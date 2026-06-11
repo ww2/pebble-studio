@@ -10,6 +10,8 @@ win:
   target:
     - dir
   artifactName: "Pebble Studio ${version}.${ext}"
+  signAndEditExecutable: false
+  sign: null
 # Note: NSIS installer target is intentionally omitted here because building
 # an NSIS .exe installer requires wine (or a native Windows machine).
 # To build the installer, run `npm run dist` on Windows or Linux with wine.
