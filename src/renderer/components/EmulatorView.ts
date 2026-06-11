@@ -56,6 +56,7 @@ export class EmulatorView {
     this.caption.textContent = `${info.label} · ${info.width}×${info.height}`;
     this.el.querySelector<HTMLElement>(".emu-frame")!.classList.toggle("emu-frame--round", info.round);
     this.status.textContent = `Booting ${info.label}…`;
+    this.status.classList.remove("emu-status--live");
 
     // Disconnect any prior session before starting a new platform.
     if (this.vnc) {
@@ -89,7 +90,8 @@ export class EmulatorView {
       return;
     }
 
-    this.status.textContent = info.label;
+    this.status.textContent = "● Live";
+    this.status.classList.add("emu-status--live");
     this.vnc = connectVnc(this.screenHost, ep as { host: string; port: number; wsPath: string }, info.touch);
 
     // Re-install library apps after boot so a platform switch picks them up.
