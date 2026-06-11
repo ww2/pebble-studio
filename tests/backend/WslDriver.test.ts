@@ -2,16 +2,19 @@ import { describe, it, expect, vi } from "vitest";
 import { WslDriver } from "../../src/main/backend/WslDriver.js";
 
 describe("WslDriver", () => {
-  it("prefixes discrete commands with wsl.exe --", async () => {
+  it("runs discrete commands via a wsl.exe login shell so PATH finds pebble", async () => {
     const calls: { cmd: string; args: string[] }[] = [];
     const run = vi.fn(async (cmd: string, args: string[]) => { calls.push({ cmd, args }); return { code: 0, stdout: "", stderr: "" }; });
     const d = new WslDriver({ run });
     d.setPlatform("chalk");
     await d.button("up", "press");
     expect(calls[0].cmd).toBe("wsl.exe");
-    expect(calls[0].args.slice(0, 2)).toEqual(["--", "pebble"]);
-    expect(calls[0].args).toContain("emu-button");
-    expect(calls[0].args).toContain("up");
+    expect(calls[0].args.slice(0, 3)).toEqual(["--", "bash", "-lc"]);
+    // The pebble invocation is the quoted command line passed to `bash -lc`.
+    const cmdline = calls[0].args[3];
+    expect(cmdline).toContain("pebble");
+    expect(cmdline).toContain("emu-button");
+    expect(cmdline).toContain("up");
   });
 
   it("injects --vnc into emulator commands (so the WSL emulator isn't torn down)", async () => {
@@ -20,7 +23,8 @@ describe("WslDriver", () => {
     const d = new WslDriver({ run });
     d.setPlatform("basalt");
     await d.button("select", "press");
-    expect(calls[0]).toContain("--vnc");
+    // --vnc lives inside the `bash -lc` command line (args[3]).
+    expect(calls[0][3]).toContain("--vnc");
   });
 
   it("threads injected boot/stop into the inner driver (used on a Windows host)", async () => {

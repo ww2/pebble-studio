@@ -33,10 +33,18 @@ export class WslDriver implements BackendDriver {
   private readonly inner: NativeDriver;
 
   constructor(private readonly deps: WslDriverDeps) {
-    // Build a runner that prepends ["--", originalCmd] so every call becomes:
-    //   wsl.exe -- <cmd> <args...>
-    const wslRun: Runner = (cmd: string, args: string[], env?: Record<string, string>): Promise<RunResult> => {
-      return deps.run("wsl.exe", ["--", cmd, ...args], env);
+    // Run each command inside a WSL *login* shell:
+    //   wsl.exe -- bash -lc "<cmd> <args...>"
+    // `pebble` lives in ~/.local/bin, which is only on the PATH of a login
+    // shell — a bare `wsl.exe -- pebble ...` fails with "command not found" on
+    // a Windows host. Every token is shell-quoted so paths with spaces (e.g.
+    // dropped .pbw files) survive. (Env vars don't cross the Windows->WSL
+    // boundary, but every command already carries --emulator explicitly, so
+    // PEBBLE_EMULATOR would be redundant anyway.)
+    const shQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+    const wslRun: Runner = (cmd: string, args: string[], _env?: Record<string, string>): Promise<RunResult> => {
+      const cmdline = [cmd, ...args].map(shQuote).join(" ");
+      return deps.run("wsl.exe", ["--", "bash", "-lc", cmdline]);
     };
 
     this.inner = new NativeDriver({ run: wslRun, boot: deps.boot, stop: deps.stop });
