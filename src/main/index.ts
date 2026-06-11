@@ -1,4 +1,5 @@
 import { app, BrowserWindow } from "electron";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { registerIpc } from "./ipc.js";
 
@@ -37,6 +38,33 @@ function createWindow(): void {
   } else {
     // dist/main/index.cjs -> dist/renderer/index.html
     void win.loadFile(join(__dirname, "../renderer/index.html"));
+  }
+
+  // TEMP, env-gated UI-screenshot hook. Inert unless PEBBLE_UISHOT is set.
+  // After the window loads + a delay (to let the watch boot), capture the full
+  // window to the given path. PEBBLE_UISHOT_LIGHT (truthy) toggles the theme
+  // first so both themes can be captured in separate runs.
+  const shotPath = process.env.PEBBLE_UISHOT;
+  if (shotPath) {
+    win.webContents.once("did-finish-load", () => {
+      setTimeout(() => {
+        void (async () => {
+          try {
+            if (process.env.PEBBLE_UISHOT_LIGHT) {
+              await win.webContents.executeJavaScript(
+                "document.querySelector('.theme-toggle')?.click()",
+              );
+              await new Promise((r) => setTimeout(r, 600));
+            }
+            const img = await win.webContents.capturePage();
+            await writeFile(shotPath, img.toPNG());
+            console.log(`[uishot] wrote ${shotPath}`);
+          } catch (err) {
+            console.error("[uishot] capture failed", err);
+          }
+        })();
+      }, 20000);
+    });
   }
 }
 

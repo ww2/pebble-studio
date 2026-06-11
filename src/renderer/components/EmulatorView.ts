@@ -13,26 +13,31 @@ export class EmulatorView {
   private readonly screenHost: HTMLElement;
   private readonly buttonsOverlay: HTMLElement;
   private readonly status: HTMLElement;
+  private readonly caption: HTMLElement;
   private vnc: VncHandle | null = null;
 
   constructor() {
     this.el = document.createElement("div");
     this.el.className = "emu-panel";
     this.el.innerHTML = `
-      <div class="emu-stage" id="emu-stage">
-        <div class="emu-screen" id="emu-screen"></div>
-        <div class="emu-buttons" id="emu-buttons"></div>
+      <div class="emu-frame">
+        <div class="emu-stage" id="emu-stage">
+          <div class="emu-screen" id="emu-screen"></div>
+          <div class="emu-buttons" id="emu-buttons"></div>
+        </div>
       </div>
+      <div class="emu-caption" id="emu-caption"></div>
       <div class="emu-actions">
-        <button class="emu-action" id="emu-tap" type="button">Tap</button>
-        <button class="emu-action" id="emu-shake" type="button">Shake</button>
-        <span class="emu-status" id="emu-status"></span>
+        <button class="emu-action emu-action--filled" id="emu-tap" type="button">Tap</button>
+        <button class="emu-action emu-action--subtle" id="emu-shake" type="button">Shake</button>
       </div>
+      <span class="emu-status" id="emu-status"></span>
     `;
 
     this.screenHost = this.el.querySelector<HTMLElement>("#emu-screen")!;
     this.buttonsOverlay = this.el.querySelector<HTMLElement>("#emu-buttons")!;
     this.status = this.el.querySelector<HTMLElement>("#emu-status")!;
+    this.caption = this.el.querySelector<HTMLElement>("#emu-caption")!;
 
     const tapBtn = this.el.querySelector<HTMLButtonElement>("#emu-tap")!;
     const shakeBtn = this.el.querySelector<HTMLButtonElement>("#emu-shake")!;
@@ -48,6 +53,8 @@ export class EmulatorView {
     const info = getPlatform(platformId);
     const chrome = getChrome(platformId);
 
+    this.caption.textContent = `${info.label} · ${info.width}×${info.height}`;
+    this.el.querySelector<HTMLElement>(".emu-frame")!.classList.toggle("emu-frame--round", info.round);
     this.status.textContent = `Booting ${info.label}…`;
 
     // Disconnect any prior session before starting a new platform.

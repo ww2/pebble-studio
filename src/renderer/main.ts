@@ -34,15 +34,27 @@ applyTheme(resolveTheme(themeMode));
 
 const app = document.getElementById("app")!;
 app.innerHTML = `
-  <main class="shell emu-shell">
-    <header class="emu-header">
-      <h1>Pebble Studio</h1>
-      <div class="emu-toolbar" id="emu-toolbar">
-        <span class="emu-backend">Backend: <span id="backend-kind">…</span></span>
+  <div class="app-backdrop" aria-hidden="true"></div>
+  <div class="app-shell">
+    <header class="cmdbar">
+      <div class="cmdbar-brand">
+        <span class="brand-mark" aria-hidden="true">P</span>
+        <span class="brand-name">Pebble Studio</span>
+        <span class="backend-pill" id="backend-pill" title="Active backend">
+          <span class="backend-dot"></span><span id="backend-kind">…</span>
+        </span>
+      </div>
+      <div class="cmdbar-actions" id="cmdbar-actions">
+        <label class="combo" id="version-combo">
+          <span class="combo-caption">Model</span>
+        </label>
       </div>
     </header>
-    <div id="emu-mount"></div>
-  </main>
+    <div class="workspace">
+      <section class="stage-col" id="stage-col"></section>
+      <aside class="inspector" id="inspector"></aside>
+    </div>
+  </div>
 `;
 
 const view = new EmulatorView();
@@ -50,13 +62,18 @@ const switcher = new VersionSwitcher((id: PlatformId) => void view.show(id), "ba
 const library = new AppLibrary();
 const captureBar = new CaptureBar(() => document.querySelector<HTMLElement>("#emu-screen"));
 
-const toolbar = document.getElementById("emu-toolbar")!;
-toolbar.insertBefore(switcher.el, toolbar.firstChild);
+// Command bar: version switcher (styled as a Fluent combobox) + theme toggle.
+const combo = document.getElementById("version-combo")!;
+switcher.el.classList.add("combo-select");
+combo.appendChild(switcher.el);
 
 const themeToggle = document.createElement("button");
 themeToggle.className = "theme-toggle";
+themeToggle.type = "button";
+themeToggle.setAttribute("aria-label", "Toggle color theme");
 const renderThemeLabel = (): void => {
-  themeToggle.textContent = themeMode === "dark" ? "☀ Light" : "🌙 Dark";
+  themeToggle.textContent = themeMode === "dark" ? "☀  Light" : "🌙  Dark";
+  themeToggle.title = themeMode === "dark" ? "Switch to light theme" : "Switch to dark theme";
 };
 renderThemeLabel();
 themeToggle.addEventListener("click", () => {
@@ -65,11 +82,26 @@ themeToggle.addEventListener("click", () => {
   localStorage.setItem("pebble-studio:theme", themeMode);
   renderThemeLabel();
 });
-toolbar.appendChild(themeToggle);
-const emuMount = document.getElementById("emu-mount")!;
-emuMount.appendChild(view.el);
-emuMount.appendChild(library.el);
-emuMount.appendChild(captureBar.el);
+document.getElementById("cmdbar-actions")!.appendChild(themeToggle);
+
+// Stage column = the live device (hero).
+document.getElementById("stage-col")!.appendChild(view.el);
+
+// Inspector column = stacked cards (Apps, Capture).
+const inspector = document.getElementById("inspector")!;
+
+const appsCard = document.createElement("section");
+appsCard.className = "card";
+appsCard.innerHTML = `<h2 class="card-title">Apps</h2>`;
+appsCard.appendChild(library.el);
+
+const captureCard = document.createElement("section");
+captureCard.className = "card";
+captureCard.innerHTML = `<h2 class="card-title">Capture</h2>`;
+captureCard.appendChild(captureBar.el);
+
+inspector.appendChild(appsCard);
+inspector.appendChild(captureCard);
 
 async function init(): Promise<void> {
   const kindEl = document.getElementById("backend-kind")!;
@@ -80,6 +112,7 @@ async function init(): Promise<void> {
     await view.show(switcher.value);
   } catch (err) {
     kindEl.textContent = "error";
+    document.getElementById("backend-pill")?.classList.add("backend-pill--error");
     console.error("backend init failed", err);
   }
 }

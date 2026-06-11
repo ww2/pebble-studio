@@ -17,27 +17,28 @@ export class AppLibrary {
     this.el = document.createElement("div");
     this.el.className = "lib-panel";
 
-    const heading = document.createElement("h2");
-    heading.className = "lib-heading";
-    heading.textContent = "App Library";
-
     this.dropZone = document.createElement("div");
     this.dropZone.className = "lib-drop-zone";
 
+    const dropIcon = document.createElement("span");
+    dropIcon.className = "lib-drop-icon";
+    dropIcon.textContent = "↓";
+    dropIcon.setAttribute("aria-hidden", "true");
+
     const dropLabel = document.createElement("span");
     dropLabel.className = "lib-drop-label";
-    dropLabel.textContent = "Drop .pbw here";
+    dropLabel.textContent = "Drop .pbw files here to install";
 
     this.errorMsg = document.createElement("span");
     this.errorMsg.className = "lib-error";
 
+    this.dropZone.appendChild(dropIcon);
     this.dropZone.appendChild(dropLabel);
     this.dropZone.appendChild(this.errorMsg);
 
     this.list = document.createElement("ul");
     this.list.className = "lib-list";
 
-    this.el.appendChild(heading);
     this.el.appendChild(this.dropZone);
     this.el.appendChild(this.list);
 
