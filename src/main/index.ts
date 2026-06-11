@@ -26,6 +26,11 @@ function createWindow(): void {
     },
   });
 
+  // Forward renderer console output to the terminal (useful for headless dev).
+  win.webContents.on("console-message", (_e, _lvl, message) =>
+    console.log(`[renderer] ${message}`),
+  );
+
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;
   if (devServerUrl) {
     void win.loadURL(devServerUrl);
