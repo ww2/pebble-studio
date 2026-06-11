@@ -1,4 +1,4 @@
-import { ipcMain, app } from "electron";
+import { ipcMain, app, dialog } from "electron";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { createDriver } from "./backend/createDriver.js";
@@ -38,6 +38,15 @@ export function registerIpc(): void {
     //    (that's what "clear" means: the watch starts fresh with no user apps).
     await driver!.start(platformId);
     // loaded remains empty after the clear reboot.
+  });
+
+  ipcMain.handle("dialog:pickPbw", async (): Promise<string[]> => {
+    const result = await dialog.showOpenDialog({
+      title: "Select .pbw file(s)",
+      properties: ["openFile", "multiSelections"],
+      filters: [{ name: "Pebble apps", extensions: ["pbw"] }],
+    });
+    return result.canceled ? [] : result.filePaths;
   });
 
   ipcMain.handle("backend:init", async () => {

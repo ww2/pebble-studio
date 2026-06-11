@@ -852,13 +852,41 @@ body {
 }
 .settings-row-label { color: var(--text); }
 .settings-row-desc { color: var(--text-secondary); margin: 0; }
-/* Placeholder container for the default-watch selector (populated by a later
-   agent). Reserves space + reads as an empty, awaiting region. */
+/* Hosts the "Startup watch" dropdown. */
 .settings-default-watch {
-  min-height: 44px;
-  border: 1px dashed var(--border-strong);
+  display: flex;
+}
+.settings-watch-control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+.settings-watch-label { color: var(--text); }
+.settings-watch-select {
+  appearance: none;
+  -webkit-appearance: none;
+  background:
+    var(--raised)
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='none' stroke='%23808080' stroke-width='1.5'%3E%3Cpath d='M3 4.5 6 7.5 9 4.5'/%3E%3C/svg%3E")
+    no-repeat right 8px center;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-bottom-color: var(--control-bottom);
   border-radius: var(--radius-control);
-  background: var(--control);
+  padding: 6px 28px 6px 10px;
+  font: inherit;
+  font-size: var(--type-body);
+  cursor: pointer;
+  min-width: 160px;
+  transition: border-color var(--dur) var(--ease);
+}
+.settings-watch-select:hover { border-color: var(--border-strong); }
+.settings-watch-select:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
 }
 
 /* ── App library ─────────────────────────────────────────────────────────── */
@@ -899,6 +927,27 @@ body {
 .lib-drop-label {
   color: var(--text-tertiary);
   font-size: var(--type-body);
+}
+/* "Select file…" button — Fluent secondary (neutral fill) style. */
+.lib-pick-btn {
+  margin-top: 2px;
+  background: var(--control);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-bottom-color: var(--control-bottom);
+  border-radius: var(--radius-control);
+  padding: 5px 14px;
+  font: inherit;
+  font-size: var(--type-body);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.lib-pick-btn:hover { background: var(--control-hover); border-color: var(--border-strong); }
+.lib-pick-btn:active { transform: translateY(1px); }
+.lib-pick-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--accent);
 }
 .lib-error {
   color: var(--danger);

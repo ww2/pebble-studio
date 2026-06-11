@@ -6,9 +6,17 @@ import type { RgbaImage } from "../../capture/upscale.js";
 /** Magenta key color used as the transparent index in round GIFs. */
 const GIF_TRANSPARENT_COLOR = 0xff00ff;
 
+/**
+ * Hard cap (seconds) on any single GIF recording. Sized to allow the longest
+ * 15s preset to complete; manual recordings are bounded by this too so files
+ * can't grow unbounded.
+ */
+const GIF_MAX_SECONDS = 15;
+
 export class CaptureBar {
   readonly el: HTMLElement;
   private readonly select: HTMLSelectElement;
+  private readonly durationSelect: HTMLSelectElement;
   private readonly shotBtn: HTMLButtonElement;
   private readonly recBtn: HTMLButtonElement;
   private readonly status: HTMLSpanElement;
@@ -39,6 +47,22 @@ export class CaptureBar {
       this.select.appendChild(opt);
     }
 
+    // GIF duration selector: Manual / 5s / 10s / 15s. Manual (value "0") = today's
+    // behavior (record until Stop or the cap). A preset auto-stops after N seconds.
+    const durLabel = document.createElement("label");
+    durLabel.className = "capture-label";
+    durLabel.textContent = "Duration:";
+
+    this.durationSelect = document.createElement("select");
+    this.durationSelect.className = "capture-select";
+    for (const [value, text] of [["0", "Manual"], ["5", "5s"], ["10", "10s"], ["15", "15s"]]) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = text;
+      if (value === "0") opt.selected = true;
+      this.durationSelect.appendChild(opt);
+    }
+
     // Screenshot button
     this.shotBtn = document.createElement("button");
     this.shotBtn.type = "button";
@@ -60,9 +84,16 @@ export class CaptureBar {
 
     this.el.appendChild(label);
     this.el.appendChild(this.select);
+    this.el.appendChild(durLabel);
+    this.el.appendChild(this.durationSelect);
     this.el.appendChild(this.shotBtn);
     this.el.appendChild(this.recBtn);
     this.el.appendChild(this.status);
+  }
+
+  /** Selected duration in seconds, or 0 for Manual. */
+  private durationSeconds(): number {
+    return parseInt(this.durationSelect.value, 10);
   }
 
   private factor(): number {
@@ -140,7 +171,11 @@ export class CaptureBar {
     this.recBtn.textContent = "Stop GIF";
     this.recBtn.classList.add("capture-btn--recording");
 
-    const budget = new FrameBudget({ fps: 15, maxSeconds: 8 });
+    // A preset (5/10/15s) caps the budget at exactly that many seconds so the
+    // existing isFull() path auto-stops. Manual uses the full hard cap.
+    const preset = this.durationSeconds();
+    const maxSeconds = preset > 0 ? preset : GIF_MAX_SECONDS;
+    const budget = new FrameBudget({ fps: 15, maxSeconds });
     const stamp = this.stamp();
     const round = this.isRound();
 

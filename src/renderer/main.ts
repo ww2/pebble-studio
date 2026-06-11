@@ -6,7 +6,7 @@ import { CaptureBar } from "./components/CaptureBar.js";
 import { NavRail } from "./components/NavRail.js";
 import { SettingsPane } from "./components/SettingsPane.js";
 import type { PlatformId } from "../shared/types.js";
-import { getPlatform } from "../main/backend/emulatorRegistry.js";
+import { getPlatform, PLATFORMS } from "../main/backend/emulatorRegistry.js";
 
 interface StudioApi {
   initBackend(): Promise<{ kind: string }>;
@@ -23,6 +23,7 @@ interface StudioApi {
   loadedList(): Promise<string[]>;
   loadedClear(platformId: string): Promise<unknown>;
   pathForFile(file: File): string;
+  pickPbw(): Promise<string[]>;
   saveCapture(name: string, bytes: Uint8Array): Promise<string>;
 }
 
@@ -65,8 +66,24 @@ app.innerHTML = `
   </div>
 `;
 
+// Default watch = Pebble Time 2 (emery); restore the last-used watch, falling
+// back to emery on first run / invalid persisted value.
+const storedPlatform = localStorage.getItem("pebble-studio:platform");
+const initialPlatform: PlatformId =
+  PLATFORMS.some((p) => p.id === storedPlatform) ? (storedPlatform as PlatformId) : "emery";
+
 const view = new EmulatorView();
-const switcher = new VersionSwitcher((id: PlatformId) => void view.show(id), "basalt");
+
+// Persist the active platform and keep both the top combo and the Settings
+// "Startup watch" dropdown in sync, regardless of which control changed it.
+function selectPlatform(id: PlatformId): void {
+  localStorage.setItem("pebble-studio:platform", id);
+  switcher.value = id;        // no-op set when the combo originated the change
+  settings.setPlatform(id);   // no-op set when Settings originated the change
+  void view.show(id);
+}
+
+const switcher = new VersionSwitcher((id: PlatformId) => selectPlatform(id), initialPlatform);
 const library = new AppLibrary(
   () => switcher.value,
   (platformId: string) => view.reconnectAfterClear(platformId as PlatformId),
@@ -75,7 +92,7 @@ const captureBar = new CaptureBar(
   () => document.querySelector<HTMLElement>("#emu-screen"),
   () => getPlatform(switcher.value as PlatformId).round,
 );
-const settings = new SettingsPane(themeMode);
+const settings = new SettingsPane(themeMode, initialPlatform, (id: PlatformId) => selectPlatform(id));
 
 // Command bar: version switcher (Fluent combobox) controls the persistent
 // live preview, so it stays in the top command bar. The theme toggle now lives

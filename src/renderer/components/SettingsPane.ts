@@ -1,4 +1,6 @@
 import { resolveTheme, applyTheme, type ThemeMode } from "../theme.js";
+import type { PlatformId } from "../../shared/types.js";
+import { PLATFORMS } from "../../main/backend/emulatorRegistry.js"; // pure module, bundled by Vite
 
 type ThemeChoice = "light" | "dark";
 
@@ -7,23 +9,32 @@ type ThemeChoice = "light" | "dark";
  * preferences:
  *  - Theme toggle — a Fluent switch (pill track + knob, accent when on).
  *    "On" = dark theme. Persists to `pebble-studio:theme`.
- *  - Default watch — a clearly-marked empty container
- *    (`.settings-default-watch`, id `settings-default-watch`) left for a later
- *    agent to populate with the actual default-watch persistence UI.
+ *  - Default watch — a labeled "Startup watch" dropdown listing every platform.
+ *    Its value is bound to the persisted platform (`pebble-studio:platform`);
+ *    changing it persists the new value and switches the live preview via the
+ *    injected `onPlatformChange` callback (the same path the top combo uses).
  *
  * The component owns the theme switch wiring (moved here from the command bar)
  * so theming stays instant via `applyTheme`.
  */
 export class SettingsPane {
   readonly el: HTMLElement;
-  /** Mounting point for the (future) default-watch selector. */
+  /** Mounting point for the default-watch selector. */
   readonly defaultWatchSlot: HTMLElement;
 
   private themeMode: ThemeChoice;
   private readonly switchEl: HTMLButtonElement;
+  private readonly watchSelect: HTMLSelectElement;
+  /** Switches the live preview to the chosen platform (wired from main.ts). */
+  private readonly onPlatformChange: (id: PlatformId) => void;
 
-  constructor(initialTheme: ThemeChoice) {
+  constructor(
+    initialTheme: ThemeChoice,
+    initialPlatform: PlatformId,
+    onPlatformChange: (id: PlatformId) => void,
+  ) {
     this.themeMode = initialTheme;
+    this.onPlatformChange = onPlatformChange;
 
     this.el = document.createElement("div");
     this.el.className = "settings-pane";
@@ -76,16 +87,51 @@ export class SettingsPane {
     watchDesc.className = "settings-row-desc type-caption";
     watchDesc.textContent = "Choose the watch model to boot on launch.";
 
-    // Empty, clearly-marked container for a later agent to populate.
+    // Container hosting the labeled "Startup watch" dropdown.
     this.defaultWatchSlot = document.createElement("div");
     this.defaultWatchSlot.className = "settings-default-watch";
     this.defaultWatchSlot.id = "settings-default-watch";
+
+    const watchControl = document.createElement("label");
+    watchControl.className = "settings-watch-control";
+
+    const watchLabel = document.createElement("span");
+    watchLabel.className = "settings-watch-label type-body";
+    watchLabel.textContent = "Startup watch";
+
+    this.watchSelect = document.createElement("select");
+    this.watchSelect.className = "settings-watch-select";
+    const validInitial = PLATFORMS.some((p) => p.id === initialPlatform)
+      ? initialPlatform
+      : PLATFORMS[0].id;
+    for (const p of PLATFORMS) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = p.label;
+      if (p.id === validInitial) opt.selected = true;
+      this.watchSelect.appendChild(opt);
+    }
+    this.watchSelect.addEventListener("change", () => {
+      // Persistence + combo sync are centralized in the injected callback.
+      this.onPlatformChange(this.watchSelect.value as PlatformId);
+    });
+
+    watchControl.append(watchLabel, this.watchSelect);
+    this.defaultWatchSlot.appendChild(watchControl);
 
     watch.append(watchHeading, watchDesc, this.defaultWatchSlot);
 
     this.el.append(appearance, watch);
 
     this.syncSwitch();
+  }
+
+  /**
+   * Reflect an externally-driven platform change (e.g. the top combo) so this
+   * dropdown's shown value tracks the live preview. Does NOT re-fire onChange.
+   */
+  setPlatform(id: PlatformId): void {
+    if (this.watchSelect.value !== id) this.watchSelect.value = id;
   }
 
   private toggleTheme(): void {
