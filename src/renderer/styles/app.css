@@ -346,11 +346,13 @@ body {
 }
 .emu-screen--round { border-radius: 50%; }
 
-/* noVNC injects a canvas; let it fill the host. */
+/* noVNC injects a canvas; let it fill the host and stay crisp when zoomed. */
 .emu-screen canvas {
   display: block;
   width: 100% !important;
   height: 100% !important;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
 }
 
 /* Button overlay covers the whole frame; only the nubs capture clicks. It sits
@@ -455,6 +457,21 @@ body {
   border-radius: 3px;
 }
 
+/* ── Zoom wrapper: reserves layout space so scaled frame doesn't overlap ─── */
+.emu-frame-wrapper {
+  /* Natural height = stage height + frame padding (set via --stage-height). */
+  /* When zoom > 1 the frame overflows; we expand the wrapper via height so
+     the elements below don't slide under the scaled frame. */
+  --zoom-scale: 1;
+  --stage-height: 200px;   /* updated dynamically from JS */
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  /* Reserve space = natural height × zoom so content below stays clear. */
+  height: calc(var(--stage-height) * var(--zoom-scale));
+  transition: height 180ms var(--ease);
+}
+
 .emu-status--live {
   color: var(--success);
   font-weight: 600;
@@ -472,7 +489,73 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
 }
+
+/* Separator between Tap/Shake and lifecycle buttons */
+.emu-actions-sep {
+  width: 1px;
+  height: 22px;
+  background: var(--border);
+  margin: 0 2px;
+}
+
+/* Danger-tinted subtle button for Force-close */
+.emu-action--danger {
+  color: var(--danger);
+}
+.emu-action--danger:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, var(--control-hover));
+}
+
+/* Zoom row: sits below the actions row */
+.emu-zoom-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.emu-zoom-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  white-space: nowrap;
+}
+
+/* Segmented control for zoom levels */
+.emu-zoom-segmented {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  overflow: hidden;
+}
+
+.emu-zoom-opt {
+  background: var(--control);
+  color: var(--text-secondary);
+  border: none;
+  border-right: 1px solid var(--border);
+  padding: 5px 11px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
+  line-height: 1;
+  white-space: nowrap;
+}
+.emu-zoom-opt:last-child { border-right: none; }
+.emu-zoom-opt:hover { background: var(--control-hover); color: var(--text); }
+.emu-zoom-opt:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent); }
+.emu-zoom-opt--active {
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+.emu-zoom-opt--active:hover { background: var(--accent-hover); }
 
 /* Material-ish buttons: filled accent (primary) + subtle (secondary). */
 .emu-action {
