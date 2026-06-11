@@ -27,7 +27,10 @@ declare global {
   }
 }
 
-applyTheme(resolveTheme("dark"));
+type ThemeChoice = "light" | "dark";
+let themeMode: ThemeChoice =
+  localStorage.getItem("pebble-studio:theme") === "light" ? "light" : "dark";
+applyTheme(resolveTheme(themeMode));
 
 const app = document.getElementById("app")!;
 app.innerHTML = `
@@ -49,6 +52,20 @@ const captureBar = new CaptureBar(() => document.querySelector<HTMLElement>("#em
 
 const toolbar = document.getElementById("emu-toolbar")!;
 toolbar.insertBefore(switcher.el, toolbar.firstChild);
+
+const themeToggle = document.createElement("button");
+themeToggle.className = "theme-toggle";
+const renderThemeLabel = (): void => {
+  themeToggle.textContent = themeMode === "dark" ? "☀ Light" : "🌙 Dark";
+};
+renderThemeLabel();
+themeToggle.addEventListener("click", () => {
+  themeMode = themeMode === "dark" ? "light" : "dark";
+  applyTheme(resolveTheme(themeMode));
+  localStorage.setItem("pebble-studio:theme", themeMode);
+  renderThemeLabel();
+});
+toolbar.appendChild(themeToggle);
 const emuMount = document.getElementById("emu-mount")!;
 emuMount.appendChild(view.el);
 emuMount.appendChild(library.el);

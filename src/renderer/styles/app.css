@@ -334,3 +334,14 @@ body {
   flex: 1;
   min-width: 0;
 }
+
+.theme-toggle {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.theme-toggle:hover { border-color: var(--accent); }
