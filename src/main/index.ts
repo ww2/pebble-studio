@@ -1,13 +1,15 @@
 import { app, BrowserWindow } from "electron";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { registerIpc } from "./ipc.js";
+
+// This file is bundled to CommonJS (dist/main/index.cjs) by esbuild, where
+// `__dirname` is a native global. The ambient declare keeps it typechecking
+// under the ESM (nodenext) tsconfig used for `npm run typecheck`.
+declare const __dirname: string;
 
 // Under WSLg the chromium sandbox typically cannot initialize; disable it so
 // the app actually starts. Harmless on platforms where the sandbox works.
 app.commandLine.appendSwitch("no-sandbox");
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -16,7 +18,7 @@ function createWindow(): void {
     height: 760,
     backgroundColor: "#202020",
     webPreferences: {
-      // Emitted by tsc from preload.cts (nodenext maps .cts -> .cjs).
+      // Emitted by the esbuild bundle alongside index.cjs.
       preload: join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
@@ -28,7 +30,7 @@ function createWindow(): void {
   if (devServerUrl) {
     void win.loadURL(devServerUrl);
   } else {
-    // dist/main/index.js -> dist/renderer/index.html
+    // dist/main/index.cjs -> dist/renderer/index.html
     void win.loadFile(join(__dirname, "../renderer/index.html"));
   }
 }
