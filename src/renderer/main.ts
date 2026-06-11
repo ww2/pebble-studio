@@ -3,6 +3,8 @@ import { EmulatorView } from "./components/EmulatorView.js";
 import { VersionSwitcher } from "./components/VersionSwitcher.js";
 import { AppLibrary } from "./components/AppLibrary.js";
 import { CaptureBar } from "./components/CaptureBar.js";
+import { NavRail } from "./components/NavRail.js";
+import { SettingsPane } from "./components/SettingsPane.js";
 import type { PlatformId } from "../shared/types.js";
 import { getPlatform } from "../main/backend/emulatorRegistry.js";
 
@@ -31,7 +33,7 @@ declare global {
 }
 
 type ThemeChoice = "light" | "dark";
-let themeMode: ThemeChoice =
+const themeMode: ThemeChoice =
   localStorage.getItem("pebble-studio:theme") === "light" ? "light" : "dark";
 applyTheme(resolveTheme(themeMode));
 
@@ -42,7 +44,7 @@ app.innerHTML = `
     <header class="cmdbar">
       <div class="cmdbar-brand">
         <span class="brand-mark" aria-hidden="true">P</span>
-        <span class="brand-name">Pebble Studio</span>
+        <span class="brand-name type-body-strong">Pebble Studio</span>
         <span class="backend-pill" id="backend-pill" title="Active backend">
           <span class="backend-dot"></span><span id="backend-kind">…</span>
         </span>
@@ -54,8 +56,11 @@ app.innerHTML = `
       </div>
     </header>
     <div class="workspace">
+      <div class="nav-rail-host" id="nav-rail-host"></div>
       <section class="stage-col" id="stage-col"></section>
-      <aside class="inspector" id="inspector"></aside>
+      <aside class="inspector" id="inspector">
+        <div class="inspector-pane" id="inspector-pane"></div>
+      </aside>
     </div>
   </div>
 `;
@@ -70,46 +75,53 @@ const captureBar = new CaptureBar(
   () => document.querySelector<HTMLElement>("#emu-screen"),
   () => getPlatform(switcher.value as PlatformId).round,
 );
+const settings = new SettingsPane(themeMode);
 
-// Command bar: version switcher (styled as a Fluent combobox) + theme toggle.
+// Command bar: version switcher (Fluent combobox) controls the persistent
+// live preview, so it stays in the top command bar. The theme toggle now lives
+// in the Settings pane.
 const combo = document.getElementById("version-combo")!;
 combo.appendChild(switcher.el);
 
-const themeToggle = document.createElement("button");
-themeToggle.className = "theme-toggle";
-themeToggle.type = "button";
-themeToggle.setAttribute("aria-label", "Toggle color theme");
-const renderThemeLabel = (): void => {
-  themeToggle.textContent = themeMode === "dark" ? "☀  Light" : "🌙  Dark";
-  themeToggle.title = themeMode === "dark" ? "Switch to light theme" : "Switch to dark theme";
-};
-renderThemeLabel();
-themeToggle.addEventListener("click", () => {
-  themeMode = themeMode === "dark" ? "light" : "dark";
-  applyTheme(resolveTheme(themeMode));
-  localStorage.setItem("pebble-studio:theme", themeMode);
-  renderThemeLabel();
-});
-document.getElementById("cmdbar-actions")!.appendChild(themeToggle);
-
-// Stage column = the live device (hero).
+// Stage column = the persistent live device (primary content).
 document.getElementById("stage-col")!.appendChild(view.el);
 
-// Inspector column = stacked cards (Apps, Capture).
-const inspector = document.getElementById("inspector")!;
+// ── Right inspector: a single swappable pane driven by the nav rail ─────────
+const pane = document.getElementById("inspector-pane")!;
 
-const appsCard = document.createElement("section");
-appsCard.className = "card";
-appsCard.innerHTML = `<h2 class="card-title">Apps</h2>`;
-appsCard.appendChild(library.el);
+function buildCard(title: string, body: HTMLElement): HTMLElement {
+  const card = document.createElement("section");
+  card.className = "card";
+  const heading = document.createElement("h2");
+  heading.className = "card-title type-body-strong";
+  heading.textContent = title;
+  card.append(heading, body);
+  return card;
+}
 
-const captureCard = document.createElement("section");
-captureCard.className = "card";
-captureCard.innerHTML = `<h2 class="card-title">Capture</h2>`;
-captureCard.appendChild(captureBar.el);
+const panes: Record<string, HTMLElement> = {
+  apps: buildCard("Apps", library.el),
+  capture: buildCard("Capture", captureBar.el),
+  settings: buildCard("Settings", settings.el),
+};
 
-inspector.appendChild(appsCard);
-inspector.appendChild(captureCard);
+function showPane(id: string): void {
+  const next = panes[id];
+  if (!next) return;
+  pane.replaceChildren(next);
+}
+
+const navRail = new NavRail(
+  [
+    { id: "apps", label: "Apps", glyph: "▦" },
+    { id: "capture", label: "Capture", glyph: "◉" },
+    { id: "settings", label: "Settings", glyph: "⚙" },
+  ],
+  showPane,
+  "apps",
+);
+document.getElementById("nav-rail-host")!.appendChild(navRail.el);
+showPane(navRail.value);
 
 async function init(): Promise<void> {
   const kindEl = document.getElementById("backend-kind")!;

@@ -5,16 +5,20 @@ describe("resolveTheme", () => {
   it("returns dark tokens for dark mode", () => {
     const t = resolveTheme("dark");
     expect(t["--bg"]).toBe("#202020");
-    expect(t["--text"]).toBe("#ffffff");
+    expect(t["--text"]).toBe("rgba(255,255,255,0.89)");
+    expect(t["--text-secondary"]).toBe("rgba(255,255,255,0.6)");
     expect(t["--accent"]).toBe("#60cdff");
     expect(t["--surface"]).toBe("#2b2b2b");
+    expect(t["--hairline"]).toBe("rgba(255,255,255,0.07)");
   });
   it("returns light tokens for light mode", () => {
     const t = resolveTheme("light");
     expect(t["--bg"]).toBe("#f3f3f3");
-    expect(t["--text"]).toBe("#1b1b1b");
+    expect(t["--text"]).toBe("rgba(0,0,0,0.89)");
+    expect(t["--text-secondary"]).toBe("rgba(0,0,0,0.6)");
     expect(t["--accent"]).toBe("#005fb8");
     expect(t["--surface"]).toBe("#ffffff");
+    expect(t["--hairline"]).toBe("rgba(0,0,0,0.06)");
   });
   it("resolves 'system' using the provided prefersDark flag", () => {
     expect(resolveTheme("system", true)["--bg"]).toBe("#202020");

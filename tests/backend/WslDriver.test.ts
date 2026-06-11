@@ -40,6 +40,18 @@ describe("WslDriver", () => {
     expect(stop).toHaveBeenCalledOnce();
   });
 
+  it("translates a Windows .pbw path to /mnt/... before it crosses into WSL", async () => {
+    const calls: string[][] = [];
+    const run = vi.fn(async (_c: string, args: string[]) => { calls.push(args); return { code: 0, stdout: "", stderr: "" }; });
+    const d = new WslDriver({ run });
+    d.setPlatform("basalt");
+    await d.install("C:\\Users\\Jane Doe\\My Watch.pbw");
+    // The translated path lives inside the `bash -lc` command line (args[3]).
+    const cmdline = calls[0][3];
+    expect(cmdline).toContain("/mnt/c/Users/Jane Doe/My Watch.pbw");
+    expect(cmdline).not.toContain("C:");
+  });
+
   it("rejects on non-zero exit", async () => {
     const run = vi.fn(async () => ({ code: 1, stdout: "", stderr: "wsl boom" }));
     const d = new WslDriver({ run });

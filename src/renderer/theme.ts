@@ -11,53 +11,61 @@ export type ThemeTokens = Record<string, string>;
  * gradient/texture layer used by the app backdrop.
  */
 const DARK: ThemeTokens = {
+  // Mica base + card/layer per Fluent spec. Base #202020, card #2B2B2B.
   "--bg": "#202020",
-  "--bg-tint": "#2a3138",
+  // Subtle neutral tint layered into the opaque Mica backdrop.
+  "--bg-tint": "rgba(255,255,255,0.03)",
   "--surface": "#2b2b2b",
-  "--surface-2": "#323232",
-  "--raised": "#373737",
-  "--text": "#ffffff",
-  "--text-secondary": "rgba(255,255,255,0.72)",
-  "--text-tertiary": "rgba(255,255,255,0.50)",
+  "--surface-2": "#272727",
+  "--raised": "#2f2f2f",
+  "--text": "rgba(255,255,255,0.89)",
+  "--text-secondary": "rgba(255,255,255,0.6)",
+  "--text-tertiary": "rgba(255,255,255,0.45)",
   "--accent": "#60cdff",
   "--accent-hover": "#7ad6ff",
   "--accent-press": "#4cc2f5",
-  "--accent-fg": "#06131c",
+  "--accent-fg": "#003e5c",
   "--accent-soft": "rgba(96,205,255,0.14)",
   "--accent-soft-hover": "rgba(96,205,255,0.22)",
-  "--border": "#3a3a3a",
-  "--border-strong": "#484848",
-  "--hairline": "rgba(255,255,255,0.08)",
-  "--control": "rgba(255,255,255,0.05)",
+  // Fluent stroke at 7% in dark.
+  "--border": "rgba(255,255,255,0.07)",
+  "--border-strong": "rgba(255,255,255,0.12)",
+  "--hairline": "rgba(255,255,255,0.07)",
+  // Subtle darker hairline for the bottom edge of controls (Fluent control stroke).
+  "--control-bottom": "rgba(0,0,0,0.30)",
+  "--control": "rgba(255,255,255,0.06)",
   "--control-hover": "rgba(255,255,255,0.09)",
-  "--control-press": "rgba(255,255,255,0.03)",
-  // Menu / popup surface (dropdowns, listboxes) — opaque so text never bleeds
-  // into the page behind it. Paired text + hover/selected states guarantee
-  // legible contrast in dark mode.
-  "--menu-bg": "#2c2c2c",
-  "--menu-text": "#ffffff",
+  "--control-press": "rgba(255,255,255,0.04)",
+  // Acrylic fill for transient surfaces (semi-transparent; paired with blur).
+  "--acrylic": "rgba(44,44,44,0.78)",
+  // Menu / popup surface (dropdowns, listboxes) — Acrylic-tinted, blurred in CSS.
+  "--menu-bg": "rgba(44,44,44,0.82)",
+  "--menu-text": "rgba(255,255,255,0.89)",
   "--menu-text-secondary": "rgba(255,255,255,0.55)",
   "--menu-hover": "rgba(255,255,255,0.08)",
   "--menu-selected": "rgba(96,205,255,0.20)",
-  "--menu-selected-text": "#ffffff",
-  "--menu-border": "#454545",
-  "--danger": "#ff6b6b",
-  "--danger-soft": "rgba(255,107,107,0.18)",
+  "--menu-selected-text": "rgba(255,255,255,0.92)",
+  "--menu-border": "rgba(255,255,255,0.10)",
+  "--danger": "#ff99a4",
+  "--danger-soft": "rgba(255,153,164,0.18)",
   "--success": "#3fb950",
-  "--elev-1": "0 1px 2px rgba(0,0,0,0.40)",
-  "--elev-2": "0 2px 8px rgba(0,0,0,0.45)",
-  "--elev-3": "0 8px 24px rgba(0,0,0,0.55)",
-  "--device-shadow": "0 24px 60px rgba(0,0,0,0.60)",
+  // Soft elevation — depth comes mostly from layered materials, so shadows are light.
+  "--elev-1": "0 1px 2px rgba(0,0,0,0.28)",
+  "--elev-2": "0 2px 6px rgba(0,0,0,0.32)",
+  "--elev-3": "0 8px 20px rgba(0,0,0,0.40)",
+  "--device-shadow": "0 16px 40px rgba(0,0,0,0.45)",
 };
 
 const LIGHT: ThemeTokens = {
+  // Mica base + card/layer per Fluent spec. Base #F3F3F3, card #FFFFFF.
   "--bg": "#f3f3f3",
-  "--bg-tint": "#e7eef6",
+  // Subtle neutral tint layered into the opaque Mica backdrop.
+  "--bg-tint": "rgba(0,0,0,0.02)",
   "--surface": "#ffffff",
   "--surface-2": "#fbfbfb",
   "--raised": "#ffffff",
-  "--text": "#1b1b1b",
-  "--text-secondary": "rgba(0,0,0,0.62)",
+  "--text": "rgba(0,0,0,0.89)",
+  "--text-secondary": "rgba(0,0,0,0.6)",
   "--text-tertiary": "rgba(0,0,0,0.45)",
   "--accent": "#005fb8",
   "--accent-hover": "#0a6cc9",
@@ -65,28 +73,33 @@ const LIGHT: ThemeTokens = {
   "--accent-fg": "#ffffff",
   "--accent-soft": "rgba(0,95,184,0.10)",
   "--accent-soft-hover": "rgba(0,95,184,0.16)",
-  "--border": "#e1e1e1",
-  "--border-strong": "#d2d2d2",
-  "--hairline": "rgba(0,0,0,0.07)",
+  // Fluent stroke at 6% in light.
+  "--border": "rgba(0,0,0,0.06)",
+  "--border-strong": "rgba(0,0,0,0.12)",
+  "--hairline": "rgba(0,0,0,0.06)",
+  // Subtle darker hairline for the bottom edge of controls (Fluent control stroke).
+  "--control-bottom": "rgba(0,0,0,0.16)",
   "--control": "rgba(0,0,0,0.03)",
   "--control-hover": "rgba(0,0,0,0.06)",
   "--control-press": "rgba(0,0,0,0.02)",
-  // Menu / popup surface (dropdowns, listboxes) — opaque white with dark text
-  // so the old white-on-white dropdown problem cannot recur in light mode.
-  "--menu-bg": "#ffffff",
-  "--menu-text": "#1b1b1b",
+  // Acrylic fill for transient surfaces (semi-transparent; paired with blur).
+  "--acrylic": "rgba(252,252,252,0.78)",
+  // Menu / popup surface (dropdowns, listboxes) — Acrylic-tinted, blurred in CSS.
+  "--menu-bg": "rgba(252,252,252,0.85)",
+  "--menu-text": "rgba(0,0,0,0.89)",
   "--menu-text-secondary": "rgba(0,0,0,0.50)",
   "--menu-hover": "rgba(0,0,0,0.05)",
   "--menu-selected": "rgba(0,95,184,0.12)",
   "--menu-selected-text": "#003c75",
-  "--menu-border": "#d8d8d8",
+  "--menu-border": "rgba(0,0,0,0.08)",
   "--danger": "#c42b1c",
   "--danger-soft": "rgba(196,43,28,0.10)",
   "--success": "#0f7b0f",
-  "--elev-1": "0 1px 2px rgba(0,0,0,0.08)",
-  "--elev-2": "0 2px 8px rgba(0,0,0,0.10)",
-  "--elev-3": "0 8px 24px rgba(0,0,0,0.14)",
-  "--device-shadow": "0 24px 60px rgba(0,0,0,0.22)",
+  // Soft elevation — depth comes mostly from layered materials, so shadows are light.
+  "--elev-1": "0 1px 2px rgba(0,0,0,0.06)",
+  "--elev-2": "0 2px 6px rgba(0,0,0,0.08)",
+  "--elev-3": "0 8px 20px rgba(0,0,0,0.12)",
+  "--device-shadow": "0 16px 40px rgba(0,0,0,0.18)",
 };
 
 export function resolveTheme(mode: ThemeMode, prefersDark = false): ThemeTokens {
