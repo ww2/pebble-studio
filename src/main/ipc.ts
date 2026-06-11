@@ -30,7 +30,17 @@ export function registerIpc(): void {
   ipcMain.handle("emu:screenshot", async (_e, out: string) => driver!.screenshot(out));
 
   ipcMain.handle("capture:save", async (_e, name: string, bytes: Uint8Array) => {
-    const out = path.join(app.getPath("downloads"), name);
+    // Sanitize the filename: strip any directory component and confirm the
+    // resolved path stays inside Downloads (defense-in-depth against traversal).
+    const safeName = path.basename(name);
+    if (!/^[\w.\- ]+\.(png|gif)$/i.test(safeName)) {
+      throw new Error(`invalid capture filename: ${name}`);
+    }
+    const downloads = path.resolve(app.getPath("downloads"));
+    const out = path.resolve(downloads, safeName);
+    if (out !== path.join(downloads, safeName) || !out.startsWith(downloads + path.sep)) {
+      throw new Error("capture path escapes downloads directory");
+    }
     await fs.writeFile(out, Buffer.from(bytes));
     console.log(`[capture] saved ${out}`);
     return out;
