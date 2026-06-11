@@ -13,6 +13,8 @@ const studio = {
   libRemove: (p: string) => ipcRenderer.invoke("lib:remove", p),
   libInstallAll: () => ipcRenderer.invoke("lib:installAll"),
   pathForFile: (file: File) => webUtils.getPathForFile(file),
+  saveCapture: (name: string, bytes: Uint8Array): Promise<string> =>
+    ipcRenderer.invoke("capture:save", name, bytes),
 };
 
 contextBridge.exposeInMainWorld("studio", studio);

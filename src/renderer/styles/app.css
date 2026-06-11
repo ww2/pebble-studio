@@ -255,3 +255,82 @@ body {
   background: rgba(255, 107, 107, 0.2);
   color: #ff6b6b;
 }
+
+/* ── Capture bar ──────────────────────────────────────────────── */
+.capture-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--surface, #2b2b2b);
+  border: 1px solid var(--border, #3a3a3a);
+  border-radius: 8px;
+  flex-wrap: wrap;
+}
+
+.capture-label {
+  font-size: 13px;
+  opacity: 0.8;
+}
+
+.capture-select {
+  background: var(--bg, #202020);
+  color: var(--text, #fff);
+  border: 1px solid var(--border, #3a3a3a);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 13px;
+}
+
+.capture-select:focus-visible {
+  outline: 2px solid var(--accent, #60cdff);
+  outline-offset: 1px;
+}
+
+.capture-btn {
+  background: var(--accent, #60cdff);
+  color: #061018;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 0.1s ease;
+}
+
+.capture-btn:hover {
+  filter: brightness(1.08);
+}
+
+.capture-btn:active {
+  filter: brightness(0.92);
+}
+
+.capture-btn--rec {
+  background: var(--surface, #2b2b2b);
+  color: var(--accent, #60cdff);
+  border: 1px solid var(--accent, #60cdff);
+}
+
+.capture-btn--recording {
+  background: #ff4444;
+  color: #fff;
+  border-color: #ff4444;
+  animation: rec-pulse 1s ease-in-out infinite alternate;
+}
+
+@keyframes rec-pulse {
+  from { opacity: 1; }
+  to   { opacity: 0.7; }
+}
+
+.capture-status {
+  font-size: 12px;
+  opacity: 0.75;
+  word-break: break-all;
+  flex: 1;
+  min-width: 0;
+}

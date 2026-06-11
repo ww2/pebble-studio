@@ -2,6 +2,7 @@ import { resolveTheme, applyTheme } from "./theme.js";
 import { EmulatorView } from "./components/EmulatorView.js";
 import { VersionSwitcher } from "./components/VersionSwitcher.js";
 import { AppLibrary } from "./components/AppLibrary.js";
+import { CaptureBar } from "./components/CaptureBar.js";
 import type { PlatformId } from "../shared/types.js";
 
 interface StudioApi {
@@ -17,6 +18,7 @@ interface StudioApi {
   libRemove(p: string): Promise<string[]>;
   libInstallAll(): Promise<void>;
   pathForFile(file: File): string;
+  saveCapture(name: string, bytes: Uint8Array): Promise<string>;
 }
 
 declare global {
@@ -43,12 +45,14 @@ app.innerHTML = `
 const view = new EmulatorView();
 const switcher = new VersionSwitcher((id: PlatformId) => void view.show(id), "basalt");
 const library = new AppLibrary();
+const captureBar = new CaptureBar(() => document.querySelector<HTMLElement>("#emu-screen"));
 
 const toolbar = document.getElementById("emu-toolbar")!;
 toolbar.insertBefore(switcher.el, toolbar.firstChild);
 const emuMount = document.getElementById("emu-mount")!;
 emuMount.appendChild(view.el);
 emuMount.appendChild(library.el);
+emuMount.appendChild(captureBar.el);
 
 async function init(): Promise<void> {
   const kindEl = document.getElementById("backend-kind")!;
