@@ -6,7 +6,7 @@ export const PLATFORMS: PlatformInfo[] = [
   { id: "chalk",   label: "Pebble Time Round",  machine: "pebble-s4-bb",          width: 180, height: 180, round: true,  color: true,  touch: false },
   { id: "diorite", label: "Pebble 2",           machine: "pebble-silk-bb",        width: 144, height: 168, round: false, color: false, touch: false },
   { id: "emery",   label: "Pebble Time 2",      machine: "pebble-snowy-emery-bb", width: 200, height: 228, round: false, color: true,  touch: true  },
-  { id: "flint",   label: "Pebble Flint",       machine: "pebble-flint",          width: 144, height: 168, round: false, color: true,  touch: false },
+  { id: "flint",   label: "Pebble 2 Duo",       machine: "pebble-flint",          width: 144, height: 168, round: false, color: true,  touch: false },
   { id: "gabbro",  label: "Pebble Round 2",     machine: "pebble-gabbro",         width: 260, height: 260, round: true,  color: true,  touch: true  },
 ];
 

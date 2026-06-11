@@ -20,6 +20,18 @@ describe("NativeDriver", () => {
     await expect(d.button("select", "press")).rejects.toThrow(/boom/);
   });
 
+  it("start() and stop() use the injected boot/stop deps (no real spawning)", async () => {
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const boot = vi.fn(async () => ({ host: "localhost", port: 6080, wsPath: "/" }));
+    const stop = vi.fn(async () => {});
+    const d = new NativeDriver({ run, boot, stop });
+    const ep = await d.start("basalt");
+    expect(boot).toHaveBeenCalledWith("basalt");
+    expect(ep).toEqual({ host: "localhost", port: 6080, wsPath: "/" });
+    await d.stop();
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
   it("converts setTime('system') to an HH:MM:SS string (not ISO)", async () => {
     const calls: string[][] = [];
     const run = vi.fn(async (_c: string, args: string[]) => { calls.push(args); return { code: 0, stdout: "", stderr: "" }; });

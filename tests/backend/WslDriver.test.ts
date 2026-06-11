@@ -23,6 +23,19 @@ describe("WslDriver", () => {
     expect(calls[0]).toContain("--vnc");
   });
 
+  it("threads injected boot/stop into the inner driver (used on a Windows host)", async () => {
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const boot = vi.fn(async (id: string) => ({ host: "ignored", port: 6080, wsPath: "/" }));
+    const stop = vi.fn(async () => {});
+    const d = new WslDriver({ run, boot, stop });
+    const ep = await d.start("basalt");
+    expect(boot).toHaveBeenCalledWith("basalt");
+    // WslDriver forces host back to localhost (WSL2 forwards to the Windows host).
+    expect(ep.host).toBe("localhost");
+    await d.stop();
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
   it("rejects on non-zero exit", async () => {
     const run = vi.fn(async () => ({ code: 1, stdout: "", stderr: "wsl boom" }));
     const d = new WslDriver({ run });

@@ -3,6 +3,7 @@ import { spawnRunner } from "./spawnRunner.js";
 import { selectDriverKind, type ProbeResult, type DriverKind } from "./driverFactory.js";
 import { NativeDriver } from "./NativeDriver.js";
 import { WslDriver } from "./WslDriver.js";
+import { bootEmulator, stopEmulator, makeWslBootDeps } from "./bootEmulator.js";
 import type { BackendDriver } from "./BackendDriver.js";
 
 /**
@@ -37,7 +38,7 @@ async function qemuAvailable(): Promise<boolean> {
 
   // Probe the well-known pebble-tool SDK location used by bootEmulator.ts.
   const home = process.env.HOME ?? "";
-  const sdkQemu = `${home}/.local/share/pebble-sdk/SDKs/4.9.169/toolchain/bin/qemu-pebble`;
+  const sdkQemu = `${home}/.local/share/pebble-sdk/SDKs/current/toolchain/bin/qemu-pebble`;
   try {
     await access(sdkQemu);
     return true;
@@ -56,7 +57,13 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
   };
   const kind = selectDriverKind(probe);
   const driver = kind === "native"
-    ? new NativeDriver({ run: spawnRunner })
-    : new WslDriver({ run: spawnRunner });
+    ? new NativeDriver({ run: spawnRunner }) // native default boot/stop
+    : new WslDriver({
+        run: spawnRunner,
+        // On a Windows host the emulator lifecycle must run inside WSL via
+        // wsl.exe, not as Node-spawned Linux binaries on the Windows host.
+        boot: (id) => bootEmulator(id, makeWslBootDeps()),
+        stop: () => stopEmulator({ killAll: makeWslBootDeps().killAll }),
+      });
   return { driver, kind };
 }

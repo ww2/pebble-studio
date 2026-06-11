@@ -4,12 +4,18 @@ import type { PebbleCommand } from "./pebbleCli.js";
 import * as cli from "./pebbleCli.js";
 import { bootEmulator, stopEmulator } from "./bootEmulator.js";
 
+/** Default stop uses the native (current-host) teardown. */
+const defaultStop: StopFn = () => stopEmulator();
+
 export type BootFn = (id: PlatformId) => Promise<VncEndpoint>;
+export type StopFn = () => Promise<void>;
 
 export interface NativeDriverDeps {
   run: Runner;
   /** Real boot orchestration; injectable so unit tests never spawn processes. */
   boot?: BootFn;
+  /** Real stop orchestration; injectable so the WSL host can tear down in-WSL. */
+  stop?: StopFn;
 }
 
 export class NativeDriver implements BackendDriver {
@@ -25,7 +31,7 @@ export class NativeDriver implements BackendDriver {
   }
 
   async stop(): Promise<void> {
-    await stopEmulator();
+    await (this.deps.stop ?? defaultStop)();
   }
 
   async install(pbwPath: string): Promise<void> {

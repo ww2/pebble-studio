@@ -1,18 +1,18 @@
 import type { PlatformId, ButtonId, ButtonAction } from "../../shared/types.js";
 import type { BackendDriver, Runner, RunResult, VncEndpoint } from "./BackendDriver.js";
-import { NativeDriver, type BootFn } from "./NativeDriver.js";
+import { NativeDriver, type BootFn, type StopFn } from "./NativeDriver.js";
 
 export interface WslDriverDeps {
   run: Runner;
   /**
-   * Injectable boot function for unit tests (avoids spawning real processes).
-   *
-   * NOTE: The WSL-host boot path (wsl.exe booting the emulator from a Windows
-   * host) is unvalidated in the current Linux/WSL dev environment — there is no
-   * Windows host here. This path is exercised only when Electron runs on a real
-   * Windows host with WSL2 installed. The injectable boot keeps tests hermetic.
+   * Injectable boot function. In production (createDriver) this routes the full
+   * emulator boot through `wsl.exe -- bash -lc "... pebble emu-control --vnc"`
+   * so the lifecycle runs INSIDE WSL — the only place qemu-pebble exists when
+   * the Electron app runs on a Windows host. Injectable so tests stay hermetic.
    */
   boot?: BootFn;
+  /** Injectable stop; in production this tears down the stack inside WSL. */
+  stop?: StopFn;
 }
 
 /**
@@ -39,7 +39,7 @@ export class WslDriver implements BackendDriver {
       return deps.run("wsl.exe", ["--", cmd, ...args], env);
     };
 
-    this.inner = new NativeDriver({ run: wslRun, boot: deps.boot });
+    this.inner = new NativeDriver({ run: wslRun, boot: deps.boot, stop: deps.stop });
   }
 
   setPlatform(id: PlatformId): void {
