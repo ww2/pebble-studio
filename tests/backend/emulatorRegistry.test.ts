@@ -25,6 +25,15 @@ describe("emulatorRegistry", () => {
     expect(getPlatform("basalt").machine).toBe("pebble-snowy-bb");
   });
 
+  it("returns gabbro as a 260x260 round color touch display", () => {
+    const gabbro = getPlatform("gabbro");
+    expect(gabbro.round).toBe(true);
+    expect(gabbro.color).toBe(true);
+    expect(gabbro.touch).toBe(true);
+    expect(gabbro.width).toBe(260);
+    expect(gabbro.height).toBe(260);
+  });
+
   it("throws on an unknown platform", () => {
     // @ts-expect-error testing runtime guard
     expect(() => getPlatform("nope")).toThrow(/unknown platform/i);
