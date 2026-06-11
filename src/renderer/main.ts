@@ -64,7 +64,6 @@ const captureBar = new CaptureBar(() => document.querySelector<HTMLElement>("#em
 
 // Command bar: version switcher (styled as a Fluent combobox) + theme toggle.
 const combo = document.getElementById("version-combo")!;
-switcher.el.classList.add("combo-select");
 combo.appendChild(switcher.el);
 
 const themeToggle = document.createElement("button");

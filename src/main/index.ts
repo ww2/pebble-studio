@@ -50,12 +50,26 @@ function createWindow(): void {
       setTimeout(() => {
         void (async () => {
           try {
-            if (process.env.PEBBLE_UISHOT_LIGHT) {
-              await win.webContents.executeJavaScript(
-                "document.querySelector('.theme-toggle')?.click()",
-              );
-              await new Promise((r) => setTimeout(r, 600));
-            }
+            // Force the desired theme deterministically (independent of any
+            // persisted localStorage choice): the toggle label reads "Dark" when
+            // currently light and "Light" when currently dark, so click only if
+            // we are not already in the target theme.
+            const wantLight = Boolean(process.env.PEBBLE_UISHOT_LIGHT);
+            await win.webContents.executeJavaScript(
+              `(() => {
+                const b = document.querySelector('.theme-toggle');
+                if (!b) return;
+                const isDark = /Light/.test(b.textContent || '');
+                const want = ${wantLight ? "false" : "true"};
+                if (isDark !== want) b.click();
+              })()`,
+            );
+            await new Promise((r) => setTimeout(r, 600));
+            // Open the custom model dropdown so its legibility is captured.
+            await win.webContents.executeJavaScript(
+              "document.querySelector('.version-combo .version-combo-btn')?.click()",
+            );
+            await new Promise((r) => setTimeout(r, 400));
             const img = await win.webContents.capturePage();
             await writeFile(shotPath, img.toPNG());
             console.log(`[uishot] wrote ${shotPath}`);

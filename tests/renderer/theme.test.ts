@@ -25,11 +25,33 @@ describe("resolveTheme", () => {
       const t = resolveTheme(mode);
       for (const key of [
         "--surface", "--surface-2", "--raised", "--text-secondary",
-        "--accent-hover", "--border", "--hairline", "--control",
+        "--text-tertiary", "--accent-hover", "--border", "--hairline", "--control",
         "--elev-1", "--elev-2", "--elev-3", "--device-shadow",
       ]) {
         expect(t[key], `${mode} ${key}`).toBeTruthy();
       }
     }
+  });
+
+  it("provides legible menu/popup tokens for the custom combobox in both themes", () => {
+    for (const mode of ["light", "dark"] as ThemeMode[]) {
+      const t = resolveTheme(mode);
+      for (const key of [
+        "--menu-bg", "--menu-text", "--menu-text-secondary",
+        "--menu-hover", "--menu-selected", "--menu-selected-text", "--menu-border",
+      ]) {
+        expect(t[key], `${mode} ${key}`).toBeTruthy();
+      }
+      // Menu surface and its text must never be the same colour (no white-on-white).
+      expect(t["--menu-bg"]).not.toBe(t["--menu-text"]);
+    }
+  });
+
+  it("defines a green --success and a --danger token that differ between themes", () => {
+    expect(resolveTheme("light")["--success"]).toBe("#0f7b0f");
+    expect(resolveTheme("dark")["--success"]).toBe("#3fb950");
+    expect(resolveTheme("light")["--success"]).not.toBe(resolveTheme("dark")["--success"]);
+    expect(resolveTheme("light")["--danger"]).toBeTruthy();
+    expect(resolveTheme("dark")["--danger"]).toBeTruthy();
   });
 });
