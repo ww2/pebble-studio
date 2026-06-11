@@ -16,6 +16,7 @@ function basename(p: string): string {
 export class AppLibrary {
   readonly el: HTMLElement;
   private readonly dropZone: HTMLElement;
+  private readonly pickBtn: HTMLButtonElement;
   private readonly list: HTMLUListElement;
   private readonly errorMsg: HTMLElement;
   private readonly header: HTMLElement;
@@ -69,8 +70,17 @@ export class AppLibrary {
     this.errorMsg = document.createElement("span");
     this.errorMsg.className = "lib-error";
 
+    // "Select file" button — opens a native picker as an alternative to drag-drop.
+    this.pickBtn = document.createElement("button");
+    this.pickBtn.className = "lib-pick-btn";
+    this.pickBtn.type = "button";
+    this.pickBtn.textContent = "Select file…";
+    this.pickBtn.title = "Choose one or more .pbw files to install";
+    this.pickBtn.addEventListener("click", () => void this.handlePick());
+
     this.dropZone.appendChild(dropIcon);
     this.dropZone.appendChild(dropLabel);
+    this.dropZone.appendChild(this.pickBtn);
     this.dropZone.appendChild(this.errorMsg);
 
     this.list = document.createElement("ul");
@@ -100,20 +110,44 @@ export class AppLibrary {
     this.errorMsg.textContent = "";
     const files = Array.from(e.dataTransfer?.files ?? []);
     for (const file of files) {
-      const filePath = window.studio.pathForFile(file);
-      if (!filePath.endsWith(".pbw")) {
-        this.errorMsg.textContent = `Not a .pbw file: ${file.name}`;
-        continue;
-      }
-      try {
-        await window.studio.libAdd(filePath);
-        await window.studio.install(filePath);
-      } catch (err) {
-        console.error("[lib] install failed", filePath, err);
-        this.errorMsg.textContent = `Install failed: ${file.name}`;
-      }
+      await this.installPath(window.studio.pathForFile(file));
     }
     await this.refresh();
+  }
+
+  /** Open the native file picker and install whatever the user selects. */
+  private async handlePick(): Promise<void> {
+    this.errorMsg.textContent = "";
+    const paths = await window.studio.pickPbw();
+    if (paths.length === 0) return; // cancelled — no-op, no error shown
+    for (const filePath of paths) {
+      await this.installPath(filePath);
+    }
+    await this.refresh();
+  }
+
+  /**
+   * Shared install routine for both drag-drop and the file picker (DRY).
+   * Validates the extension, then runs the libAdd + install pair. On failure
+   * surfaces the real reason (first line of the driver's error message), which
+   * already includes the underlying stderr.
+   */
+  private async installPath(filePath: string): Promise<void> {
+    const name = basename(filePath);
+    if (!filePath.endsWith(".pbw")) {
+      this.errorMsg.textContent = `Not a .pbw file: ${name}`;
+      return;
+    }
+    try {
+      await window.studio.libAdd(filePath);
+      await window.studio.install(filePath);
+    } catch (err) {
+      console.error("[lib] install failed", filePath, err);
+      const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
+      this.errorMsg.textContent = reason
+        ? `Install failed: ${name} — ${reason}`
+        : `Install failed: ${name}`;
+    }
   }
 
   private async handleClear(): Promise<void> {

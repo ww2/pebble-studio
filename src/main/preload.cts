@@ -15,6 +15,7 @@ const studio = {
   loadedList: (): Promise<string[]> => ipcRenderer.invoke("loaded:list"),
   loadedClear: (platformId: string) => ipcRenderer.invoke("loaded:clear", platformId),
   pathForFile: (file: File) => webUtils.getPathForFile(file),
+  pickPbw: (): Promise<string[]> => ipcRenderer.invoke("dialog:pickPbw"),
   saveCapture: (name: string, bytes: Uint8Array): Promise<string> =>
     ipcRenderer.invoke("capture:save", name, bytes),
 };

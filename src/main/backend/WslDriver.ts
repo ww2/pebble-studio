@@ -1,6 +1,7 @@
 import type { PlatformId, ButtonId, ButtonAction } from "../../shared/types.js";
 import type { BackendDriver, Runner, RunResult, VncEndpoint } from "./BackendDriver.js";
 import { NativeDriver, type BootFn, type StopFn } from "./NativeDriver.js";
+import { toWslPath } from "./wslPath.js";
 
 export interface WslDriverDeps {
   run: Runner;
@@ -69,7 +70,13 @@ export class WslDriver implements BackendDriver {
   }
 
   async install(pbwPath: string): Promise<void> {
-    return this.inner.install(pbwPath);
+    // Dropped/picked .pbw files arrive as Windows paths on a Windows host
+    // (`C:\Users\you\app.pbw`). Translate to the WSL mount (`/mnt/c/...`) before
+    // the path crosses into WSL — `pebble` inside WSL can't open a `C:\` path.
+    // This also covers reinstall-on-boot, since lib:installAll / emu:install
+    // both route through driver.install(). NativeDriver is left untouched (its
+    // paths are already POSIX in pure-Linux dev).
+    return this.inner.install(toWslPath(pbwPath));
   }
 
   async button(id: ButtonId, action: ButtonAction): Promise<void> {

@@ -1,9 +1,11 @@
 /* ============================================================================
-   Pebble Studio — Windows 11 Fluent + Material SaaS design system
+   Pebble Studio — Windows 11 Fluent Design system
    ----------------------------------------------------------------------------
-   8px spacing grid · 8px card radius · layered Mica backdrop · soft elevation
-   shadows · hairline borders · accent used sparingly for primary/selection.
-   Type scale: 20 / 16 / 13 / 11. Theme tokens live in theme.ts.
+   4px spacing grid · 8px window/card radius · 4px control radius · opaque Mica
+   backdrop · Acrylic (blur) only on transient surfaces · hairline strokes with
+   a marginally darker bottom edge · accent used sparingly for primary/selection.
+   Type ramp: Caption 12 / Body 14 / Body Strong 14·600 / Subtitle 20·600 /
+   Title 28·600. Color + elevation tokens live in theme.ts.
    ========================================================================== */
 
 :root {
@@ -11,28 +13,48 @@
      resolveTheme() overrides all of these via inline custom properties. */
   --bg: #202020;
   --surface: #2b2b2b;
-  --surface-2: #323232;
-  --raised: #373737;
-  --text: #ffffff;
-  --text-secondary: rgba(255,255,255,0.72);
-  --text-tertiary: rgba(255,255,255,0.50);
-  --border: #3a3a3a;
-  --border-strong: #484848;
+  --surface-2: #272727;
+  --raised: #2f2f2f;
+  --text: rgba(255,255,255,0.89);
+  --text-secondary: rgba(255,255,255,0.6);
+  --text-tertiary: rgba(255,255,255,0.45);
+  --border: rgba(255,255,255,0.07);
+  --border-strong: rgba(255,255,255,0.12);
+  --hairline: rgba(255,255,255,0.07);
+  --control-bottom: rgba(0,0,0,0.30);
   --success: #3fb950;
-  --danger: #ff6b6b;
-  --menu-bg: #2c2c2c;
-  --menu-text: #ffffff;
+  --danger: #ff99a4;
+  --acrylic: rgba(44,44,44,0.78);
+  --menu-bg: rgba(44,44,44,0.82);
+  --menu-text: rgba(255,255,255,0.89);
   --menu-text-secondary: rgba(255,255,255,0.55);
   --menu-hover: rgba(255,255,255,0.08);
   --menu-selected: rgba(96,205,255,0.20);
-  --menu-selected-text: #ffffff;
-  --menu-border: #454545;
+  --menu-selected-text: rgba(255,255,255,0.92);
+  --menu-border: rgba(255,255,255,0.10);
+
+  /* Corners: 8px on windows/cards/dialogs, 4px on buttons/inputs/small controls. */
   --radius-card: 8px;
-  --radius-control: 6px;
+  --radius-control: 4px;
   --radius-sm: 4px;
+
+  /* Type ramp (Fluent). */
+  --type-caption: 12px;
+  --type-body: 14px;
+  --type-subtitle: 20px;
+  --type-title: 28px;
+
+  /* Motion: standard Fluent ease + duration. */
   --ease: cubic-bezier(0.33, 0, 0.2, 1);
-  --dur: 140ms;
+  --dur: 160ms;
 }
+
+/* ── Type ramp utility classes ───────────────────────────────────────────── */
+.type-caption     { font-size: var(--type-caption); line-height: 1.4; }
+.type-body        { font-size: var(--type-body); line-height: 1.45; }
+.type-body-strong { font-size: var(--type-body); font-weight: 600; line-height: 1.45; }
+.type-subtitle    { font-size: var(--type-subtitle); font-weight: 600; line-height: 1.3; }
+.type-title       { font-size: var(--type-title); font-weight: 600; line-height: 1.2; }
 
 * { box-sizing: border-box; }
 
@@ -45,7 +67,7 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, sans-serif;
-  font-size: 13px;
+  font-size: var(--type-body);
   line-height: 1.45;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
@@ -54,24 +76,26 @@ body {
 
 #app { height: 100%; }
 
-/* ── Mica-style layered backdrop ─────────────────────────────────────────── */
+/* ── Mica backdrop ───────────────────────────────────────────────────────────
+   Opaque, subtly tinted neutral: the base token with a faint neutral tint
+   layered on top. NOT translucent — translucency (Acrylic) is reserved for
+   transient surfaces (menus / flyouts / the version popup). */
 .app-backdrop {
   position: fixed;
   inset: 0;
   z-index: -1;
   background:
-    radial-gradient(1200px 700px at 78% -10%, var(--bg-tint), transparent 60%),
-    radial-gradient(900px 600px at -10% 110%, var(--accent-soft), transparent 55%),
+    linear-gradient(var(--bg-tint), var(--bg-tint)),
     var(--bg);
 }
-/* Faint atmospheric noise so the surface isn't flat. */
+/* Faint atmospheric noise so the Mica surface isn't perfectly flat. */
 .app-backdrop::after {
   content: "";
   position: absolute;
   inset: 0;
-  opacity: 0.6;
+  opacity: 0.5;
   mix-blend-mode: overlay;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
 }
 
 /* ── App shell ───────────────────────────────────────────────────────────── */
@@ -90,9 +114,10 @@ body {
   justify-content: space-between;
   padding: 0 20px;
   border-bottom: 1px solid var(--hairline);
-  background: color-mix(in srgb, var(--surface) 55%, transparent);
-  -webkit-backdrop-filter: blur(20px) saturate(160%);
-  backdrop-filter: blur(20px) saturate(160%);
+  /* Acrylic chrome: translucent fill + backdrop blur. */
+  background: var(--acrylic);
+  -webkit-backdrop-filter: blur(30px) saturate(160%);
+  backdrop-filter: blur(30px) saturate(160%);
 }
 
 .cmdbar-brand {
@@ -116,7 +141,6 @@ body {
 
 .brand-name {
   font-size: 16px;
-  font-weight: 600;
   letter-spacing: 0.1px;
 }
 
@@ -129,7 +153,7 @@ body {
   border-radius: 999px;
   background: var(--control);
   border: 1px solid var(--hairline);
-  font-size: 11px;
+  font-size: var(--type-caption);
   color: var(--text-secondary);
 }
 .backend-dot {
@@ -154,7 +178,7 @@ body {
   gap: 8px;
 }
 .combo-caption {
-  font-size: 11px;
+  font-size: var(--type-caption);
   color: var(--text-tertiary);
   font-weight: 600;
   text-transform: uppercase;
@@ -173,11 +197,13 @@ body {
   min-width: 168px;
   background: var(--raised);
   color: var(--text);
+  /* Fluent control stroke: 1px hairline all round, marginally darker at bottom. */
   border: 1px solid var(--border);
+  border-bottom-color: var(--control-bottom);
   border-radius: var(--radius-control);
   padding: 7px 12px;
   font: inherit;
-  font-size: 13px;
+  font-size: var(--type-body);
   cursor: pointer;
   transition: border-color var(--dur) var(--ease), background-color var(--dur) var(--ease);
 }
@@ -185,7 +211,7 @@ body {
 .version-combo-caret {
   flex: 0 0 auto;
   color: var(--text-tertiary);
-  font-size: 11px;
+  font-size: var(--type-caption);
   line-height: 1;
 }
 .version-combo-btn:hover { background-color: var(--control-hover); border-color: var(--border-strong); }
@@ -199,6 +225,7 @@ body {
   box-shadow: 0 0 0 1px var(--accent);
 }
 
+/* Acrylic flyout: translucent menu fill + backdrop blur (transient surface). */
 .version-combo-popup {
   position: absolute;
   top: calc(100% + 6px);
@@ -209,9 +236,11 @@ body {
   overflow-y: auto;
   padding: 4px;
   background: var(--menu-bg);
+  -webkit-backdrop-filter: blur(40px) saturate(170%);
+  backdrop-filter: blur(40px) saturate(170%);
   color: var(--menu-text);
   border: 1px solid var(--menu-border);
-  border-radius: var(--radius-control);
+  border-radius: var(--radius-card);
   box-shadow: var(--elev-3);
 }
 .version-combo-option {
@@ -225,9 +254,9 @@ body {
   cursor: pointer;
   white-space: nowrap;
 }
-.version-combo-opt-label { font-size: 13px; }
+.version-combo-opt-label { font-size: var(--type-body); }
 .version-combo-opt-id {
-  font-size: 11px;
+  font-size: var(--type-caption);
   color: var(--menu-text-secondary);
   font-variant-numeric: tabular-nums;
 }
@@ -239,31 +268,108 @@ body {
 .version-combo-option.is-selected .version-combo-opt-id { color: var(--menu-selected-text); opacity: 0.75; }
 .version-combo-option.is-selected.is-active { background: var(--menu-selected); }
 
-/* ── Theme toggle ────────────────────────────────────────────────────────── */
-.theme-toggle {
+/* ── Fluent toggle switch (pill track + knob, accent when on) ─────────────── */
+.fluent-switch {
+  --switch-w: 40px;
+  --switch-h: 20px;
+  --knob: 12px;
+  position: relative;
+  flex: 0 0 auto;
+  width: var(--switch-w);
+  height: var(--switch-h);
+  padding: 0;
+  border-radius: 999px;
   background: var(--control);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-control);
-  padding: 7px 14px;
-  font: inherit;
-  font-size: 13px;
+  border: 1px solid var(--text-secondary);
   cursor: pointer;
   transition: background-color var(--dur) var(--ease), border-color var(--dur) var(--ease);
 }
-.theme-toggle:hover { background: var(--control-hover); border-color: var(--border-strong); }
-.theme-toggle:active { background: var(--control-press); }
-.theme-toggle:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.fluent-switch:hover { background: var(--control-hover); }
+.fluent-switch:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent); }
+.fluent-switch-knob {
+  position: absolute;
+  top: 50%;
+  left: 3px;
+  width: var(--knob);
+  height: var(--knob);
+  border-radius: 50%;
+  background: var(--text-secondary);
+  transform: translateY(-50%);
+  transition: transform var(--dur) var(--ease), background-color var(--dur) var(--ease),
+    width var(--dur) var(--ease), height var(--dur) var(--ease);
+}
+.fluent-switch--on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.fluent-switch--on:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.fluent-switch--on .fluent-switch-knob {
+  background: var(--accent-fg);
+  transform: translate(calc(var(--switch-w) - var(--knob) - 8px), -50%);
+}
 
-/* ── Workspace: two columns ──────────────────────────────────────────────── */
+/* ── Workspace: nav rail + persistent stage + swappable inspector ─────────── */
 .workspace {
   flex: 1 1 auto;
   min-height: 0;
   display: grid;
-  grid-template-columns: 1fr 336px;
+  grid-template-columns: auto 1fr 336px;
   gap: 16px;
   padding: 16px;
 }
+
+/* ── Left navigation rail ────────────────────────────────────────────────── */
+.nav-rail-host {
+  display: flex;
+}
+.nav-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 64px;
+  padding: 4px;
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  box-shadow: var(--elev-1);
+}
+.nav-rail-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 100%;
+  height: 56px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  font: inherit;
+  transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.nav-rail-item:hover { background: var(--control-hover); color: var(--text); }
+.nav-rail-item:active { background: var(--control-press); }
+.nav-rail-item:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent); }
+.nav-rail-item--active { color: var(--text); }
+.nav-rail-glyph { font-size: 18px; line-height: 1; }
+.nav-rail-label { font-size: var(--type-caption); line-height: 1; }
+/* Accent pill on the left edge when selected. */
+.nav-rail-pill {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 3px;
+  height: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  transform: translateY(-50%);
+  transition: height var(--dur) var(--ease);
+}
+.nav-rail-item--active .nav-rail-pill { height: 18px; }
 
 /* ── Device stage (hero) ─────────────────────────────────────────────────── */
 .stage-col {
@@ -293,15 +399,29 @@ body {
    tucked against the frame edge and partly hidden under a rim pseudo-element so
    they read as nubs built into the casing. */
 .emu-frame {
-  --frame-pad: 16px;
+  /* B3: bezel reduced ~60% (16 → 6 square / 18 → 7 round); the rim ::after keys
+     off --frame-pad so it tracks automatically. Tuck offsets and border-radius
+     below were re-tuned proportionally for the thinner bezel. */
+  --frame-pad: 6px;
+  /* B5: casing color. Default black; the round bezel toggle overrides this to a
+     light value. The casing background + rim ::after gradient both key off it so
+     a tasteful shading is kept for either color. */
+  --case-color: #1a1c1f;
+  --case-hi: rgba(255, 255, 255, 0.06);
   position: relative;
   padding: var(--frame-pad);
-  border-radius: 22px;
-  background: linear-gradient(155deg, var(--raised), var(--surface));
+  border-radius: 14px;
+  background: linear-gradient(155deg, color-mix(in srgb, var(--case-color) 100%, white 6%), var(--case-color));
   border: 1px solid var(--border);
-  box-shadow: var(--device-shadow), inset 0 1px 0 var(--hairline);
+  box-shadow: var(--device-shadow), inset 0 1px 0 var(--case-hi);
 }
-.emu-frame--round { --frame-pad: 18px; border-radius: 50%; }
+.emu-frame--round { --frame-pad: 7px; border-radius: 50%; }
+
+/* B5: light ("white") casing variant for round models. */
+.emu-frame--case-white {
+  --case-color: #e9eaec;
+  --case-hi: rgba(255, 255, 255, 0.7);
+}
 
 /* Frame rim: a copy of the casing edge drawn ABOVE the buttons so each nub's
    inner half is concealed under the casing (tucked-in illusion). It's a thick
@@ -317,9 +437,9 @@ body {
   border: var(--frame-pad) solid transparent;
   box-shadow:
     inset 0 0 0 1px var(--border),
-    inset 0 1px 0 var(--hairline);
+    inset 0 1px 0 var(--case-hi);
   background:
-    linear-gradient(155deg, var(--raised), var(--surface)) border-box;
+    linear-gradient(155deg, color-mix(in srgb, var(--case-color) 100%, white 6%), var(--case-color)) border-box;
   -webkit-mask:
     linear-gradient(#000 0 0) padding-box,
     linear-gradient(#000 0 0);
@@ -345,6 +465,27 @@ body {
   background: #000;
 }
 .emu-screen--round { border-radius: 50%; }
+
+/* A4: neutral "Switching…" placeholder shown over the stage while the old watch
+   tears down and before the new geometry is applied, so old + new never overlap.
+   The frame is collapsed to a neutral pill during the switch (see .emu-frame--switching). */
+.emu-switch-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: inherit;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: var(--type-body);
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+.emu-frame--switching .emu-switch-overlay { display: flex; }
+/* While switching, hide the button overlay so old buttons don't linger. */
+.emu-frame--switching .emu-buttons { display: none; }
 
 /* noVNC injects a canvas; let it fill the host and stay crisp when zoomed. */
 .emu-screen canvas {
@@ -390,30 +531,31 @@ body {
   width: 16px;
   border-radius: 3px;
 }
-/* Left side: most of the nub sits just left of (outside) the casing edge. */
+/* Left side: most of the nub sits just left of (outside) the casing edge.
+   B1: Back aligns vertically with Up (top: 24%, no centering); height 34px. */
 .emu-hit--back {
-  left: -13px;
-  top: 50%;
+  left: -11px;
+  top: 24%;
   height: 34px;
-  transform: translateY(-50%);
   border-radius: 3px 0 0 3px;
 }
 /* Right side: most of the nub sits just right of (outside) the casing edge. */
 .emu-hit--up {
-  right: -13px;
+  right: -11px;
   top: 24%;
   height: 34px;
   border-radius: 0 3px 3px 0;
 }
+/* B1: all four square buttons unified to 34px (Select was 40px). */
 .emu-hit--select {
-  right: -13px;
+  right: -11px;
   top: 50%;
-  height: 40px;
+  height: 34px;
   transform: translateY(-50%);
   border-radius: 0 3px 3px 0;
 }
 .emu-hit--down {
-  right: -13px;
+  right: -11px;
   bottom: 24%;
   height: 34px;
   border-radius: 0 3px 3px 0;
@@ -424,34 +566,36 @@ body {
    down-toward-center, Down tilts up-toward-center, Select stays horizontal, and
    Back sits on the left edge pointing toward center. Back height == Select. */
 .emu-buttons--round .emu-hit--back {
-  left: -13px;
+  left: -11px;
   top: 50%;
   height: 40px;
   transform: translateY(-50%);
   border-radius: 3px 0 0 3px;
 }
 .emu-buttons--round .emu-hit--select {
-  right: -13px;
+  right: -11px;
   top: 50%;
   height: 40px;
   transform: translateY(-50%);
   border-radius: 0 3px 3px 0;
 }
 /* Up/Down rotate toward the circle center. Positioned on the upper/lower-right
-   arc; the rotation tilts them radially (down-toward-center / up-toward-center). */
+   arc; the rotation tilts them radially (down-toward-center / up-toward-center).
+   B2: height 32 → 40 to match Select; arc position re-tuned (right/top/bottom)
+   so the taller nubs still sit on the rim. */
 .emu-buttons--round .emu-hit--up {
-  right: 4px;
-  top: 23%;
-  height: 32px;
+  right: 1px;
+  top: 21%;
+  height: 40px;
   transform: rotate(52deg);
   transform-origin: center;
   border-radius: 3px;
 }
 .emu-buttons--round .emu-hit--down {
-  right: 4px;
-  bottom: 23%;
+  right: 1px;
+  bottom: 21%;
   top: auto;
-  height: 32px;
+  height: 40px;
   transform: rotate(-52deg);
   transform-origin: center;
   border-radius: 3px;
@@ -479,7 +623,7 @@ body {
 }
 
 .emu-caption {
-  font-size: 13px;
+  font-size: var(--type-body);
   color: var(--text-secondary);
   font-weight: 600;
   letter-spacing: 0.2px;
@@ -518,7 +662,7 @@ body {
 }
 
 .emu-zoom-label {
-  font-size: 11px;
+  font-size: var(--type-caption);
   color: var(--text-tertiary);
   font-weight: 600;
   text-transform: uppercase;
@@ -541,7 +685,7 @@ body {
   border-right: 1px solid var(--border);
   padding: 5px 11px;
   font: inherit;
-  font-size: 12px;
+  font-size: var(--type-caption);
   cursor: pointer;
   transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
   line-height: 1;
@@ -557,6 +701,51 @@ body {
 }
 .emu-zoom-opt--active:hover { background: var(--accent-hover); }
 
+/* B5: round-bezel black/white toggle. Reuses the segmented-control look; shown
+   only for round models (toggled via hidden attribute from EmulatorView). */
+.emu-case-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.emu-case-toggle[hidden] { display: none; }
+.emu-case-label {
+  font-size: var(--type-caption);
+  color: var(--text-tertiary);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  white-space: nowrap;
+}
+.emu-case-segmented {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  overflow: hidden;
+}
+.emu-case-opt {
+  background: var(--control);
+  color: var(--text-secondary);
+  border: none;
+  border-right: 1px solid var(--border);
+  padding: 5px 11px;
+  font: inherit;
+  font-size: var(--type-caption);
+  cursor: pointer;
+  transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
+  line-height: 1;
+  white-space: nowrap;
+}
+.emu-case-opt:last-child { border-right: none; }
+.emu-case-opt:hover { background: var(--control-hover); color: var(--text); }
+.emu-case-opt:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent); }
+.emu-case-opt--active {
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+.emu-case-opt--active:hover { background: var(--accent-hover); }
+
 /* Material-ish buttons: filled accent (primary) + subtle (secondary). */
 .emu-action {
   position: relative;
@@ -564,7 +753,7 @@ body {
   border-radius: var(--radius-control);
   padding: 8px 20px;
   font: inherit;
-  font-size: 13px;
+  font-size: var(--type-body);
   font-weight: 600;
   cursor: pointer;
   overflow: hidden;
@@ -581,26 +770,38 @@ body {
 .emu-action--subtle {
   background: var(--control);
   color: var(--text);
+  /* Fluent control stroke with a marginally darker bottom edge. */
   border-color: var(--border);
+  border-bottom-color: var(--control-bottom);
 }
 .emu-action--subtle:hover { background: var(--control-hover); border-color: var(--border-strong); }
 .emu-action--subtle:active { background: var(--control-press); transform: translateY(1px); }
 .emu-action:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent); }
 
 .emu-status {
-  font-size: 11px;
+  font-size: var(--type-caption);
   color: var(--text-tertiary);
   min-height: 1em;
   text-align: center;
 }
 
-/* ── Inspector column ────────────────────────────────────────────────────── */
+/* ── Inspector column (swappable pane) ───────────────────────────────────── */
 .inspector {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 16px;
   overflow-y: auto;
+}
+.inspector-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  /* Subtle connected reveal when the nav rail swaps the pane. */
+  animation: pane-reveal var(--dur) var(--ease);
+}
+@keyframes pane-reveal {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 .card {
@@ -616,11 +817,76 @@ body {
 
 .card-title {
   margin: 0;
-  font-size: 13px;
-  font-weight: 600;
+  font-size: var(--type-caption);
   color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
+}
+
+/* ── Settings pane ───────────────────────────────────────────────────────── */
+.settings-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.settings-section-title {
+  margin: 0;
+  color: var(--text);
+}
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.settings-row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.settings-row-label { color: var(--text); }
+.settings-row-desc { color: var(--text-secondary); margin: 0; }
+/* Hosts the "Startup watch" dropdown. */
+.settings-default-watch {
+  display: flex;
+}
+.settings-watch-control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+.settings-watch-label { color: var(--text); }
+.settings-watch-select {
+  appearance: none;
+  -webkit-appearance: none;
+  background:
+    var(--raised)
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='none' stroke='%23808080' stroke-width='1.5'%3E%3Cpath d='M3 4.5 6 7.5 9 4.5'/%3E%3C/svg%3E")
+    no-repeat right 8px center;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-bottom-color: var(--control-bottom);
+  border-radius: var(--radius-control);
+  padding: 6px 28px 6px 10px;
+  font: inherit;
+  font-size: var(--type-body);
+  cursor: pointer;
+  min-width: 160px;
+  transition: border-color var(--dur) var(--ease);
+}
+.settings-watch-select:hover { border-color: var(--border-strong); }
+.settings-watch-select:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
 }
 
 /* ── App library ─────────────────────────────────────────────────────────── */
@@ -660,11 +926,32 @@ body {
 }
 .lib-drop-label {
   color: var(--text-tertiary);
-  font-size: 13px;
+  font-size: var(--type-body);
+}
+/* "Select file…" button — Fluent secondary (neutral fill) style. */
+.lib-pick-btn {
+  margin-top: 2px;
+  background: var(--control);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-bottom-color: var(--control-bottom);
+  border-radius: var(--radius-control);
+  padding: 5px 14px;
+  font: inherit;
+  font-size: var(--type-body);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.lib-pick-btn:hover { background: var(--control-hover); border-color: var(--border-strong); }
+.lib-pick-btn:active { transform: translateY(1px); }
+.lib-pick-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--accent);
 }
 .lib-error {
   color: var(--danger);
-  font-size: 11px;
+  font-size: var(--type-caption);
   min-height: 1em;
 }
 
@@ -685,7 +972,7 @@ body {
   background: var(--control);
   border: 1px solid var(--hairline);
   border-radius: var(--radius-control);
-  font-size: 13px;
+  font-size: var(--type-body);
   word-break: break-all;
   transition: background var(--dur) var(--ease);
 }
@@ -713,14 +1000,14 @@ body {
   min-height: 24px;
 }
 .lib-loaded-count {
-  font-size: 12px;
+  font-size: var(--type-caption);
   color: var(--success);
   font-weight: 600;
 }
 /* "● loaded" pill on individual list items */
 .lib-loaded-pill {
   flex-shrink: 0;
-  font-size: 11px;
+  font-size: var(--type-caption);
   font-weight: 600;
   color: var(--success);
   background: color-mix(in srgb, var(--success) 14%, transparent);
@@ -736,7 +1023,7 @@ body {
   background: transparent;
   border: 1px solid var(--danger);
   color: var(--danger);
-  font-size: 12px;
+  font-size: var(--type-caption);
   font-weight: 500;
   padding: 3px 10px;
   border-radius: var(--radius-control);
@@ -759,7 +1046,7 @@ body {
   flex-wrap: wrap;
 }
 .capture-label {
-  font-size: 13px;
+  font-size: var(--type-body);
   color: var(--text-secondary);
 }
 .capture-select {
@@ -771,10 +1058,11 @@ body {
     no-repeat right 8px center;
   color: var(--text);
   border: 1px solid var(--border);
+  border-bottom-color: var(--control-bottom);
   border-radius: var(--radius-sm);
   padding: 6px 26px 6px 10px;
   font: inherit;
-  font-size: 13px;
+  font-size: var(--type-body);
   cursor: pointer;
   transition: border-color var(--dur) var(--ease);
 }
@@ -787,7 +1075,7 @@ body {
   border-radius: var(--radius-control);
   padding: 7px 14px;
   font: inherit;
-  font-size: 13px;
+  font-size: var(--type-body);
   font-weight: 600;
   cursor: pointer;
   transition: background-color var(--dur) var(--ease), transform var(--dur) var(--ease);
@@ -800,6 +1088,7 @@ body {
   background: var(--control);
   color: var(--accent);
   border-color: var(--border);
+  border-bottom-color: var(--control-bottom);
 }
 .capture-btn--rec:hover { background: var(--control-hover); }
 .capture-btn--recording {
@@ -814,7 +1103,7 @@ body {
 }
 
 .capture-status {
-  font-size: 11px;
+  font-size: var(--type-caption);
   color: var(--text-tertiary);
   word-break: break-all;
   flex: 1 1 100%;
@@ -823,7 +1112,7 @@ body {
 
 /* ── Responsiveness for the 1100×760 window ──────────────────────────────── */
 @media (max-width: 980px) {
-  .workspace { grid-template-columns: 1fr 300px; }
+  .workspace { grid-template-columns: auto 1fr 300px; }
 }
 
 /* Scrollbar polish (Fluent thin) */

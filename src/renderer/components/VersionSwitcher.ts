@@ -94,6 +94,18 @@ export class VersionSwitcher {
     return this.selected;
   }
 
+  /**
+   * Programmatically set the selection (e.g. from the Settings "Startup watch"
+   * dropdown) WITHOUT firing onChange — the caller drives the preview itself,
+   * so this only keeps the combo's shown value in sync.
+   */
+  set value(id: PlatformId) {
+    if (!PLATFORMS.some((p) => p.id === id) || id === this.selected) return;
+    this.selected = id;
+    this.syncButton();
+    this.syncSelectedState();
+  }
+
   // ── internals ────────────────────────────────────────────────────────────
   private indexOfSelected(): number {
     return PLATFORMS.findIndex((p) => p.id === this.selected);
