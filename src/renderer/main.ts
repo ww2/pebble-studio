@@ -4,6 +4,7 @@ import { VersionSwitcher } from "./components/VersionSwitcher.js";
 import { AppLibrary } from "./components/AppLibrary.js";
 import { CaptureBar } from "./components/CaptureBar.js";
 import type { PlatformId } from "../shared/types.js";
+import { getPlatform } from "../main/backend/emulatorRegistry.js";
 
 interface StudioApi {
   initBackend(): Promise<{ kind: string }>;
@@ -60,7 +61,10 @@ app.innerHTML = `
 const view = new EmulatorView();
 const switcher = new VersionSwitcher((id: PlatformId) => void view.show(id), "basalt");
 const library = new AppLibrary();
-const captureBar = new CaptureBar(() => document.querySelector<HTMLElement>("#emu-screen"));
+const captureBar = new CaptureBar(
+  () => document.querySelector<HTMLElement>("#emu-screen"),
+  () => getPlatform(switcher.value as PlatformId).round,
+);
 
 // Command bar: version switcher (styled as a Fluent combobox) + theme toggle.
 const combo = document.getElementById("version-combo")!;

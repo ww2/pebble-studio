@@ -1,6 +1,10 @@
 import GIF from "gif.js";
 import { FrameBudget } from "../../capture/gifRecorder.js";
-import { grabUpscaled, rgbaToBlob } from "../captureCanvas.js";
+import { grabUpscaled, rgbaToBlob, applyCircularMask } from "../captureCanvas.js";
+import type { RgbaImage } from "../../capture/upscale.js";
+
+/** Magenta key color used as the transparent index in round GIFs. */
+const GIF_TRANSPARENT_COLOR = 0xff00ff;
 
 export class CaptureBar {
   readonly el: HTMLElement;
@@ -13,7 +17,10 @@ export class CaptureBar {
   private gif: InstanceType<typeof GIF> | null = null;
   private recTimer: ReturnType<typeof setInterval> | null = null;
 
-  constructor(private readonly getHost: () => HTMLElement | null) {
+  constructor(
+    private readonly getHost: () => HTMLElement | null,
+    private readonly isRound: () => boolean = () => false,
+  ) {
     this.el = document.createElement("div");
     this.el.className = "capture-bar";
 
@@ -28,7 +35,7 @@ export class CaptureBar {
       const opt = document.createElement("option");
       opt.value = String(v);
       opt.textContent = `${v}\xD7`;
-      if (v === 4) opt.selected = true;
+      if (v === 1) opt.selected = true;
       this.select.appendChild(opt);
     }
 
@@ -66,11 +73,36 @@ export class CaptureBar {
     return String(Date.now());
   }
 
+  /**
+   * Apply mask to frame when on a round platform.
+   * For GIF frames also replace masked pixels with the transparent key color
+   * so gif.js can index them as transparent.
+   */
+  private maybeCircularMask(frame: RgbaImage, forGif = false): RgbaImage {
+    if (!this.isRound()) return frame;
+    const masked = applyCircularMask(frame);
+    if (!forGif) return masked;
+
+    // Replace alpha-0 pixels with the GIF transparent key color so gif.js
+    // can use them as the transparent index.
+    const out = new Uint8Array(masked.data);
+    for (let i = 0; i < out.length; i += 4) {
+      if (out[i + 3] === 0) {
+        out[i]     = (GIF_TRANSPARENT_COLOR >> 16) & 0xff; // R
+        out[i + 1] = (GIF_TRANSPARENT_COLOR >> 8) & 0xff;  // G
+        out[i + 2] = GIF_TRANSPARENT_COLOR & 0xff;          // B
+        out[i + 3] = 255; // make opaque so gif.js sees the color
+      }
+    }
+    return { data: out, width: masked.width, height: masked.height };
+  }
+
   private async takeScreenshot(): Promise<void> {
     const host = this.getHost();
     if (!host) { this.status.textContent = "No emulator screen"; return; }
     try {
-      const frame = grabUpscaled(host, this.factor());
+      const raw = grabUpscaled(host, this.factor());
+      const frame = this.maybeCircularMask(raw);
       const blob = await rgbaToBlob(frame);
       const arrayBuffer = await blob.arrayBuffer();
       const bytes = new Uint8Array(arrayBuffer);
@@ -96,7 +128,7 @@ export class CaptureBar {
     if (!host) { this.status.textContent = "No emulator screen"; return; }
 
     // Grab a first frame to determine dimensions
-    let firstFrame;
+    let firstFrame: RgbaImage;
     try {
       firstFrame = grabUpscaled(host, this.factor());
     } catch (err) {
@@ -110,14 +142,21 @@ export class CaptureBar {
 
     const budget = new FrameBudget({ fps: 15, maxSeconds: 8 });
     const stamp = this.stamp();
+    const round = this.isRound();
 
-    this.gif = new GIF({
+    const gifOptions: ConstructorParameters<typeof GIF>[0] = {
       workers: 2,
       quality: 10,
       width: firstFrame.width,
       height: firstFrame.height,
       workerScript: "./gif.worker.js",
-    });
+    };
+    if (round) {
+      gifOptions.transparent = GIF_TRANSPARENT_COLOR;
+      gifOptions.background = "#ff00ff";
+    }
+
+    this.gif = new GIF(gifOptions);
 
     const gifRef = this.gif;
 
@@ -136,7 +175,8 @@ export class CaptureBar {
 
     // Add the first frame immediately
     if (budget.tryAdd()) {
-      const canvas = this.imageToCanvas(firstFrame);
+      const maskedFirst = this.maybeCircularMask(firstFrame, true);
+      const canvas = this.imageToCanvas(maskedFirst);
       gifRef.addFrame(canvas, { delay: budget.frameDelayMs(), copy: true });
     }
 
@@ -146,8 +186,9 @@ export class CaptureBar {
         return;
       }
       try {
-        const frame = grabUpscaled(host, this.factor());
+        const raw = grabUpscaled(host, this.factor());
         if (budget.tryAdd()) {
+          const frame = this.maybeCircularMask(raw, true);
           const canvas = this.imageToCanvas(frame);
           gifRef.addFrame(canvas, { delay: budget.frameDelayMs(), copy: true });
           this.status.textContent = `Recording… ${budget.remaining()} frames left`;
@@ -161,7 +202,7 @@ export class CaptureBar {
     }, budget.frameDelayMs());
   }
 
-  private imageToCanvas(image: { data: Uint8Array; width: number; height: number }): HTMLCanvasElement {
+  private imageToCanvas(image: RgbaImage): HTMLCanvasElement {
     const canvas = document.createElement("canvas");
     canvas.width = image.width;
     canvas.height = image.height;

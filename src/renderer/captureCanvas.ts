@@ -1,6 +1,31 @@
 import { upscaleNearest, type RgbaImage } from "../capture/upscale.js";
 
 /**
+ * Apply a circular mask to an RGBA image.
+ * Pixels OUTSIDE the inscribed circle (centered, radius = min(w,h)/2) are set
+ * to alpha 0. Pixels inside are unchanged. Returns a new RgbaImage (copy).
+ */
+export function applyCircularMask(image: RgbaImage): RgbaImage {
+  const { width, height } = image;
+  const out = new Uint8Array(image.data);
+  const cx = width / 2;
+  const cy = height / 2;
+  const r = Math.min(width, height) / 2;
+  const r2 = r * r;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const dx = x + 0.5 - cx;
+      const dy = y + 0.5 - cy;
+      if (dx * dx + dy * dy > r2) {
+        const i = (y * width + x) * 4;
+        out[i + 3] = 0;
+      }
+    }
+  }
+  return { data: out, width, height };
+}
+
+/**
  * Read pixel data from the noVNC canvas inside `host`.
  * noVNC renders into a <canvas> child; we draw it onto a fresh canvas first
  * to avoid any cross-origin or taint issues, then call getImageData.
