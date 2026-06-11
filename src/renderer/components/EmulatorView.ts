@@ -283,6 +283,23 @@ export class EmulatorView {
   }
 
   /**
+   * Reconnect VNC to the already-running emulator after a wipe+reboot triggered
+   * externally (e.g. "Clear emulator"). Unlike `show()` / `bootPlatform()`, this
+   * does NOT call `start()` (the emulator is already booted) and does NOT call
+   * `libInstallAll()` (the whole point of Clear is to leave it empty).
+   */
+  async reconnectAfterClear(platformId: PlatformId): Promise<void> {
+    if (!this.started || !this.currentPlatform) return;
+    const info = getPlatform(platformId);
+    this.disconnectVnc();
+    this.status.textContent = "● Live";
+    this.status.classList.add("emu-status--live");
+    // The IPC handler already rebooted — re-use the same VNC endpoint.
+    const ep = { host: "localhost", port: 6080, wsPath: "/" };
+    this.vnc = connectVnc(this.screenHost, ep, info.touch);
+  }
+
+  /**
    * Render the four physical buttons as nubs tucked into the frame edge. Placement
    * is driven purely by CSS classes keyed on side + shape (not registry pixel
    * coords), so the buttons hug the (square or round) frame edge and — on round

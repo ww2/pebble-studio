@@ -69,3 +69,14 @@ export function screenshotCmd(outPath: string): PebbleCommand { return base("scr
 export function bootCmd(platform: PlatformId): PebbleCommand {
   return { cmd: "pebble", args: ["emu-control", "--emulator", platform, "--vnc"] };
 }
+
+/**
+ * Wipes all emulator data for the current SDK version.
+ * NOTE: `pebble wipe` has NO --emulator flag — it wipes ALL platform dirs
+ * (basalt, chalk, etc.) under the active SDK version's persist directory.
+ * The emulator CANNOT survive a wipe; a full reboot is required afterward.
+ * (Empirically confirmed: deletes ~/.local/share/pebble-sdk/<ver>/{basalt,...})
+ */
+export function wipeCmd(): PebbleCommand {
+  return { cmd: "pebble", args: ["wipe"] };
+}

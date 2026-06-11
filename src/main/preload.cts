@@ -12,6 +12,8 @@ const studio = {
   libList: () => ipcRenderer.invoke("lib:list"),
   libRemove: (p: string) => ipcRenderer.invoke("lib:remove", p),
   libInstallAll: () => ipcRenderer.invoke("lib:installAll"),
+  loadedList: (): Promise<string[]> => ipcRenderer.invoke("loaded:list"),
+  loadedClear: (platformId: string) => ipcRenderer.invoke("loaded:clear", platformId),
   pathForFile: (file: File) => webUtils.getPathForFile(file),
   saveCapture: (name: string, bytes: Uint8Array): Promise<string> =>
     ipcRenderer.invoke("capture:save", name, bytes),

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  installCmd, buttonCmd, accelTapCmd, setTimeCmd, btCmd, batteryCmd, screenshotCmd, bootCmd,
+  installCmd, buttonCmd, accelTapCmd, setTimeCmd, btCmd, batteryCmd, screenshotCmd, bootCmd, wipeCmd,
 } from "../../src/main/backend/pebbleCli.js";
 
 describe("pebbleCli argv builders", () => {
@@ -36,5 +36,14 @@ describe("pebbleCli argv builders", () => {
   });
   it("builds an emulator boot command with vnc enabled", () => {
     expect(bootCmd("chalk").args).toEqual(["emu-control", "--emulator", "chalk", "--vnc"]);
+  });
+  it("builds a wipe command with no --emulator flag (wipes all platforms)", () => {
+    // pebble wipe has no --emulator option; it always wipes all platform dirs
+    // for the current SDK version. The emulator cannot survive a wipe.
+    const c = wipeCmd();
+    expect(c.cmd).toBe("pebble");
+    expect(c.args).toEqual(["wipe"]);
+    // Confirm no --emulator flag is present (would be a CLI error)
+    expect(c.args).not.toContain("--emulator");
   });
 });

@@ -18,6 +18,8 @@ interface StudioApi {
   libList(): Promise<string[]>;
   libRemove(p: string): Promise<string[]>;
   libInstallAll(): Promise<void>;
+  loadedList(): Promise<string[]>;
+  loadedClear(platformId: string): Promise<unknown>;
   pathForFile(file: File): string;
   saveCapture(name: string, bytes: Uint8Array): Promise<string>;
 }
@@ -60,7 +62,10 @@ app.innerHTML = `
 
 const view = new EmulatorView();
 const switcher = new VersionSwitcher((id: PlatformId) => void view.show(id), "basalt");
-const library = new AppLibrary();
+const library = new AppLibrary(
+  () => switcher.value,
+  (platformId: string) => view.reconnectAfterClear(platformId as PlatformId),
+);
 const captureBar = new CaptureBar(
   () => document.querySelector<HTMLElement>("#emu-screen"),
   () => getPlatform(switcher.value as PlatformId).round,

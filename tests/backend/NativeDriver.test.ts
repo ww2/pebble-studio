@@ -41,4 +41,15 @@ describe("NativeDriver", () => {
     const timeArg = calls[0][calls[0].length - 1];
     expect(timeArg).toMatch(/^\d{2}:\d{2}:\d{2}$/);  // HH:MM:SS, never an ISO 'T'
   });
+
+  it("wipe() runs pebble wipe with no --emulator flag", async () => {
+    const calls: { cmd: string; args: string[] }[] = [];
+    const run = vi.fn(async (cmd: string, args: string[]) => { calls.push({ cmd, args }); return { code: 0, stdout: "", stderr: "" }; });
+    const d = new NativeDriver({ run });
+    d.setPlatform("basalt");
+    await d.wipe();
+    expect(calls[0].cmd).toBe("pebble");
+    expect(calls[0].args).toEqual(["wipe"]);
+    expect(calls[0].args).not.toContain("--emulator");
+  });
 });

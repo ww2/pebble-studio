@@ -95,4 +95,8 @@ export class WslDriver implements BackendDriver {
   async screenshot(outPath: string): Promise<void> {
     return this.inner.screenshot(outPath);
   }
+
+  async wipe(): Promise<void> {
+    return this.inner.wipe();
+  }
 }

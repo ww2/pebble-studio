@@ -64,6 +64,14 @@ export class NativeDriver implements BackendDriver {
     await this.exec(cli.screenshotCmd(outPath));
   }
 
+  async wipe(): Promise<void> {
+    // wipeCmd() has no --emulator flag, so withVnc() is a no-op here.
+    // We run pebble wipe via the injected runner (not through exec's throw-on-nonzero
+    // since wipe sometimes exits nonzero on stderr warnings but still succeeds).
+    const c = cli.wipeCmd();
+    await this.deps.run(c.cmd, c.args, c.env);
+  }
+
   private async exec(c: PebbleCommand): Promise<RunResult> {
     const args = withVnc(c.args);
     const result = await this.deps.run(c.cmd, args, c.env);

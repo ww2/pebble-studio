@@ -15,4 +15,7 @@ export interface BackendDriver {
   bluetooth(connected: boolean): Promise<void>;
   battery(percent: number, charging: boolean): Promise<void>;
   screenshot(outPath: string): Promise<void>;
+  /** Wipe all emulator data for the current SDK version. The emulator cannot
+   * survive a wipe; caller must reboot afterward. */
+  wipe(): Promise<void>;
 }
