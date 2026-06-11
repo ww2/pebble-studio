@@ -1,11 +1,20 @@
-import { ipcMain } from "electron";
+import { ipcMain, app } from "electron";
+import path from "node:path";
 import { createDriver } from "./backend/createDriver.js";
 import type { BackendDriver } from "./backend/BackendDriver.js";
 import type { PlatformId, ButtonId } from "../shared/types.js";
+import { LibraryStore } from "./library.js";
 
 let driver: BackendDriver | null = null;
 
 export function registerIpc(): void {
+  const library = new LibraryStore(path.join(app.getPath("userData"), "library.json"));
+
+  ipcMain.handle("lib:add", async (_e, pbwPath: string) => { library.add(pbwPath); return library.list(); });
+  ipcMain.handle("lib:list", async () => library.list());
+  ipcMain.handle("lib:remove", async (_e, p: string) => { library.remove(p); return library.list(); });
+  ipcMain.handle("lib:installAll", async () => { for (const p of library.list()) await driver!.install(p); });
+
   ipcMain.handle("backend:init", async () => {
     const { driver: d, kind } = await createDriver();
     driver = d;

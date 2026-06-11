@@ -84,6 +84,13 @@ export class EmulatorView {
 
     this.status.textContent = info.label;
     this.vnc = connectVnc(this.screenHost, ep as { host: string; port: number; wsPath: string }, info.touch);
+
+    // Re-install library apps after boot so a platform switch picks them up.
+    try {
+      await window.studio.libInstallAll();
+    } catch (err) {
+      console.error("[emu] libInstallAll failed", err);
+    }
   }
 
   private renderButtons(platformId: PlatformId): void {

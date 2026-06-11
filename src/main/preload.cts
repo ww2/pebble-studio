@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 
 const studio = {
   initBackend: (): Promise<{ kind: string }> => ipcRenderer.invoke("backend:init"),
@@ -8,6 +8,11 @@ const studio = {
   button: (id: string) => ipcRenderer.invoke("emu:button", id),
   accelTap: () => ipcRenderer.invoke("emu:accelTap"),
   screenshot: (out: string) => ipcRenderer.invoke("emu:screenshot", out),
+  libAdd: (pbwPath: string) => ipcRenderer.invoke("lib:add", pbwPath),
+  libList: () => ipcRenderer.invoke("lib:list"),
+  libRemove: (p: string) => ipcRenderer.invoke("lib:remove", p),
+  libInstallAll: () => ipcRenderer.invoke("lib:installAll"),
+  pathForFile: (file: File) => webUtils.getPathForFile(file),
 };
 
 contextBridge.exposeInMainWorld("studio", studio);
