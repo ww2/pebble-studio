@@ -50,6 +50,20 @@ function createWindow(): void {
       setTimeout(() => {
         void (async () => {
           try {
+            // Optionally switch platform (e.g. to a round device) before capture
+            // by selecting the matching combobox option, then wait for it to boot.
+            const wantPlatform = process.env.PEBBLE_UISHOT_PLATFORM;
+            if (wantPlatform) {
+              await win.webContents.executeJavaScript(
+                `(() => {
+                  const btn = document.querySelector('.version-combo .version-combo-btn');
+                  if (btn) btn.click();
+                  const opt = document.querySelector('.version-combo-option[data-id="${wantPlatform}"]');
+                  if (opt) opt.click();
+                })()`,
+              );
+              await new Promise((r) => setTimeout(r, 16000));
+            }
             // Force the desired theme deterministically (independent of any
             // persisted localStorage choice): the toggle label reads "Dark" when
             // currently light and "Light" when currently dark, so click only if

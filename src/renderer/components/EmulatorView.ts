@@ -21,9 +21,9 @@ export class EmulatorView {
     this.el.className = "emu-panel";
     this.el.innerHTML = `
       <div class="emu-frame">
+        <div class="emu-buttons" id="emu-buttons"></div>
         <div class="emu-stage" id="emu-stage">
           <div class="emu-screen" id="emu-screen"></div>
-          <div class="emu-buttons" id="emu-buttons"></div>
         </div>
       </div>
       <div class="emu-caption" id="emu-caption"></div>
@@ -54,7 +54,8 @@ export class EmulatorView {
     const chrome = getChrome(platformId);
 
     this.caption.textContent = `${info.label} · ${info.width}×${info.height}`;
-    this.el.querySelector<HTMLElement>(".emu-frame")!.classList.toggle("emu-frame--round", info.round);
+    const frame = this.el.querySelector<HTMLElement>(".emu-frame")!;
+    frame.classList.toggle("emu-frame--round", info.round);
     this.status.textContent = `Booting ${info.label}…`;
     this.status.classList.remove("emu-status--live");
 
@@ -70,16 +71,29 @@ export class EmulatorView {
     stage.style.width = `${chrome.bodyWidth}px`;
     stage.style.height = `${chrome.bodyHeight}px`;
 
-    // Position the screen host within the stage.
-    Object.assign(this.screenHost.style, {
-      left: `${chrome.screen.x}px`,
-      top: `${chrome.screen.y}px`,
-      width: `${chrome.screen.width}px`,
-      height: `${chrome.screen.height}px`,
-    });
+    // Position the screen host within the stage. For round devices the screen
+    // is centered in the (square) stage so it sits dead-center of the circular
+    // frame; for square devices the registry's screen offset is used.
+    if (info.round) {
+      Object.assign(this.screenHost.style, {
+        left: "50%",
+        top: "50%",
+        transform: "translate(-50%, -50%)",
+        width: `${chrome.screen.width}px`,
+        height: `${chrome.screen.height}px`,
+      });
+    } else {
+      Object.assign(this.screenHost.style, {
+        left: `${chrome.screen.x}px`,
+        top: `${chrome.screen.y}px`,
+        transform: "none",
+        width: `${chrome.screen.width}px`,
+        height: `${chrome.screen.height}px`,
+      });
+    }
     this.screenHost.classList.toggle("emu-screen--round", info.round);
 
-    this.renderButtons(platformId);
+    this.renderButtons(info.round);
 
     let ep;
     try {
@@ -102,22 +116,24 @@ export class EmulatorView {
     }
   }
 
-  private renderButtons(platformId: PlatformId): void {
-    const chrome = getChrome(platformId);
+  /**
+   * Render the four physical buttons as nubs tucked into the frame edge. Placement
+   * is driven purely by CSS classes keyed on side + shape (not registry pixel
+   * coords), so the buttons hug the (square or round) frame edge and — on round
+   * devices — angle radially toward the center. The registry geometry is still
+   * used for hit-testing in tests; here we only need the button ids/order.
+   */
+  private renderButtons(round: boolean): void {
     this.buttonsOverlay.innerHTML = "";
-    for (const b of chrome.buttons) {
+    this.buttonsOverlay.classList.toggle("emu-buttons--round", round);
+    const ids: ButtonId[] = ["back", "up", "select", "down"];
+    for (const id of ids) {
       const el = document.createElement("button");
       el.type = "button";
-      el.className = "emu-hit";
-      el.dataset.button = b.id;
-      el.title = b.id;
-      Object.assign(el.style, {
-        left: `${b.x}px`,
-        top: `${b.y}px`,
-        width: `${b.width}px`,
-        height: `${b.height}px`,
-      });
-      el.addEventListener("click", () => void window.studio.button(b.id as ButtonId));
+      el.className = `emu-hit emu-hit--${id}`;
+      el.dataset.button = id;
+      el.title = id;
+      el.addEventListener("click", () => void window.studio.button(id));
       this.buttonsOverlay.appendChild(el);
     }
   }

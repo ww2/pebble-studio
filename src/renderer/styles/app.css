@@ -288,19 +288,51 @@ body {
   padding: 24px;
 }
 
-/* Tasteful device frame around the live stage. */
+/* Tasteful device frame around the live stage. The frame is the positioning
+   context for both the live stage and the physical-button overlay; buttons are
+   tucked against the frame edge and partly hidden under a rim pseudo-element so
+   they read as nubs built into the casing. */
 .emu-frame {
+  --frame-pad: 16px;
   position: relative;
-  padding: 16px;
+  padding: var(--frame-pad);
   border-radius: 22px;
   background: linear-gradient(155deg, var(--raised), var(--surface));
   border: 1px solid var(--border);
   box-shadow: var(--device-shadow), inset 0 1px 0 var(--hairline);
 }
-.emu-frame--round { border-radius: 50%; padding: 18px; }
+.emu-frame--round { --frame-pad: 18px; border-radius: 50%; }
+
+/* Frame rim: a copy of the casing edge drawn ABOVE the buttons so each nub's
+   inner half is concealed under the casing (tucked-in illusion). It's a thick
+   transparent-centered ring matching the frame's rounded/round shape. */
+.emu-frame::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 3;
+  /* Re-assert the casing color as a border so the nub roots hide behind it. */
+  border: var(--frame-pad) solid transparent;
+  box-shadow:
+    inset 0 0 0 1px var(--border),
+    inset 0 1px 0 var(--hairline);
+  background:
+    linear-gradient(155deg, var(--raised), var(--surface)) border-box;
+  -webkit-mask:
+    linear-gradient(#000 0 0) padding-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) padding-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+}
 
 .emu-stage {
   position: relative;
+  z-index: 1;
   background: #0a0a0a;
   border-radius: 8px;
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.6);
@@ -321,27 +353,107 @@ body {
   height: 100% !important;
 }
 
-/* Button overlay covers the stage; only hit-buttons capture clicks. */
+/* Button overlay covers the whole frame; only the nubs capture clicks. It sits
+   below the frame rim (z 3) but above the casing background so the outer half of
+   each nub peeks out beyond the rim. */
 .emu-buttons {
   position: absolute;
   inset: 0;
+  z-index: 2;
   pointer-events: none;
 }
-/* Physical watch buttons: subtle dark nubs on the device frame, not accent bars. */
+/* Physical watch buttons: subtle dark nubs tucked into the device frame edge. */
 .emu-hit {
   position: absolute;
   pointer-events: auto;
   background: linear-gradient(180deg, #5a5f66 0%, #3c4046 100%);
   border: 1px solid rgba(0, 0, 0, 0.45);
   border-radius: 3px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 1px 2px rgba(0, 0, 0, 0.35);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 1px 2px rgba(0, 0, 0, 0.45);
   cursor: pointer;
   padding: 0;
   font-size: 0;
   transition: filter var(--dur) var(--ease), transform var(--dur) var(--ease);
 }
 .emu-hit:hover { filter: brightness(1.18); }
-.emu-hit:active { transform: scale(0.9); filter: brightness(0.85); }
+.emu-hit:active { filter: brightness(0.85); }
+
+/* ── Square-device button placement ──────────────────────────────────────────
+   Nubs hug the left/right outer edge of the casing. The inner ~1/3 is concealed
+   by the frame rim; the majority peeks out. Back (left) height == Up height. */
+.emu-hit--back,
+.emu-hit--up,
+.emu-hit--select,
+.emu-hit--down {
+  width: 16px;
+  border-radius: 3px;
+}
+/* Left side: most of the nub sits just left of (outside) the casing edge. */
+.emu-hit--back {
+  left: -13px;
+  top: 50%;
+  height: 34px;
+  transform: translateY(-50%);
+  border-radius: 3px 0 0 3px;
+}
+/* Right side: most of the nub sits just right of (outside) the casing edge. */
+.emu-hit--up {
+  right: -13px;
+  top: 24%;
+  height: 34px;
+  border-radius: 0 3px 3px 0;
+}
+.emu-hit--select {
+  right: -13px;
+  top: 50%;
+  height: 40px;
+  transform: translateY(-50%);
+  border-radius: 0 3px 3px 0;
+}
+.emu-hit--down {
+  right: -13px;
+  bottom: 24%;
+  height: 34px;
+  border-radius: 0 3px 3px 0;
+}
+
+/* ── Round-device button placement ───────────────────────────────────────────
+   Nubs sit on the circle edge and angle radially toward the center: Up tilts
+   down-toward-center, Down tilts up-toward-center, Select stays horizontal, and
+   Back sits on the left edge pointing toward center. Back height == Select. */
+.emu-buttons--round .emu-hit--back {
+  left: -13px;
+  top: 50%;
+  height: 40px;
+  transform: translateY(-50%);
+  border-radius: 3px 0 0 3px;
+}
+.emu-buttons--round .emu-hit--select {
+  right: -13px;
+  top: 50%;
+  height: 40px;
+  transform: translateY(-50%);
+  border-radius: 0 3px 3px 0;
+}
+/* Up/Down rotate toward the circle center. Positioned on the upper/lower-right
+   arc; the rotation tilts them radially (down-toward-center / up-toward-center). */
+.emu-buttons--round .emu-hit--up {
+  right: 4px;
+  top: 23%;
+  height: 32px;
+  transform: rotate(52deg);
+  transform-origin: center;
+  border-radius: 3px;
+}
+.emu-buttons--round .emu-hit--down {
+  right: 4px;
+  bottom: 23%;
+  top: auto;
+  height: 32px;
+  transform: rotate(-52deg);
+  transform-origin: center;
+  border-radius: 3px;
+}
 
 .emu-status--live {
   color: var(--success);
