@@ -60,7 +60,7 @@ describe("offsetMinutesFor", () => {
 });
 
 describe("DEFAULT_TIME_CONFIG", () => {
-  it("defaults to a 24-hour clock", () => expect(DEFAULT_TIME_CONFIG.hour24).toBe(true));
+  it("defaults to a 12-hour clock", () => expect(DEFAULT_TIME_CONFIG.hour24).toBe(false));
 });
 
 describe("isVirtualClock", () => {

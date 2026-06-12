@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  installCmd, buttonCmd, accelTapCmd, setTimeCmd, timeFormatCmd, btCmd, batteryCmd, screenshotCmd, bootCmd, wipeCmd, timelineQuickViewCmd,
+  installCmd, buttonCmd, accelTapCmd, setTimeCmd, timeFormatCmd, btCmd, batteryCmd, screenshotCmd, bootCmd, wipeCmd, timelineQuickViewCmd, setTzOffsetCmd,
 } from "../../src/main/backend/pebbleCli.js";
 
 describe("pebbleCli argv builders", () => {
@@ -69,4 +69,29 @@ describe("timeFormatCmd", () => {
 describe("timelineQuickViewCmd", () => {
   it("on", () => expect(timelineQuickViewCmd(true).args).toEqual(["emu-set-timeline-quick-view", "--emulator", expect.any(String), "on"]));
   it("off", () => expect(timelineQuickViewCmd(false).args).toContain("off"));
+});
+
+describe("setTzOffsetCmd", () => {
+  // ROOT CAUSE of the v0.0.11 "timezone/custom time do nothing on the .exe" bug:
+  // the one-liner is run as `bash -lc <oneLiner>` and the WSL driver re-wraps it
+  // as `wsl.exe -- bash -lc "'bash' '-lc' '<oneLiner>'"`. ANY single/double quote
+  // inside the one-liner has to survive Node's Windows arg-quoting + two shell
+  // hops, which mangled it. So the one-liner MUST stay quote-free.
+  it("produces a quote-free one-liner (survives the Windows→wsl.exe→bash hops)", () => {
+    const c = setTzOffsetCmd(-240, "America/New_York");
+    expect(c.cmd).toBe("bash");
+    const oneLiner = c.args[1];
+    expect(oneLiner).not.toContain("'");
+    expect(oneLiner).not.toContain('"');
+    expect(oneLiner).toContain("-240");
+    expect(oneLiner).toContain("America/New_York");
+  });
+  it("falls back to a synthesized UTC±h name for non-shell-safe/absent zones", () => {
+    expect(setTzOffsetCmd(540).args[1]).toContain("UTC+9");
+    expect(setTzOffsetCmd(-240).args[1]).toContain("UTC-4");
+    // A zone with shell-unsafe characters is rejected → synthesized name used.
+    const c = setTzOffsetCmd(540, "Asia/Tokyo; rm -rf /");
+    expect(c.args[1]).not.toContain("rm -rf");
+    expect(c.args[1]).toContain("UTC+9");
+  });
 });

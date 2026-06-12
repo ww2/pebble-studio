@@ -42,7 +42,7 @@ export const OFFSET_MIN_MINUTES = -32767;
 export const OFFSET_MAX_MINUTES = 32767;
 
 export const DEFAULT_TIME_CONFIG: TimeConfig = {
-  source: "system", rate: "1x", timezone: "UTC", hour24: true, customWallMs: 0,
+  source: "system", rate: "1x", timezone: "UTC", hour24: false, customWallMs: 0,
 };
 
 /** Minutes east of UTC for `tz` at instant `at`. Invalid zones → 0. (Pure; uses Intl.) */
@@ -107,8 +107,9 @@ export function isNonSystemTime(cfg: TimeConfig, hostTz: string): boolean {
 }
 
 interface TimeDriver {
-  /** Push a UTC offset (minutes) via a short-lived raw SetUTC. */
-  setTzOffset(offsetMin: number): Promise<void>;
+  /** Push a UTC offset (minutes) via a short-lived raw SetUTC. `tzName` (IANA
+   * zone) becomes the SetUTC tz_name; omitted/absent for custom-anchor mode. */
+  setTzOffset(offsetMin: number, tzName?: string): Promise<void>;
   timeFormat(hour24: boolean): Promise<void>;
 }
 
@@ -147,7 +148,11 @@ export function makeTimeController(
       if (!d) return;
       const off = offsetMinutesFor(cfg, now(), hostTz(), anchorMs);
       if (!force && off === lastPushed) return; // no minute change → leave bridge free
-      await d.setTzOffset(off);
+      // For System/Timezone the offset IS a real zone → send its IANA name as
+      // tz_name so the watch shows a meaningful zone. Custom is a bare offset
+      // anchor (no real zone) → let the helper synthesize "UTC±h".
+      const tzName = cfg.source === "custom" ? undefined : cfg.timezone;
+      await d.setTzOffset(off, tzName);
       lastPushed = off;
     } catch { /* tool/emulator may be absent; degrade silently */ }
     finally { pushing = false; }

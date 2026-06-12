@@ -81,18 +81,39 @@ export function timeFormatCmd(hour24: boolean): PebbleCommand {
  * through the native runner OR the WSL runner (`wsl.exe -- bash -lc …`) unchanged.
  */
 // Helper source (pb-set-tz.py): connects to the running emulator's pypkjs websocket
-// (port from /tmp/pb-emulator.json) and sends SetUTC(now, utc_offset=argv[1]).
+// (port from /tmp/pb-emulator.json) and sends SetUTC(now, utc_offset=argv[1],
+// tz_name=argv[2]). Base64 of the script (the base64 alphabet is shell-safe — no
+// quotes/spaces/metacharacters — so it can be echo'd UNQUOTED, see below).
 const SET_TZ_HELPER_B64 =
-  "aW1wb3J0IHN5cywganNvbiwgdGltZQpmcm9tIGxpYnBlYmJsZTIuY29tbXVuaWNhdGlvbiBpbXBvcnQgUGViYmxlQ29ubmVjdGlvbgpmcm9tIGxpYnBlYmJsZTIuY29tbXVuaWNhdGlvbi50cmFuc3BvcnRzLndlYnNvY2tldCBpbXBvcnQgV2Vic29ja2V0VHJhbnNwb3J0CmZyb20gbGlicGViYmxlMi5wcm90b2NvbC5zeXN0ZW0gaW1wb3J0IFRpbWVNZXNzYWdlLCBTZXRVVEMKb2Zmc2V0ID0gaW50KHN5cy5hcmd2WzFdKQppbmZvID0ganNvbi5sb2FkKG9wZW4oJy90bXAvcGItZW11bGF0b3IuanNvbicpKQpwb3J0ID0gTm9uZQpmb3IgcGxhdCwgdmVycyBpbiBpbmZvLml0ZW1zKCk6CiAgICBmb3IgdiwgZCBpbiB2ZXJzLml0ZW1zKCk6CiAgICAgICAgcCA9IChkLmdldCgncHlwa2pzJykgb3Ige30pLmdldCgncG9ydCcpCiAgICAgICAgaWYgcDogcG9ydCA9IHAKaWYgcG9ydCBpcyBOb25lOgogICAgc3lzLmV4aXQoJ25vIHB5cGtqcyBwb3J0IGluIC90bXAvcGItZW11bGF0b3IuanNvbicpCmMgPSBQZWJibGVDb25uZWN0aW9uKFdlYnNvY2tldFRyYW5zcG9ydCgnd3M6Ly9sb2NhbGhvc3Q6JWQvJyAlIHBvcnQpKQpjLmNvbm5lY3QoKTsgYy5ydW5fYXN5bmMoKQp0cyA9IGludCh0aW1lLnRpbWUoKSkKbmFtZSA9ICdVVEMlK2QnICUgKG9mZnNldCAvLyA2MCkKYy5zZW5kX3BhY2tldChUaW1lTWVzc2FnZShtZXNzYWdlPVNldFVUQyh1bml4X3RpbWU9dHMsIHV0Y19vZmZzZXQ9b2Zmc2V0LCB0el9uYW1lPW5hbWUpKSkKdGltZS5zbGVlcCgwLjQpCnByaW50KCdzZW50IG9mZnNldD0lZCAoJXMpIHZpYSB3cyBwb3J0ICVkJyAlIChvZmZzZXQsIG5hbWUsIHBvcnQpKQo=";
+  "aW1wb3J0IHN5cywganNvbiwgdGltZQpmcm9tIGxpYnBlYmJsZTIuY29tbXVuaWNhdGlvbiBpbXBvcnQgUGViYmxlQ29ubmVjdGlvbgpmcm9tIGxpYnBlYmJsZTIuY29tbXVuaWNhdGlvbi50cmFuc3BvcnRzLndlYnNvY2tldCBpbXBvcnQgV2Vic29ja2V0VHJhbnNwb3J0CmZyb20gbGlicGViYmxlMi5wcm90b2NvbC5zeXN0ZW0gaW1wb3J0IFRpbWVNZXNzYWdlLCBTZXRVVEMKb2Zmc2V0ID0gaW50KHN5cy5hcmd2WzFdKQpuYW1lID0gc3lzLmFyZ3ZbMl0gaWYgbGVuKHN5cy5hcmd2KSA+IDIgZWxzZSAoJ1VUQyUrZCcgJSAob2Zmc2V0IC8vIDYwKSkKaW5mbyA9IGpzb24ubG9hZChvcGVuKCcvdG1wL3BiLWVtdWxhdG9yLmpzb24nKSkKcG9ydCA9IE5vbmUKZm9yIHBsYXQsIHZlcnMgaW4gaW5mby5pdGVtcygpOgogICAgZm9yIHYsIGQgaW4gdmVycy5pdGVtcygpOgogICAgICAgIHAgPSAoZC5nZXQoJ3B5cGtqcycpIG9yIHt9KS5nZXQoJ3BvcnQnKQogICAgICAgIGlmIHA6IHBvcnQgPSBwCmlmIHBvcnQgaXMgTm9uZToKICAgIHN5cy5leGl0KCdubyBweXBranMgcG9ydCBpbiAvdG1wL3BiLWVtdWxhdG9yLmpzb24nKQpjID0gUGViYmxlQ29ubmVjdGlvbihXZWJzb2NrZXRUcmFuc3BvcnQoJ3dzOi8vbG9jYWxob3N0OiVkLycgJSBwb3J0KSkKYy5jb25uZWN0KCk7IGMucnVuX2FzeW5jKCkKdHMgPSBpbnQodGltZS50aW1lKCkpCmMuc2VuZF9wYWNrZXQoVGltZU1lc3NhZ2UobWVzc2FnZT1TZXRVVEModW5peF90aW1lPXRzLCB1dGNfb2Zmc2V0PW9mZnNldCwgdHpfbmFtZT1uYW1lKSkpCnRpbWUuc2xlZXAoMC40KQpwcmludCgnc2VudCBvZmZzZXQ9JWQgKCVzKSB2aWEgd3MgcG9ydCAlZCcgJSAob2Zmc2V0LCBuYW1lLCBwb3J0KSkK";
 
-export function setTzOffsetCmd(offsetMin: number): PebbleCommand {
+/** A name is safe to pass UNQUOTED through the shell (IANA zones: letters, digits,
+ * `/`, `_`, `-`, `+`). Anything else falls back to the synthesized UTC±h name. */
+function shellSafeZoneName(name: string | undefined, offsetMin: number): string {
+  if (name && /^[A-Za-z0-9_+/-]+$/.test(name)) return name;
+  const h = Math.trunc(offsetMin / 60);
+  return `UTC${h >= 0 ? "+" : ""}${h}`;
+}
+
+export function setTzOffsetCmd(offsetMin: number, tzName?: string): PebbleCommand {
   const off = Math.trunc(offsetMin);
+  const name = shellSafeZoneName(tzName, off);
+  // CRITICAL: this one-liner must contain NO single OR double quotes. It is run as
+  // `bash -lc <oneLiner>`, and on a Windows host the WSL driver re-wraps the whole
+  // thing (`wsl.exe -- bash -lc "'bash' '-lc' '<oneLiner>'"`). Quotes inside the
+  // one-liner would have to survive Node's Windows arg-quoting AND two shell-parse
+  // hops — which mangled the previous quoted version, so timezone/custom time
+  // silently never reached the watch. Everything here is quote-free:
+  //   - the base64 blob is echo'd unquoted (base64 alphabet is shell-safe);
+  //   - $HOME/pebble paths have no spaces, so $VAR is left unquoted;
+  //   - the shebang is stripped with `head -1 | cut -c3-` (no sed quotes);
+  //   - the zone name is validated shell-safe above.
   const oneLiner =
-    `mkdir -p "$HOME/.pebble-studio"; ` +
-    `H="$HOME/.pebble-studio/pb-set-tz.py"; ` +
-    `echo '${SET_TZ_HELPER_B64}' | base64 -d > "$H"; ` +
-    `PYBIN=$(sed -n '1s/^#!//p' "$(command -v pebble)"); ` +
-    `"$PYBIN" "$H" ${off}`;
+    `mkdir -p $HOME/.pebble-studio; ` +
+    `H=$HOME/.pebble-studio/pb-set-tz.py; ` +
+    `echo ${SET_TZ_HELPER_B64} | base64 -d > $H; ` +
+    `PYBIN=$(head -1 $(command -v pebble) | cut -c3-); ` +
+    `$PYBIN $H ${off} ${name}`;
   return { cmd: "bash", args: ["-lc", oneLiner] };
 }
 

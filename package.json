@@ -1,6 +1,6 @@
 {
   "name": "pebble-studio",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "description": "Modern GUI for the qemu-pebble emulator",
   "author": "Jason Lin",
   "main": "dist/main/index.cjs",

@@ -17,8 +17,9 @@ export interface BackendDriver {
   accelTap(): Promise<void>;
   setTime(value: string, opts?: { utc?: boolean }): Promise<void>;
   /** Push the watch's UTC offset (minutes) via a raw SetUTC — the only lever that
-   * moves the displayed time on qemu-pebble (see timeController's contract). */
-  setTzOffset(offsetMin: number): Promise<void>;
+   * moves the displayed time on qemu-pebble (see timeController's contract).
+   * `tzName` (IANA zone) is sent as the SetUTC tz_name; falls back to "UTC±h". */
+  setTzOffset(offsetMin: number, tzName?: string): Promise<void>;
   timeFormat(hour24: boolean): Promise<void>;
   bluetooth(connected: boolean): Promise<void>;
   battery(percent: number, charging: boolean): Promise<void>;

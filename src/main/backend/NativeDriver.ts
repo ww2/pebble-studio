@@ -55,12 +55,12 @@ export class NativeDriver implements BackendDriver {
     await this.exec(cli.setTimeCmd(value, opts?.utc ?? false));
   }
 
-  async setTzOffset(offsetMin: number): Promise<void> {
+  async setTzOffset(offsetMin: number, tzName?: string): Promise<void> {
     // Runs the raw-SetUTC helper directly through the runner (NOT exec): it is a
     // `bash -lc` command, not a `pebble --emulator` one, so withVnc()/throw-on-
     // nonzero don't apply. We surface a nonzero exit for diagnosis but don't throw
     // (the time controller degrades silently if the emulator/tool is absent).
-    const c = cli.setTzOffsetCmd(offsetMin);
+    const c = cli.setTzOffsetCmd(offsetMin, tzName);
     const r = await this.deps.run(c.cmd, c.args, c.env);
     if (r.code !== 0) {
       console.warn(`[time] setTzOffset(${offsetMin}) exit ${r.code}: ${r.stderr || r.stdout}`);

@@ -15,6 +15,7 @@ import {
   type TimeConfig,
   type Rate,
 } from "../../main/backend/timeController.js";
+import { formatTimeDisplay, parseTimeInput, timePlaceholder } from "../timeFormat.js";
 
 type ThemeChoice = "light" | "dark";
 type BootMode = "auto" | "manual";
@@ -145,6 +146,10 @@ export class SettingsPane {
   private hour24 = false;
   /** True when a custom field was edited but not yet applied via Run. */
   private timeDirty = false;
+  /** Canonical custom time as 24-hour "HH:MM" — the source of truth. The text
+   * input only DISPLAYS it (12h or 24h per the toggle); we parse edits back to
+   * this so the rest of the pipeline stays unambiguous. */
+  private customTime24 = "12:00";
   /** The last TimeConfig actually pushed to the watch — re-pushed (with the new
    * hour24) when the 12/24h toggle flips so the format updates without changing
    * which time mode is active. */
@@ -343,9 +348,13 @@ export class SettingsPane {
     const timeInputLabel = document.createElement("span");
     timeInputLabel.className = "settings-watch-label type-body";
     timeInputLabel.textContent = "Custom time";
+    // Plain text input (NOT type=time): Chromium's native time picker renders
+    // 12h/24h from the OS locale and ignores our toggle, so we format/parse it
+    // ourselves (see timeFormat.ts) to honor the 24-hour-clock switch.
     this.timeInput = document.createElement("input");
-    this.timeInput.type = "time";
+    this.timeInput.type = "text";
     this.timeInput.className = "settings-watch-select";
+    this.timeInput.autocomplete = "off";
     timeControl.append(timeInputLabel, this.timeInput);
 
     // Rate dropdown (Custom only): Frozen / 1× / 2× / 4× / 10×. Non-1× rates are
@@ -389,11 +398,11 @@ export class SettingsPane {
     }
     tzControl.append(tzLabel, this.tzSelect);
 
-    // 24-hour clock toggle (default ON).
+    // 24-hour clock toggle (default OFF — 12-hour is the default).
     const hour24Row = this.makeSwitchRow(
       "24-hour clock",
-      "Sets what clock_is_24h_style() returns on the watch.",
-      localStorage.getItem(TIME_HOUR24_KEY) !== "false", // default ON
+      "Sets what clock_is_24h_style() returns on the watch, and the custom-time input format.",
+      localStorage.getItem(TIME_HOUR24_KEY) === "true", // default OFF (12h)
       (on) => {
         this.hour24 = on;
         localStorage.setItem(TIME_HOUR24_KEY, on ? "true" : "false");
@@ -434,9 +443,8 @@ export class SettingsPane {
         // Explicit apply via "Run custom time" — don't push on select.
         const { date, time: t } = nowDateTimeLocal();
         this.dateInput.value = date;
-        this.timeInput.value = t;
         localStorage.setItem(TIME_CUSTOM_DATE_KEY, date);
-        localStorage.setItem(TIME_CUSTOM_TIME_KEY, t);
+        this.setCustomTime24(t); // t is canonical 24h "HH:MM"
         this.rateSelect.value = "frozen";
         localStorage.setItem(TIME_RATE_KEY, "frozen");
         this.tzSelect.value = TZ_SYSTEM;
@@ -450,7 +458,7 @@ export class SettingsPane {
         // isn't the host) and apply immediately — this mode is live, not staged.
         const { date, time: t } = nowDateTimeLocal();
         this.dateInput.value = date;
-        this.timeInput.value = t;
+        this.setCustomTime24(t); // canonical 24h "HH:MM" (greyed in zone mode)
         this.rateSelect.value = "1x";
         if (this.tzSelect.value === TZ_SYSTEM) {
           const stored = localStorage.getItem(TIME_TZ_KEY);
@@ -477,7 +485,13 @@ export class SettingsPane {
       markDirty();
     });
     this.timeInput.addEventListener("change", () => {
-      localStorage.setItem(TIME_CUSTOM_TIME_KEY, this.timeInput.value);
+      const parsed = parseTimeInput(this.timeInput.value);
+      if (parsed === null) {
+        // Unparseable — restore the last good value rather than store garbage.
+        this.applyHour24ToInput();
+        return;
+      }
+      this.setCustomTime24(parsed); // also normalizes the displayed text
       markDirty();
     });
     this.rateSelect.addEventListener("change", () => {
@@ -664,9 +678,11 @@ export class SettingsPane {
     {
       const stored = nowDateTimeLocal();
       this.dateInput.value = localStorage.getItem(TIME_CUSTOM_DATE_KEY) ?? stored.date;
-      this.timeInput.value = localStorage.getItem(TIME_CUSTOM_TIME_KEY) ?? stored.time;
+      // Legacy values were written by a native time input (always 24h "HH:MM"),
+      // so parseTimeInput accepts them; fall back to "now" if absent/invalid.
+      this.customTime24 = parseTimeInput(localStorage.getItem(TIME_CUSTOM_TIME_KEY) ?? "") ?? stored.time;
       this.rateSelect.value = localStorage.getItem(TIME_RATE_KEY) ?? "1x";
-      this.hour24 = localStorage.getItem(TIME_HOUR24_KEY) !== "false"; // default ON
+      this.hour24 = localStorage.getItem(TIME_HOUR24_KEY) === "true"; // default OFF (12h)
       this.applyHour24ToInput();
       // Time source always starts at System on launch — a persisted Custom time
       // (often a now-stale timestamp) shouldn't silently drive the watch across
@@ -691,11 +707,21 @@ export class SettingsPane {
     return this.hour24;
   }
 
-  /** Drive the native time input's 12/24h display off the toggle. Chromium renders
-   * `<input type=time>` per the element's `lang`: en-GB → 24h (no AM/PM), en-US →
-   * 12h. (The control has no direct 12/24 attribute.) */
+  /** Re-render the custom-time text input from the canonical value in the format
+   * the toggle selects (24h "HH:MM" or 12h "h:mm AM/PM"), and update the example
+   * placeholder. Called whenever hour24 or the canonical value changes. */
   private applyHour24ToInput(): void {
-    this.timeInput.lang = this.hour24 ? "en-GB" : "en-US";
+    this.timeInput.value = formatTimeDisplay(this.customTime24, this.hour24);
+    this.timeInput.placeholder = timePlaceholder(this.hour24);
+  }
+
+  /** Set the canonical custom time (24h "HH:MM"), persist it, and re-render the
+   * input. `display` controls whether the visible input is refreshed (skip while
+   * the user is mid-edit so we don't fight their typing). */
+  private setCustomTime24(canon: string, display = true): void {
+    this.customTime24 = canon;
+    localStorage.setItem(TIME_CUSTOM_TIME_KEY, canon);
+    if (display) this.applyHour24ToInput();
   }
 
   /**
@@ -775,14 +801,14 @@ export class SettingsPane {
       rate: this.rateSelect.value as Rate,
       timezone: detectHostTimezone(),
       hour24: this.read24h(),
-      customWallMs: customWallMs(this.dateInput.value, this.timeInput.value),
+      customWallMs: customWallMs(this.dateInput.value, this.customTime24),
     };
   }
 
   /** Apply the edited custom time (Run custom time button). */
   private applyCustom(): void {
     localStorage.setItem(TIME_CUSTOM_DATE_KEY, this.dateInput.value);
-    localStorage.setItem(TIME_CUSTOM_TIME_KEY, this.timeInput.value);
+    localStorage.setItem(TIME_CUSTOM_TIME_KEY, this.customTime24);
     localStorage.setItem(TIME_RATE_KEY, this.rateSelect.value);
     localStorage.setItem(TIME_SOURCE_KEY, "custom");
     this.applyConfig(this.buildCustomConfig());
@@ -813,7 +839,7 @@ export class SettingsPane {
       el.classList.remove("settings-time-status--running");
       return;
     }
-    const ms = customWallMs(this.dateInput.value, this.timeInput.value);
+    const ms = customWallMs(this.dateInput.value, this.customTime24);
     const d = new Date(ms);
     const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
