@@ -9,6 +9,13 @@ import {
   type KeyAction,
   type Bindings,
 } from "../keybindings.js";
+import {
+  detectHostTimezone,
+  DEFAULT_TIME_CONFIG,
+  type TimeConfig,
+  type Rate,
+  type TimeSource,
+} from "../../main/backend/timeController.js";
 
 type ThemeChoice = "light" | "dark";
 type BootMode = "auto" | "manual";
@@ -25,6 +32,26 @@ const CAPTURE_DIR_KEY = "pebble-studio:capture-dir";
 const BACKLIGHT_CAPTURE_KEY = "pebble-studio:backlight-capture";
 const BACKLIGHT_ALWAYS_KEY = "pebble-studio:backlight-always";
 const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
+
+const TIME_SOURCE_KEY = "pebble-studio:time-source";
+const TIME_RATE_KEY = "pebble-studio:time-rate";
+const TIME_TZ_KEY = "pebble-studio:time-tz";
+const TIME_HOUR24_KEY = "pebble-studio:time-hour24";
+const TIME_CUSTOM_KEY = "pebble-studio:time-custom"; // datetime-local string
+
+const COMMON_ZONES = [
+  "UTC", "America/Los_Angeles", "America/Denver", "America/Chicago",
+  "America/New_York", "America/Sao_Paulo", "Europe/London", "Europe/Paris",
+  "Europe/Moscow", "Asia/Dubai", "Asia/Kolkata", "Asia/Shanghai",
+  "Asia/Tokyo", "Australia/Sydney", "Pacific/Auckland",
+];
+
+/** Convert a datetime-local string ("2026-06-01T14:30") to a UTC-naive epoch ms. */
+function dtLocalToUtcMs(s: string): number {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(s);
+  if (!m) return 0;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], 0);
+}
 
 /** Human-readable labels for each bindable emulator action (Keyboard section). */
 const ACTION_LABELS: Record<KeyAction, string> = {
@@ -216,6 +243,122 @@ export class SettingsPane {
 
     watch.append(watchHeading, watchDesc, this.defaultWatchSlot, bootRow);
 
+    // ── Time section ──────────────────────────────────────────────────────
+    const time = document.createElement("section");
+    time.className = "settings-section";
+
+    const timeHeading = document.createElement("h3");
+    timeHeading.className = "settings-section-title type-body-strong";
+    timeHeading.textContent = "Time";
+
+    // Time source dropdown (System / Custom).
+    const sourceControl = document.createElement("label");
+    sourceControl.className = "settings-watch-control";
+    const sourceLabel = document.createElement("span");
+    sourceLabel.className = "settings-watch-label type-body";
+    sourceLabel.textContent = "Time source";
+    const sourceSelect = document.createElement("select");
+    sourceSelect.className = "settings-watch-select";
+    for (const [value, text] of [["system", "System"], ["custom", "Custom"]]) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = text;
+      sourceSelect.appendChild(opt);
+    }
+    sourceSelect.value = localStorage.getItem(TIME_SOURCE_KEY) ?? "system";
+    sourceControl.append(sourceLabel, sourceSelect);
+
+    // Custom date & time input (enabled only when source === "custom").
+    const customControl = document.createElement("label");
+    customControl.className = "settings-watch-control";
+    const customLabel = document.createElement("span");
+    customLabel.className = "settings-watch-label type-body";
+    customLabel.textContent = "Custom date & time";
+    const customInput = document.createElement("input");
+    customInput.type = "datetime-local";
+    customInput.className = "settings-watch-select";
+    const storedCustom = localStorage.getItem(TIME_CUSTOM_KEY);
+    if (storedCustom) customInput.value = storedCustom;
+    customInput.disabled = sourceSelect.value !== "custom";
+    customControl.append(customLabel, customInput);
+
+    sourceSelect.addEventListener("change", () => {
+      localStorage.setItem(TIME_SOURCE_KEY, sourceSelect.value);
+      customInput.disabled = sourceSelect.value !== "custom";
+      this.pushTimeConfig();
+    });
+    customInput.addEventListener("change", () => {
+      localStorage.setItem(TIME_CUSTOM_KEY, customInput.value);
+      this.pushTimeConfig();
+    });
+
+    // Rate dropdown (Frozen / 1× / 2× / 4× / 10×).
+    const rateControl = document.createElement("label");
+    rateControl.className = "settings-watch-control";
+    const rateLabel = document.createElement("span");
+    rateLabel.className = "settings-watch-label type-body";
+    rateLabel.textContent = "Rate";
+    const rateSelect = document.createElement("select");
+    rateSelect.className = "settings-watch-select";
+    for (const [value, text] of [
+      ["frozen", "Frozen"], ["1x", "1×"], ["2x", "2×"], ["4x", "4×"], ["10x", "10×"],
+    ]) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = text;
+      rateSelect.appendChild(opt);
+    }
+    rateSelect.value = localStorage.getItem(TIME_RATE_KEY) ?? "1x";
+    rateSelect.addEventListener("change", () => {
+      localStorage.setItem(TIME_RATE_KEY, rateSelect.value);
+      this.pushTimeConfig();
+    });
+    rateControl.append(rateLabel, rateSelect);
+
+    // Timezone dropdown (COMMON_ZONES + host zone if missing).
+    const tzControl = document.createElement("label");
+    tzControl.className = "settings-watch-control";
+    const tzLabel = document.createElement("span");
+    tzLabel.className = "settings-watch-label type-body";
+    tzLabel.textContent = "Timezone";
+    const tzSelect = document.createElement("select");
+    tzSelect.className = "settings-watch-select";
+    const hostTz = detectHostTimezone();
+    const zones = [...COMMON_ZONES];
+    if (!zones.includes(hostTz)) zones.unshift(hostTz);
+    for (const z of zones) {
+      const opt = document.createElement("option");
+      opt.value = z;
+      opt.textContent = z;
+      tzSelect.appendChild(opt);
+    }
+    tzSelect.value = localStorage.getItem(TIME_TZ_KEY) ?? hostTz;
+    tzSelect.addEventListener("change", () => {
+      localStorage.setItem(TIME_TZ_KEY, tzSelect.value);
+      this.pushTimeConfig();
+    });
+    tzControl.append(tzLabel, tzSelect);
+
+    // 24-hour clock toggle.
+    const hour24Row = this.makeSwitchRow(
+      "24-hour clock",
+      "Sets what clock_is_24h_style() returns on the watch.",
+      localStorage.getItem(TIME_HOUR24_KEY) !== "false", // default ON
+      (on) => {
+        localStorage.setItem(TIME_HOUR24_KEY, on ? "true" : "false");
+        this.pushTimeConfig();
+      },
+    );
+
+    const timeNote = document.createElement("p");
+    timeNote.className = "settings-row-desc type-caption";
+    timeNote.textContent =
+      "Speeding up time only fast-forwards clock-driven display (hands, date, ticks), not app animations.";
+
+    time.append(
+      timeHeading, sourceControl, customControl, rateControl, tzControl, hour24Row, timeNote,
+    );
+
     // ── Capture section ───────────────────────────────────────────────────
     const capture = document.createElement("section");
     capture.className = "settings-section";
@@ -316,10 +459,37 @@ export class SettingsPane {
 
     advanced.append(advHeading, diagRow);
 
-    this.el.append(appearance, watch, capture, keyboard, advanced);
+    this.el.append(appearance, watch, time, capture, keyboard, advanced);
 
     this.syncSwitch();
     this.syncBootSwitch();
+
+    // Push the persisted time config to the backend on startup (fire-and-forget).
+    this.pushTimeConfig();
+  }
+
+  /** Read the persisted time settings from localStorage into a TimeConfig. */
+  private buildTimeConfig(): TimeConfig {
+    const source = (localStorage.getItem(TIME_SOURCE_KEY) ?? "system") as TimeSource;
+    const rate = (localStorage.getItem(TIME_RATE_KEY) ?? "1x") as Rate;
+    const timezone = localStorage.getItem(TIME_TZ_KEY) ?? detectHostTimezone();
+    const hour24 = localStorage.getItem(TIME_HOUR24_KEY) !== "false";
+    const customWallMs = dtLocalToUtcMs(localStorage.getItem(TIME_CUSTOM_KEY) ?? "");
+    return { ...DEFAULT_TIME_CONFIG, source, rate, timezone, hour24, customWallMs };
+  }
+
+  /**
+   * Build the current time config, persist each field, push it to the backend,
+   * and broadcast a window event so the time badge (Task 11) can react.
+   */
+  private pushTimeConfig(): void {
+    const cfg = this.buildTimeConfig();
+    localStorage.setItem(TIME_SOURCE_KEY, cfg.source);
+    localStorage.setItem(TIME_RATE_KEY, cfg.rate);
+    localStorage.setItem(TIME_TZ_KEY, cfg.timezone);
+    localStorage.setItem(TIME_HOUR24_KEY, cfg.hour24 ? "true" : "false");
+    void window.studio.setTimeConfig(cfg).catch(() => {});
+    window.dispatchEvent(new CustomEvent("pebble-studio:time-changed", { detail: cfg }));
   }
 
   /**
