@@ -107,9 +107,11 @@ export function registerIpc(): void {
   const time = makeTimeController(() => driver);
 
   // Every `pebble` command re-syncs HOST time to the watch on connect (pebble-tool
-  // commands/base.py post_connect), clobbering a custom/timezone offset. After any
-  // discrete command that connects, re-assert the active offset (fire-and-forget;
-  // skipped when showing plain host/system time so we don't spawn needlessly).
+  // commands/base.py post_connect). Since v0.0.13 that clobber only matters for
+  // Timezone mode and the legacy offset fallback — shim-backed custom keeps
+  // utc_offset at the host offset, so the re-push is already a no-op. The
+  // controller decides internally what (if anything) to re-push; fire-and-forget,
+  // skipped when showing plain host/system time so we don't spawn needlessly.
   const reassertTime = (): void => {
     if (isNonSystemTime(time.getConfig(), detectHostTimezone())) void time.reassert();
   };
@@ -175,6 +177,12 @@ export function registerIpc(): void {
     currentBootToken = token;
     // Forward each boot step to the renderer (diagnostic boot notes, Task J).
     const onStep = (msg: string): void => { e.sender.send("emu:boot-progress", msg); };
+    // Deploy the LD_PRELOAD time shim BEFORE the emulator boots: bootEmulator's
+    // bootControl consults the shim-ready cache when spawning emu-control, so the
+    // wrapper must already exist on disk. Failure is fine — the time controller
+    // falls back to the legacy offset path. (Optional chaining: a null driver is
+    // handled by the start() call below, same as before.)
+    await driver?.ensureTimeShim().catch(() => false);
     const ep = await driver!.start(id, token, onStep);
     void time.applyAll(); // re-assert time settings on the fresh emulator (fire-and-forget)
     return ep;
@@ -192,6 +200,9 @@ export function registerIpc(): void {
     // killAll sweep reliably reaps qemu/websockify/emu-control/pypkjs.
     if (currentBootToken) currentBootToken.cancelled = true;
     await driver!.stop();
+    // Deliberately NOT resetting the time-shim control file here: the next
+    // emu:start's applyAll() rewrites it, and the controller starts every app run
+    // at the System default anyway.
     // NOTE: do NOT clear `loaded` here. A stop/kill (killAll) only reaps the
     // qemu/websockify/pypkjs/emu-control processes + the state file — it does NOT
     // delete installed apps, which persist on disk and are removed ONLY by
@@ -214,6 +225,9 @@ export function registerIpc(): void {
   // Time control (Task 5): get/set persisted time config and re-apply on boot.
   ipcMain.handle("time:get", async () => time.getConfig());
   ipcMain.handle("time:set", async (_e, cfg: TimeConfig) => { await time.setConfig(cfg); });
+  // Time-shim readiness ({shim:boolean}) — the Settings note shows the legacy
+  // offset-fallback limits when false.
+  ipcMain.handle("time:status", async () => time.getStatus());
   ipcMain.handle("emu:install", async (_e, pbwPath: string) => {
     await driver!.install(pbwPath);
     loaded.add(pbwPath);

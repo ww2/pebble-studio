@@ -237,7 +237,9 @@ export function makeTimeController(
     },
     async reassert(): Promise<void> {
       // Heal the post_connect host-offset clobber only where it matters:
-      if (cfg.source === "system" && cfg.timezone !== hostTz()) {
+      // Timezone mode is system-source with a non-host zone.
+      const isTimezoneMode = cfg.source === "system" && cfg.timezone !== hostTz();
+      if (isTimezoneMode) {
         // Timezone mode — re-push the chosen zone's offset.
         const d = getDriver();
         if (!d) return;

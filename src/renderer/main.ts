@@ -37,8 +37,10 @@ interface StudioApi {
   backlightMethod(m: string): Promise<void>;
   backlightPulse(): Promise<void>;
   // v0.0.7: time control (Task 5) and background-throttling toggle (Task 7).
-  getTimeConfig(): Promise<unknown>;
-  setTimeConfig(cfg: unknown): Promise<unknown>;
+  getTimeConfig(): Promise<TimeConfig>;
+  setTimeConfig(cfg: TimeConfig): Promise<void>;
+  // v0.0.13: time-shim readiness — false means the legacy offset fallback is active.
+  timeStatus(): Promise<{ shim: boolean }>;
   setBackgroundThrottling(throttle: boolean): Promise<void>;
   // v0.0.8: timeline quick-view (Task 1).
   timelineQuickView(on: boolean): Promise<void>;

@@ -142,6 +142,8 @@ export class SettingsPane {
   private runBtn!: HTMLButtonElement;
   private resetBtn!: HTMLButtonElement;
   private timeStatusEl!: HTMLElement;
+  /** The Settings time note; re-rendered when the shim status may have changed. */
+  private timeNoteEl!: HTMLParagraphElement;
   /** Live state of the 24-hour toggle (mirrors TIME_HOUR24_KEY). */
   private hour24 = false;
   /** True when a custom field was edited but not yet applied via Run. */
@@ -340,6 +342,10 @@ export class SettingsPane {
     this.dateInput = document.createElement("input");
     this.dateInput.type = "date";
     this.dateInput.className = "settings-watch-select";
+    // Wide-open range: the clock shim takes any date in the 32-bit era — no
+    // ±22-day offset limit anymore (that cap only applies in legacy fallback).
+    this.dateInput.min = "1970-01-01";
+    this.dateInput.max = "2099-12-31";
     dateControl.append(dateLabel, this.dateInput);
 
     // Custom time input (enabled only when source === "custom").
@@ -357,8 +363,9 @@ export class SettingsPane {
     this.timeInput.autocomplete = "off";
     timeControl.append(timeInputLabel, this.timeInput);
 
-    // Rate dropdown (Custom only): Frozen / 1× / 2× / 4× / 10×. Non-1× rates are
-    // driven by the virtual-clock daemon (see timeController).
+    // Rate dropdown (Custom only): Frozen / 1× / 2× / 4× / 10×. Rates drive the
+    // emulator's clock shim — exact multipliers, and Frozen stops seconds too
+    // (see timeController's control-file contract).
     const rateControl = document.createElement("label");
     rateControl.className = "settings-watch-control";
     const rateLabel = document.createElement("span");
@@ -518,16 +525,13 @@ export class SettingsPane {
       this.selectSystem();
     });
 
-    const timeNote = document.createElement("p");
-    timeNote.className = "settings-row-desc type-caption";
-    timeNote.textContent =
-      "The emulator's clock is slaved to your computer. Timezone shifts the displayed time live; " +
-      "Custom sets the entered time and Frozen/2×/4×/10× hold or fast-forward it. Limits: seconds " +
-      "still come from the host, dates must be within ~22 days of today, and it resets on reboot.";
+    this.timeNoteEl = document.createElement("p");
+    this.timeNoteEl.className = "settings-row-desc type-caption";
+    this.refreshTimeNote(); // sets the base copy now; appends fallback info async
 
     time.append(
       timeHeading, sourceControl, dateControl, timeControl, rateControl, tzControl,
-      hour24Row, timeButtons, this.timeStatusEl, timeNote,
+      hour24Row, timeButtons, this.timeStatusEl, this.timeNoteEl,
     );
 
     // ── Capture section ───────────────────────────────────────────────────
@@ -750,9 +754,36 @@ export class SettingsPane {
   /** Push a config to the emulator and notify the badge. Single apply path. */
   private applyConfig(cfg: TimeConfig): void {
     this.lastApplied = cfg;
-    void window.studio.setTimeConfig(cfg).catch(() => {});
+    void window.studio.setTimeConfig(cfg)
+      // Applying may have (re)attempted the shim deploy — re-query its status so
+      // the note reflects whether the legacy fallback is in play.
+      .then(() => this.refreshTimeNote())
+      .catch(() => {});
     window.dispatchEvent(new CustomEvent("pebble-studio:time-changed", { detail: cfg }));
     this.timeDirty = false;
+  }
+
+  /** (Re)render the Settings time note. The base copy describes the v0.0.13
+   * clock-shim model; when main reports the shim is unavailable we append the
+   * legacy offset-fallback limits. Base text is set synchronously so the note is
+   * never empty while the status query is in flight. */
+  private refreshTimeNote(): void {
+    const base =
+      "Custom time uses a clock shim inside the emulator: any date (1970–2099), " +
+      "Frozen truly freezes (seconds too), and 2×/4×/10× run exactly that fast. " +
+      "Custom time re-applies on relaunch. Timezone shifts the live display and " +
+      "is re-applied automatically after commands.";
+    this.timeNoteEl.textContent = base;
+    void window.studio.timeStatus()
+      .then(({ shim }) => {
+        if (!shim) {
+          this.timeNoteEl.textContent =
+            base +
+            " (Advanced time control unavailable on this system — falling back " +
+            "to offset mode: ±22 days, minute granularity.)";
+        }
+      })
+      .catch(() => {}); // status unavailable → keep the base copy
   }
 
   /** Apply System time (host clock) — called from source→system & Reset. */

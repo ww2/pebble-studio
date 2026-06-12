@@ -92,6 +92,12 @@ describe("makeTimeController — shim-backed (primary path)", () => {
   const t0Sec = Math.trunc(t0 / 1000);
   const deps = { now: () => t0, hostTz: () => HOST };
 
+  it("applyAll with no driver is a no-op", async () => {
+    const tc = makeTimeController(() => null, deps);
+    await expect(tc.applyAll()).resolves.toBeUndefined();
+    tc.stop();
+  });
+
   it("custom@frozen: setFakeTime(target, 0) + setTzOffset(hostOffset, hostTz)", async () => {
     const d = fakeDriver();
     const tc = makeTimeController(() => d, deps);

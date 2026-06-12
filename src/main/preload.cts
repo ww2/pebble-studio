@@ -1,4 +1,7 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
+// Type-only import — erased at compile time, so the standalone esbuild preload
+// bundle never pulls timeController code in at runtime.
+import type { TimeConfig } from "./backend/timeController.js";
 
 const studio = {
   initBackend: (): Promise<{ kind: string }> => ipcRenderer.invoke("backend:init"),
@@ -32,8 +35,10 @@ const studio = {
     ipcRenderer.invoke("emu:backlightMethod", m),
   backlightPulse: (): Promise<void> => ipcRenderer.invoke("emu:backlightPulse"),
   // Time control (Task 5).
-  getTimeConfig: () => ipcRenderer.invoke("time:get"),
-  setTimeConfig: (cfg: unknown) => ipcRenderer.invoke("time:set", cfg),
+  getTimeConfig: (): Promise<TimeConfig> => ipcRenderer.invoke("time:get"),
+  setTimeConfig: (cfg: TimeConfig): Promise<void> => ipcRenderer.invoke("time:set", cfg),
+  // Time-shim readiness (v0.0.13): false → legacy offset fallback limits apply.
+  timeStatus: (): Promise<{ shim: boolean }> => ipcRenderer.invoke("time:status"),
   timelineQuickView: (on: boolean): Promise<void> => ipcRenderer.invoke("emu:timelineQuickView", on),
   // Clay / AppConfig (Task B2). clayOpenWindow resolves with the RAW
   // still-percent-encoded close fragment ("" = cancelled).
