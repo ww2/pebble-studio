@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 
 /**
@@ -59,6 +59,11 @@ vi.mock("node:net", () => ({
 const { bootEmulator, BootAborted, makeWslBootDeps, makeNativeBootDeps, waitUntilDead } = await import(
   "../../src/main/backend/bootEmulator.js"
 );
+// timeShim holds the module-level shim-readiness cache that bootControl consults;
+// the SAME module instance is shared with bootEmulator's import in this graph.
+const { ensureTimeShim, _resetShimState, WRAPPER } = await import(
+  "../../src/main/backend/timeShim.js"
+);
 
 /** Build a fake Shell whose `pgrep -x qemu-pebble` returns a scripted sequence
  * of {code,stdout} (one per poll); `run` for anything else is a no-op success. */
@@ -91,9 +96,23 @@ describe("waitUntilDead", () => {
     await waitUntilDead(shell, 5000, { portFree, pollIntervalMs: 0 });
     // It polled at least twice (waited out the "alive" poll before resolving).
     expect(pgrepCalls.length).toBeGreaterThanOrEqual(2);
-    // Port is only probed once qemu is gone — never while it's still alive.
-    expect(portFree).toHaveBeenCalledTimes(1);
-    expect(portFree).toHaveBeenCalledWith("127.0.0.1", 5901);
+    // Ports are only probed once qemu is gone — never while it's still alive —
+    // and BOTH the raw RFB port and the websockify ws port must be released.
+    expect(portFree).toHaveBeenCalledTimes(2);
+    expect(portFree).toHaveBeenNthCalledWith(1, "127.0.0.1", 5901);
+    expect(portFree).toHaveBeenNthCalledWith(2, "127.0.0.1", 6080);
+  });
+
+  it("keeps waiting if qemu is gone and 5901 is free but websockify still holds 6080", async () => {
+    const { shell } = makePgrepShell([{ code: 1, stdout: "" }]);
+    let wsProbes = 0;
+    const portFree = vi.fn(async (_host: string, port: number) => {
+      if (port === 5901) return true;
+      wsProbes += 1;
+      return wsProbes >= 3; // 6080 stays bound for two polls, then frees
+    });
+    await waitUntilDead(shell, 5000, { portFree, pollIntervalMs: 0 });
+    expect(wsProbes).toBe(3);
   });
 
   it("keeps waiting if qemu is gone but the RFB port is still bound", async () => {
@@ -227,6 +246,41 @@ describe("bootEmulator cancellation", () => {
     expect(elapsed).toBeLessThan(2000);
   });
 
+  it("does NOT retry when the first attempt aborts via BootAborted (cancel)", async () => {
+    const bootControl = vi.fn(async () => {});
+    const killAll = vi.fn(async () => {});
+    await expect(
+      bootEmulator("basalt", {
+        killAll,
+        ensureKeymap: async () => {},
+        bootControl,
+        // Simulates the real token-aware wait: cancel surfaces as BootAborted.
+        waitForEmuInfo: async () => { throw new BootAborted(); },
+        waitForPort: async () => {},
+      }),
+    ).rejects.toBeInstanceOf(BootAborted);
+    expect(bootControl).toHaveBeenCalledTimes(1);
+    expect(killAll).toHaveBeenCalledTimes(1); // only the initial teardown — no retry kill
+  });
+
+  it("does NOT retry when the token is cancelled even if the failure is a plain Error", async () => {
+    const token = { cancelled: false };
+    const bootControl = vi.fn(async () => {});
+    await expect(
+      bootEmulator("basalt", {
+        killAll: async () => {},
+        ensureKeymap: async () => {},
+        bootControl,
+        waitForEmuInfo: async () => {
+          token.cancelled = true; // cancel lands mid-wait…
+          throw new Error("socket torn down"); // …but surfaces as a generic error
+        },
+        waitForPort: async () => {},
+      }, token),
+    ).rejects.toThrow("socket torn down");
+    expect(bootControl).toHaveBeenCalledTimes(1);
+  });
+
   it("throws BootAborted immediately if the token is already cancelled at entry", async () => {
     const killAll = vi.fn(async () => {});
     await expect(
@@ -240,5 +294,100 @@ describe("bootEmulator cancellation", () => {
     ).rejects.toBeInstanceOf(BootAborted);
     // Bails before doing any teardown work.
     expect(killAll).not.toHaveBeenCalled();
+  });
+});
+
+describe("bootEmulator retry-once", () => {
+  it("retries once after a readiness failure: clean kill, relaunch, resolves", async () => {
+    const killAll = vi.fn(async () => {});
+    const bootControl = vi.fn(async () => {});
+    let emuInfoCalls = 0;
+    const steps: string[] = [];
+    const endpoint = await bootEmulator(
+      "basalt",
+      {
+        killAll,
+        ensureKeymap: async () => {},
+        bootControl,
+        waitForEmuInfo: async () => {
+          emuInfoCalls += 1;
+          // The connect-after-marker race: first wait stalls out, second is fine.
+          if (emuInfoCalls === 1) throw new Error("timeout waiting for emulator info for basalt");
+        },
+        waitForPort: async () => {},
+      },
+      undefined,
+      (msg) => steps.push(msg),
+    );
+    expect(endpoint).toEqual({ host: "localhost", port: 6080, wsPath: "/" });
+    expect(bootControl).toHaveBeenCalledTimes(2); // initial launch + retry launch
+    expect(killAll).toHaveBeenCalledTimes(2); // initial teardown + pre-retry clean kill
+    expect(steps.some((s) => /retrying/i.test(s))).toBe(true);
+    expect(steps[steps.length - 1]).toBe("Ready");
+  });
+
+  it("propagates the failure when the retry fails too (exactly one retry)", async () => {
+    const bootControl = vi.fn(async () => {});
+    const killAll = vi.fn(async () => {});
+    await expect(
+      bootEmulator("basalt", {
+        killAll,
+        ensureKeymap: async () => {},
+        bootControl,
+        waitForEmuInfo: async () => { throw new Error("still stuck"); },
+        waitForPort: async () => {},
+      }),
+    ).rejects.toThrow("still stuck");
+    expect(bootControl).toHaveBeenCalledTimes(2); // never a third attempt
+    expect(killAll).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("bootControl wrapper routing (PEBBLE_QEMU_PATH)", () => {
+  beforeEach(() => {
+    calls.length = 0;
+    stdoutFor = () => "";
+    exitCode = 0;
+    _resetShimState();
+  });
+
+  afterEach(() => {
+    _resetShimState(); // never leak shim readiness into other suites
+  });
+
+  it("prefixes the cmdline with PEBBLE_QEMU_PATH=<wrapper> when the shim is ready", async () => {
+    // Flip the readiness cache true via the real ensureTimeShim path with a fake
+    // runner whose self-test output is exactly now+86400 (a passing self-test).
+    const nowMs = 1_750_000_000_000;
+    const selfTestOut = String(Math.floor(nowMs / 1000) + 86400);
+    const ok = await ensureTimeShim(
+      async () => ({ code: 0, stdout: selfTestOut, stderr: "" }),
+      {
+        resources: async () => ({ so: Buffer.from("so"), src: Buffer.from("src") }),
+        now: () => nowMs,
+      },
+    );
+    expect(ok).toBe(true);
+
+    calls.length = 0;
+    const deps = makeNativeBootDeps();
+    await deps.bootControl("basalt");
+    const call = calls.find((c) => c.cmd === "bash");
+    expect(call).toBeDefined();
+    const wrapped = String(call!.args[1]);
+    expect(wrapped).toContain(
+      `PEBBLE_QEMU_PATH=${WRAPPER} pebble emu-control --emulator basalt --vnc`,
+    );
+    expect(WRAPPER).toBe("$HOME/.pebble-studio/qemu-pebble");
+  });
+
+  it("uses no prefix when the shim is not ready", async () => {
+    const deps = makeNativeBootDeps();
+    await deps.bootControl("basalt");
+    const call = calls.find((c) => c.cmd === "bash");
+    expect(call).toBeDefined();
+    const wrapped = String(call!.args[1]);
+    expect(wrapped).toContain("pebble emu-control --emulator basalt --vnc");
+    expect(wrapped).not.toContain("PEBBLE_QEMU_PATH");
   });
 });

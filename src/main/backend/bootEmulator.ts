@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
 import { connect as netConnect } from "node:net";
-import { rm } from "node:fs/promises";
 import type { PlatformId } from "../../shared/types.js";
 import type { VncEndpoint } from "./BackendDriver.js";
+import { EMU_INFO_PATH, EMU_LOG_PATH, SDK_ROOT } from "./hostPaths.js";
+import { isShimReady, WRAPPER } from "./timeShim.js";
 
 /**
  * Real-boot orchestration for the qemu-pebble emulator (Task 1.5).
@@ -34,15 +35,13 @@ import type { VncEndpoint } from "./BackendDriver.js";
  * localhost ports to the Windows host, so readiness checks stay on localhost.
  */
 
-const HOME = process.env.HOME ?? "";
-// Use the `current` symlink rather than a hardcoded version so any active SDK
-// works. On a WSL host the path is resolved INSIDE wsl via `bash -lc`, so we
-// keep it as a literal POSIX path / shell expansion (~) rather than a Node path.
-const SDK_ROOT = "$HOME/.local/share/pebble-sdk/SDKs/current";
+// SDK_ROOT (imported from hostPaths) uses the `current` symlink rather than a
+// hardcoded version so any active SDK works. On a WSL host the path is resolved
+// INSIDE wsl via `bash -lc`, so it stays a literal POSIX path / shell expansion
+// rather than a Node path. PC_BIOS / STUB_KEYMAP stay derived here — they are
+// boot-keymap details, not host-path policy.
 const PC_BIOS = `${SDK_ROOT}/toolchain/lib/pc-bios`;
 const STUB_KEYMAP = "$HOME/.pebble-qemu-data/keymaps/en-us";
-const EMU_INFO_PATH = "/tmp/pb-emulator.json";
-const EMU_LOG_PATH = "/tmp/pebble-emu.log";
 const VNC_RFB_PORT = 5901;
 const WS_PORT = 6080;
 
@@ -223,7 +222,13 @@ function makeBootControl(shell: Shell) {
   return async function bootControl(id: PlatformId): Promise<void> {
     // emu-control --vnc owns the whole stack and stays alive. We detach it so it
     // survives the launching shell returning (critical on the WSL host path).
-    await shell.spawnDetached(`pebble emu-control --emulator ${id} --vnc`);
+    //
+    // When the time shim deployed OK, route qemu through the wrapper via
+    // pebble-tool's first-class PEBBLE_QEMU_PATH hook (emulator.py:279). The
+    // env assignment is part of the (quote-free) cmdline so it crosses the
+    // WSL boundary inside the same single shQuote layer as the rest.
+    const prefix = isShimReady() ? `PEBBLE_QEMU_PATH=${WRAPPER} ` : "";
+    await shell.spawnDetached(`${prefix}pebble emu-control --emulator ${id} --vnc`);
   };
 }
 
@@ -264,8 +269,9 @@ export interface WaitUntilDeadDeps {
  * never paints. Booting a DIFFERENT model takes longer (and starts a different
  * machine), which accidentally gives the stale stack time to fully release —
  * exactly the "helpfulness" the user observed. This makes that settling
- * DETERMINISTIC: poll until BOTH (a) no `qemu-pebble` process remains AND
- * (b) RFB port 5901 is free, before letting a new boot proceed.
+ * DETERMINISTIC: poll until ALL of (a) no `qemu-pebble` process remains,
+ * (b) RFB port 5901 is free, AND (c) websockify's ws port 6080 is free,
+ * before letting a new boot proceed.
  *
  * `pgrep -x qemu-pebble` matches the EXACT process NAME; the polling shell's comm
  * is `bash`/`pgrep`, never `qemu-pebble`, so there is no self-match (unlike the
@@ -289,7 +295,10 @@ export async function waitUntilDead(
     const qemuGone = code !== 0 && stdout.trim() === "";
     // (b) RFB port released.
     const rfbFree = qemuGone ? await portFree("127.0.0.1", VNC_RFB_PORT) : false;
-    if (qemuGone && rfbFree) return;
+    // (c) websockify released the websocket port too — a relaunch's websockify
+    // would otherwise collide with the lingering 6080 listener.
+    const wsFree = rfbFree ? await portFree("127.0.0.1", WS_PORT) : false;
+    if (qemuGone && rfbFree && wsFree) return;
     if (Date.now() >= deadline) return; // give up gracefully; never hang the app
     await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
@@ -381,19 +390,34 @@ export async function bootEmulator(
   // 2. Make the tool's VNC keymap path valid.
   step("Preparing keymap…");
   await d.ensureKeymap();
-  // 3. Boot the full stack (qemu + pypkjs + websockify) under the pebble tool.
-  step("Launching qemu…");
-  await d.bootControl(platformId);
-  // 4. Wait for readiness: state file, raw RFB, and the websocket proxy. The
-  //    token threads into each wait so a cancel interrupts the active loop.
-  step("Waiting for emulator state…");
-  await d.waitForEmuInfo(platformId, 60_000, token);
-  step("Waiting for VNC…");
-  await d.waitForPort("localhost", VNC_RFB_PORT, 60_000, token);
-  await d.waitForPort("localhost", WS_PORT, 60_000, token);
-
-  step("Ready");
-  return { host: "localhost", port: WS_PORT, wsPath: "/" };
+  // 3+4. Boot the full stack (qemu + pypkjs + websockify) under the pebble tool,
+  // then wait for readiness: state file, raw RFB, and the websocket proxy. The
+  // token threads into each wait so a cancel interrupts the active loop.
+  const attempt = async (): Promise<VncEndpoint> => {
+    step("Launching qemu…");
+    await d.bootControl(platformId);
+    step("Waiting for emulator state…");
+    await d.waitForEmuInfo(platformId, 60_000, token);
+    step("Waiting for VNC…");
+    await d.waitForPort("localhost", VNC_RFB_PORT, 60_000, token);
+    await d.waitForPort("localhost", WS_PORT, 60_000, token);
+    return { host: "localhost", port: WS_PORT, wsPath: "/" };
+  };
+  try {
+    const ep = await attempt();
+    step("Ready");
+    return ep;
+  } catch (err) {
+    // Known flakiness: the managed boot intermittently hangs waiting for the
+    // emulator state (a connect-after-marker race in pebble-tool). A clean kill
+    // + ONE retry recovers it. Cancellation is never retried.
+    if (err instanceof BootAborted || token?.cancelled) throw err;
+    step("Boot stalled — retrying once…");
+    await d.killAll();
+    const ep = await attempt(); // second failure propagates
+    step("Ready");
+    return ep;
+  }
 }
 
 export async function stopEmulator(deps: Partial<Pick<SpawnDeps, "killAll">> = {}): Promise<void> {

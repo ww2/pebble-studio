@@ -194,7 +194,13 @@ export function setFakeTimeCmd(targetUnix: number | null, rate: number): PebbleC
  *   3. `<cwd>/vendor/timeshim/`  — vitest / direct-node fallback
  */
 export async function readShimResources(
-  resourcesPath: string | undefined = typeof process !== "undefined" ? process.resourcesPath : undefined,
+  // process.resourcesPath is an Electron main-process addition; access it
+  // structurally so this file also typechecks in programs WITHOUT the electron
+  // ambient augmentation (the renderer tsconfig reaches this file through the
+  // type-only chain vncClient → BackendDriver → bootEmulator → timeShim).
+  resourcesPath: string | undefined = typeof process !== "undefined"
+    ? (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath
+    : undefined,
 ): Promise<{ so: Buffer; src: Buffer }> {
   // __dirname is defined at runtime in the esbuild CJS bundle; in vitest it
   // resolves through the declare above. Fall back to cwd if truly absent.

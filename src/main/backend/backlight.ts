@@ -1,6 +1,7 @@
 import { connect as netConnect } from "node:net";
 import { makeNativeShell, makeWslShell, type Shell } from "./bootEmulator.js";
 import type { DriverKind } from "./driverFactory.js";
+import { EMU_INFO_PATH } from "./hostPaths.js";
 
 /**
  * Backlight keepalive (Task K).
@@ -19,7 +20,6 @@ import type { DriverKind } from "./driverFactory.js";
  * caveat is surfaced in the Settings UI, not here.
  */
 
-const EMU_INFO_PATH = "/tmp/pb-emulator.json";
 const TICK_MS = 1000;
 
 /**
