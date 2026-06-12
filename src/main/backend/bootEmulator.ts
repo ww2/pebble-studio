@@ -227,6 +227,74 @@ function makeBootControl(shell: Shell) {
   };
 }
 
+/**
+ * Probe whether RFB port 5901 is FREE (refusing connections). Resolves true if
+ * the port is free (connection refused/errored/timed out), false if something is
+ * still accepting connections there. Ports are localhost-forwarded on both hosts
+ * (WSL2 mirrors localhost to Windows), so a native net.connect to 127.0.0.1 is
+ * host-agnostic for this free-or-not check.
+ */
+function defaultPortFree(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = netConnect({ host, port });
+    sock.setTimeout(1000);
+    const free = () => { sock.destroy(); resolve(true); };
+    sock.once("connect", () => { sock.destroy(); resolve(false); });
+    sock.once("error", free);
+    sock.once("timeout", free);
+  });
+}
+
+/** Injectable deps for `waitUntilDead` so it's testable without real procs/sockets. */
+export interface WaitUntilDeadDeps {
+  /** Probe a TCP port; resolve true iff it is FREE (refusing connections). */
+  portFree?: (host: string, port: number) => Promise<boolean>;
+  /** Override the inter-poll delay (ms) — tests set this to 0 for speed. */
+  pollIntervalMs?: number;
+}
+
+/**
+ * Block until the prior emulator stack is TRULY gone, or the timeout elapses.
+ *
+ * ROOT CAUSE THIS GUARDS (the "watchface hang"): `killAll` SIGKILLs qemu and then
+ * waits a FIXED 800ms with NO verification. SIGKILL is async — the kernel may not
+ * have reaped qemu (and released VNC display :1 / RFB port 5901) within 800ms.
+ * A same-model relaunch then races the lingering stack: the fresh
+ * `emu-control --vnc` collides with the still-bound display/port and the watch
+ * never paints. Booting a DIFFERENT model takes longer (and starts a different
+ * machine), which accidentally gives the stale stack time to fully release —
+ * exactly the "helpfulness" the user observed. This makes that settling
+ * DETERMINISTIC: poll until BOTH (a) no `qemu-pebble` process remains AND
+ * (b) RFB port 5901 is free, before letting a new boot proceed.
+ *
+ * `pgrep -x qemu-pebble` matches the EXACT process NAME; the polling shell's comm
+ * is `bash`/`pgrep`, never `qemu-pebble`, so there is no self-match (unlike the
+ * `-f` patterns killAll must guard with character classes).
+ *
+ * If the timeout elapses we resolve anyway (never hang the app); after a SIGKILL
+ * it normally resolves within a poll or two.
+ */
+export async function waitUntilDead(
+  shell: Shell,
+  timeoutMs = 5000,
+  deps: WaitUntilDeadDeps = {},
+): Promise<void> {
+  const portFree = deps.portFree ?? defaultPortFree;
+  const pollIntervalMs = deps.pollIntervalMs ?? 200;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    // (a) No qemu-pebble process: pgrep exits non-zero (and prints nothing) when
+    // there is no match.
+    const { code, stdout } = await shell.run("pgrep -x qemu-pebble");
+    const qemuGone = code !== 0 && stdout.trim() === "";
+    // (b) RFB port released.
+    const rfbFree = qemuGone ? await portFree("127.0.0.1", VNC_RFB_PORT) : false;
+    if (qemuGone && rfbFree) return;
+    if (Date.now() >= deadline) return; // give up gracefully; never hang the app
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+  }
+}
+
 function makeKillAll(shell: Shell) {
   // CRITICAL — SELF-MATCH HAZARD: this sweep runs inside `bash -lc "<cmdline>"`,
   // so the controlling shell's OWN argv literally CONTAINS these patterns. A naive
@@ -252,8 +320,14 @@ function makeKillAll(shell: Shell) {
     `pebble kill 2>/dev/null; true`;
   return async function killAll(): Promise<void> {
     await shell.run(`${sweep}; sleep 0.4; ${sweep}; rm -f ${EMU_INFO_PATH} 2>/dev/null; true`);
-    // Give the OS a beat to release the VNC display + ports.
+    // Give the OS a beat to release the VNC display + ports…
     await new Promise((r) => setTimeout(r, 800));
+    // …then VERIFY the stack is actually gone before returning. SIGKILL is async,
+    // so the fixed settle above is NOT a guarantee; without this gate a same-model
+    // relaunch races a not-yet-reaped qemu / still-bound RFB port 5901 and the
+    // watchface hangs. waitUntilDead makes teardown deterministic (the same
+    // settling a slower different-model boot accidentally provided).
+    await waitUntilDead(shell);
   };
 }
 

@@ -19,7 +19,16 @@ vi.mock("node:child_process", () => ({
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
     child.unref = () => {};
+    // The verify-dead gate (waitUntilDead) shells out `pgrep -x qemu-pebble`.
+    // For these construction tests there is no real qemu, so report "dead"
+    // (non-zero exit, empty stdout) so the gate resolves immediately instead of
+    // polling to its timeout. Other commands use the shared exitCode/stdoutFor.
+    const isPgrep = args.some((a) => typeof a === "string" && a.includes("pgrep"));
     queueMicrotask(() => {
+      if (isPgrep) {
+        child.emit("close", 1);
+        return;
+      }
       const out = stdoutFor(cmd, args);
       if (out) child.stdout.emit("data", Buffer.from(out));
       child.emit("close", exitCode);
@@ -29,9 +38,70 @@ vi.mock("node:child_process", () => ({
 }));
 
 // Import AFTER the mock is registered (vi.mock is hoisted, so this is fine).
-const { bootEmulator, BootAborted, makeWslBootDeps, makeNativeBootDeps } = await import(
+const { bootEmulator, BootAborted, makeWslBootDeps, makeNativeBootDeps, waitUntilDead } = await import(
   "../../src/main/backend/bootEmulator.js"
 );
+
+/** Build a fake Shell whose `pgrep -x qemu-pebble` returns a scripted sequence
+ * of {code,stdout} (one per poll); `run` for anything else is a no-op success. */
+function makePgrepShell(seq: { code: number; stdout: string }[]) {
+  let i = 0;
+  const pgrepCalls: string[] = [];
+  const shell = {
+    run: async (cmdline: string) => {
+      if (cmdline.includes("pgrep")) {
+        pgrepCalls.push(cmdline);
+        const r = seq[Math.min(i, seq.length - 1)];
+        i += 1;
+        return { code: r.code, stdout: r.stdout, stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    spawnDetached: async () => {},
+  };
+  return { shell, pgrepCalls };
+}
+
+describe("waitUntilDead", () => {
+  it("waits while qemu is alive, then resolves once pgrep reports dead AND port is free", async () => {
+    // First poll: qemu still alive (pgrep exit 0). Second poll: gone (exit 1, empty).
+    const { shell, pgrepCalls } = makePgrepShell([
+      { code: 0, stdout: "4242\n" },
+      { code: 1, stdout: "" },
+    ]);
+    const portFree = vi.fn(async () => true);
+    await waitUntilDead(shell, 5000, { portFree, pollIntervalMs: 0 });
+    // It polled at least twice (waited out the "alive" poll before resolving).
+    expect(pgrepCalls.length).toBeGreaterThanOrEqual(2);
+    // Port is only probed once qemu is gone — never while it's still alive.
+    expect(portFree).toHaveBeenCalledTimes(1);
+    expect(portFree).toHaveBeenCalledWith("127.0.0.1", 5901);
+  });
+
+  it("keeps waiting if qemu is gone but the RFB port is still bound", async () => {
+    const { shell } = makePgrepShell([{ code: 1, stdout: "" }]);
+    // Port stays bound for the first two probes, then frees up.
+    const portFree = vi
+      .fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+    await waitUntilDead(shell, 5000, { portFree, pollIntervalMs: 0 });
+    expect(portFree.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("resolves (does not throw) when the timeout elapses with qemu still alive", async () => {
+    // pgrep always reports alive ⇒ the gate can only end via timeout.
+    const { shell } = makePgrepShell([{ code: 0, stdout: "4242\n" }]);
+    const portFree = vi.fn(async () => true);
+    const start = Date.now();
+    await expect(
+      waitUntilDead(shell, 60, { portFree, pollIntervalMs: 10 }),
+    ).resolves.toBeUndefined();
+    // It honored the (short) timeout rather than hanging forever.
+    expect(Date.now() - start).toBeLessThan(2000);
+  });
+});
 
 describe("bootEmulator WSL shell construction", () => {
   beforeEach(() => {
