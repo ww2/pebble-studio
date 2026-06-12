@@ -33,8 +33,11 @@ let currentBootToken: BootToken | null = null;
 let captureDir: string | null = null;
 
 /**
- * The set of .pbw paths currently installed on the running emulator.
- * Populated when install succeeds; cleared when the emulator is stopped or wiped.
+ * The set of .pbw paths currently installed on the emulator's on-disk data dir.
+ * Populated when install succeeds; cleared ONLY on a real wipe (loaded:clear).
+ * A plain stop/kill preserves installed apps on disk, so it must NOT clear this.
+ * Known limitation: a fresh app process starts with an empty set even if apps
+ * persist on disk from a previous run (no cross-process persistence by design).
  */
 const loaded = new Set<string>();
 
@@ -114,6 +117,7 @@ export function registerIpc(): void {
     // 3. Reboot the current platform clean — WITHOUT reinstalling library apps
     //    (that's what "clear" means: the watch starts fresh with no user apps).
     await driver!.start(platformId);
+    void time.applyAll(); // re-assert time settings on the clear-rebooted emulator (fire-and-forget)
     // loaded remains empty after the clear reboot.
   });
 
@@ -156,7 +160,14 @@ export function registerIpc(): void {
     // killAll sweep reliably reaps qemu/websockify/emu-control/pypkjs.
     if (currentBootToken) currentBootToken.cancelled = true;
     await driver!.stop();
-    loaded.clear();
+    // NOTE: do NOT clear `loaded` here. A stop/kill (killAll) only reaps the
+    // qemu/websockify/pypkjs/emu-control processes + the state file — it does NOT
+    // delete installed apps, which persist on disk and are removed ONLY by
+    // `pebble wipe` (driver.wipe(), called from loaded:clear). Clearing the set on
+    // stop desynced it from disk: after a relaunch/force-close/model-switch the
+    // apps were still installed but `loaded` was empty, so loaded:list returned []
+    // and the renderer's "Clear emulator" button stayed disabled. The set now
+    // mirrors on-disk install state and is cleared only on a real wipe.
   });
 
   // Backlight keepalive toggles (Task K). "Always on" is independent of captures;
