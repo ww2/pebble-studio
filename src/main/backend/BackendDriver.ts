@@ -15,7 +15,8 @@ export interface BackendDriver {
   install(pbwPath: string): Promise<void>;
   button(id: ButtonId, action: ButtonAction): Promise<void>;
   accelTap(): Promise<void>;
-  setTime(value: string | "system"): Promise<void>;
+  setTime(value: string, opts?: { utc?: boolean }): Promise<void>;
+  timeFormat(hour24: boolean): Promise<void>;
   bluetooth(connected: boolean): Promise<void>;
   battery(percent: number, charging: boolean): Promise<void>;
   screenshot(outPath: string): Promise<void>;

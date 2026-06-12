@@ -34,14 +34,23 @@ describe("NativeDriver", () => {
     expect(stop).toHaveBeenCalledOnce();
   });
 
-  it("converts setTime('system') to an HH:MM:SS string (not ISO)", async () => {
+  it("setTime passes epoch + --utc through the runner", async () => {
     const calls: string[][] = [];
-    const run = vi.fn(async (_c: string, args: string[]) => { calls.push(args); return { code: 0, stdout: "", stderr: "" }; });
+    const run = async (_c: string, args: string[]) => { calls.push(args); return { code: 0, stdout: "", stderr: "" }; };
     const d = new NativeDriver({ run });
     d.setPlatform("basalt");
-    await d.setTime("system");
-    const timeArg = calls[0][calls[0].length - 1];
-    expect(timeArg).toMatch(/^\d{2}:\d{2}:\d{2}$/);  // HH:MM:SS, never an ISO 'T'
+    await d.setTime("1700000000", { utc: true });
+    expect(calls[0]).toContain("--utc");
+    expect(calls[0]).toContain("1700000000");
+  });
+
+  it("timeFormat sends --format 24h", async () => {
+    const calls: string[][] = [];
+    const run = async (_c: string, args: string[]) => { calls.push(args); return { code: 0, stdout: "", stderr: "" }; };
+    const d = new NativeDriver({ run });
+    d.setPlatform("basalt");
+    await d.timeFormat(true);
+    expect(calls[0]).toEqual(expect.arrayContaining(["emu-time-format", "--format", "24h"]));
   });
 
   it("wipe() runs pebble wipe with no --emulator flag", async () => {

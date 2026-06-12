@@ -51,10 +51,12 @@ export class NativeDriver implements BackendDriver {
     await this.exec(cli.accelTapCmd());
   }
 
-  async setTime(value: string | "system"): Promise<void> {
-    // emu-set-time wants HH:MM:SS (today, local) or unix seconds — never ISO 8601.
-    const time = value === "system" ? new Date().toTimeString().slice(0, 8) : value;
-    await this.exec(cli.setTimeCmd(time));
+  async setTime(value: string, opts?: { utc?: boolean }): Promise<void> {
+    await this.exec(cli.setTimeCmd(value, opts?.utc ?? false));
+  }
+
+  async timeFormat(hour24: boolean): Promise<void> {
+    await this.exec(cli.timeFormatCmd(hour24));
   }
 
   async bluetooth(connected: boolean): Promise<void> {
