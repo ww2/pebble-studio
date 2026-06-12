@@ -497,6 +497,14 @@ export class EmulatorView {
     this.timeCfg = cfg;
     this.hostTz = hostTz;
     this.renderTimeBadge();
+    // Safety guard: a time-config change (system or custom) must never disturb
+    // the live indicator. Re-assert the green "● Live" status/class iff live, so
+    // the requirement holds even if some other path were to perturb it. Only the
+    // separate badge element should reflect time config — never `this.status`.
+    if (this.state === "live") {
+      this.status.textContent = "● Live";
+      this.status.classList.add("emu-status--live");
+    }
   }
 
   private renderTimeBadge(): void {
