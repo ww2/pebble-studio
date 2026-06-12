@@ -10,10 +10,10 @@
 // EmulatorView by dispatching a `pebble-studio:keybindings-changed` window event.
 
 /** The bindable emulator actions. */
-export type KeyAction = "back" | "up" | "select" | "down" | "tap" | "shake";
+export type KeyAction = "back" | "up" | "select" | "down" | "tap" | "shake" | "light";
 
 /** Ordered list of actions (drives the Settings UI rows). */
-export const ACTIONS: readonly KeyAction[] = ["back", "up", "select", "down", "tap", "shake"] as const;
+export const ACTIONS: readonly KeyAction[] = ["back", "up", "select", "down", "tap", "shake", "light"] as const;
 
 /** A binding maps each action to a KeyboardEvent.key value, or null if unbound. */
 export type Bindings = Record<KeyAction, string | null>;
@@ -31,6 +31,7 @@ export const DEFAULT_BINDINGS: Bindings = {
   down: "ArrowDown",
   tap: null,
   shake: null,
+  light: null,
 };
 
 /** True for a record that has exactly the action keys with string|null values. */

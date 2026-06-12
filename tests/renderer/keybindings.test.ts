@@ -13,12 +13,13 @@ describe("keybindings defaults", () => {
     expect(DEFAULT_BINDINGS.select).toBe("ArrowRight");
     expect(DEFAULT_BINDINGS.down).toBe("ArrowDown");
   });
-  it("leaves tap and shake unbound by default", () => {
+  it("leaves tap, shake and light unbound by default", () => {
     expect(DEFAULT_BINDINGS.tap).toBeNull();
     expect(DEFAULT_BINDINGS.shake).toBeNull();
+    expect(DEFAULT_BINDINGS.light).toBeNull();
   });
-  it("exposes all six actions in order", () => {
-    expect(ACTIONS).toEqual(["back", "up", "select", "down", "tap", "shake"]);
+  it("exposes all actions in order", () => {
+    expect(ACTIONS).toEqual(["back", "up", "select", "down", "tap", "shake", "light"]);
   });
 });
 

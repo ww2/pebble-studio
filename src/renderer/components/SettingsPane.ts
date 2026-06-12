@@ -61,6 +61,7 @@ const ACTION_LABELS: Record<KeyAction, string> = {
   down: "Down",
   tap: "Tap (accel)",
   shake: "Shake",
+  light: "Light now",
 };
 
 /** Pretty-print a bound key for display (e.g. ArrowLeft → "←", " " → "Space"). */

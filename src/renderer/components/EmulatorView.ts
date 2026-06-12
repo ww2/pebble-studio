@@ -268,6 +268,9 @@ export class EmulatorView {
         void window.studio.accelTap();
         setTimeout(() => void window.studio.accelTap(), 120);
         break;
+      case "light":
+        void window.studio.backlightPulse();
+        break;
     }
   }
 
