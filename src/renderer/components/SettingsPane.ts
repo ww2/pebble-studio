@@ -3,6 +3,15 @@ import type { PlatformId } from "../../shared/types.js";
 import { PLATFORMS } from "../../main/backend/emulatorRegistry.js"; // pure module, bundled by Vite
 
 type ThemeChoice = "light" | "dark";
+type BootMode = "auto" | "manual";
+
+/** Options for the boot-mode + capture-location controls (owned by main.ts). */
+interface SettingsOptions {
+  initialBootMode: BootMode;
+  onBootModeChange: (mode: BootMode) => void;
+}
+
+const CAPTURE_DIR_KEY = "pebble-studio:capture-dir";
 
 /**
  * Settings inspector pane (Windows 11 Fluent style). Hosts app-level
@@ -25,16 +34,24 @@ export class SettingsPane {
   private themeMode: ThemeChoice;
   private readonly switchEl: HTMLButtonElement;
   private readonly watchSelect: HTMLSelectElement;
+  private readonly bootSwitchEl: HTMLButtonElement;
+  private readonly captureDirValue: HTMLSpanElement;
+  private bootMode: BootMode;
   /** Switches the live preview to the chosen platform (wired from main.ts). */
   private readonly onPlatformChange: (id: PlatformId) => void;
+  /** Persists + notifies main.ts when the boot mode changes. */
+  private readonly onBootModeChange: (mode: BootMode) => void;
 
   constructor(
     initialTheme: ThemeChoice,
     initialPlatform: PlatformId,
     onPlatformChange: (id: PlatformId) => void,
+    options: SettingsOptions,
   ) {
     this.themeMode = initialTheme;
     this.onPlatformChange = onPlatformChange;
+    this.bootMode = options.initialBootMode;
+    this.onBootModeChange = options.onBootModeChange;
 
     this.el = document.createElement("div");
     this.el.className = "settings-pane";
@@ -119,11 +136,71 @@ export class SettingsPane {
     watchControl.append(watchLabel, this.watchSelect);
     this.defaultWatchSlot.appendChild(watchControl);
 
-    watch.append(watchHeading, watchDesc, this.defaultWatchSlot);
+    // Boot mode row: Auto/Manual Fluent switch ("on" = auto-boot on selection;
+    // "off" = manual, load chrome and wait for Launch). Default Manual.
+    const bootRow = document.createElement("div");
+    bootRow.className = "settings-row";
 
-    this.el.append(appearance, watch);
+    const bootText = document.createElement("div");
+    bootText.className = "settings-row-text";
+    const bootLabel = document.createElement("span");
+    bootLabel.className = "settings-row-label type-body";
+    bootLabel.textContent = "Auto-boot on switch";
+    const bootDesc = document.createElement("span");
+    bootDesc.className = "settings-row-desc type-caption";
+    bootDesc.textContent = "On: boot when a model is selected. Off: load the chrome and wait for Launch.";
+    bootText.append(bootLabel, bootDesc);
+
+    this.bootSwitchEl = document.createElement("button");
+    this.bootSwitchEl.type = "button";
+    this.bootSwitchEl.className = "fluent-switch";
+    this.bootSwitchEl.setAttribute("role", "switch");
+    this.bootSwitchEl.setAttribute("aria-label", "Auto-boot on switch");
+    const bootKnob = document.createElement("span");
+    bootKnob.className = "fluent-switch-knob";
+    bootKnob.setAttribute("aria-hidden", "true");
+    this.bootSwitchEl.appendChild(bootKnob);
+    this.bootSwitchEl.addEventListener("click", () => this.toggleBootMode());
+
+    bootRow.append(bootText, this.bootSwitchEl);
+
+    watch.append(watchHeading, watchDesc, this.defaultWatchSlot, bootRow);
+
+    // ── Capture section ───────────────────────────────────────────────────
+    const capture = document.createElement("section");
+    capture.className = "settings-section";
+
+    const captureHeading = document.createElement("h3");
+    captureHeading.className = "settings-section-title type-body-strong";
+    captureHeading.textContent = "Captures";
+
+    const captureRow = document.createElement("div");
+    captureRow.className = "settings-row";
+
+    const captureText = document.createElement("div");
+    captureText.className = "settings-row-text";
+    const captureLabel = document.createElement("span");
+    captureLabel.className = "settings-row-label type-body";
+    captureLabel.textContent = "Capture location";
+    this.captureDirValue = document.createElement("span");
+    this.captureDirValue.className = "settings-row-desc type-caption";
+    const storedDir = localStorage.getItem(CAPTURE_DIR_KEY);
+    this.captureDirValue.textContent = storedDir ?? "Downloads (default)";
+    captureText.append(captureLabel, this.captureDirValue);
+
+    const captureBtn = document.createElement("button");
+    captureBtn.type = "button";
+    captureBtn.className = "lib-pick-btn";
+    captureBtn.textContent = "Change…";
+    captureBtn.addEventListener("click", () => void this.pickCaptureDir());
+
+    captureRow.append(captureText, captureBtn);
+    capture.append(captureHeading, captureRow);
+
+    this.el.append(appearance, watch, capture);
 
     this.syncSwitch();
+    this.syncBootSwitch();
   }
 
   /**
@@ -132,6 +209,43 @@ export class SettingsPane {
    */
   setPlatform(id: PlatformId): void {
     if (this.watchSelect.value !== id) this.watchSelect.value = id;
+  }
+
+  /** Toggle Auto/Manual boot, persist + notify main.ts via the injected callback. */
+  private toggleBootMode(): void {
+    this.bootMode = this.bootMode === "auto" ? "manual" : "auto";
+    this.syncBootSwitch();
+    this.onBootModeChange(this.bootMode);
+  }
+
+  private syncBootSwitch(): void {
+    const on = this.bootMode === "auto";
+    this.bootSwitchEl.classList.toggle("fluent-switch--on", on);
+    this.bootSwitchEl.setAttribute("aria-checked", on ? "true" : "false");
+  }
+
+  /**
+   * Pick a new capture directory via the native folder picker. On success, point
+   * main at it, persist the choice, and update the displayed path. Cancelling
+   * (null) leaves the current setting untouched.
+   */
+  private async pickCaptureDir(): Promise<void> {
+    let dir: string | null;
+    try {
+      dir = await window.studio.pickDirectory();
+    } catch (err) {
+      console.warn("[settings] pickDirectory failed (ignored):", err);
+      return;
+    }
+    if (!dir) return;
+    try {
+      await window.studio.setCaptureDir(dir);
+    } catch (err) {
+      console.error("[settings] setCaptureDir failed:", err);
+      return;
+    }
+    localStorage.setItem(CAPTURE_DIR_KEY, dir);
+    this.captureDirValue.textContent = dir;
   }
 
   private toggleTheme(): void {

@@ -28,6 +28,8 @@ export class EmulatorView {
   private readonly caption: HTMLElement;
   private readonly relaunchBtn: HTMLButtonElement;
   private readonly forceCloseBtn: HTMLButtonElement;
+  private readonly tapBtn: HTMLButtonElement;
+  private readonly shakeBtn: HTMLButtonElement;
   private readonly zoomSelect: HTMLSelectElement;
   private readonly frameWrapper: HTMLElement;
   private readonly frame: HTMLElement;
@@ -47,10 +49,20 @@ export class EmulatorView {
   private vnc: VncHandle | null = null;
   /** The platform currently running (or last attempted). null = nothing booted yet. */
   private currentPlatform: PlatformId | null = null;
-  /** True while a boot or stop operation is in progress. */
-  private busy = false;
-  /** True once the emulator has been started at least once (stop() is safe to call). */
-  private started = false;
+  /**
+   * Lifecycle state machine (v0.0.5). `stopped` = chrome idle, Launch shown;
+   * `booting` = a start() is in flight; `live` = VNC connected; `stopping` =
+   * a stop/abort is in flight. Drives button labels/enablement and gates IPC.
+   */
+  private state: "stopped" | "booting" | "live" | "stopping" = "stopped";
+  /**
+   * Monotonic boot generation. Each boot captures the current gen; force-close
+   * (and each new boot) increments it. A boot's start() goes `live` ONLY if its
+   * gen is still current when it resolves — otherwise it bails silently. This is
+   * what lets force-close take effect immediately even though a backend start()
+   * promise may still be settling.
+   */
+  private bootGen = 0;
 
   constructor() {
     this.el = document.createElement("div");
@@ -112,17 +124,27 @@ export class EmulatorView {
     // animate their positions (morph). Order matters only for DOM stacking.
     this.createButtons();
 
-    // Tap / Shake
+    // Tap / Shake — no-op unless the emulator is live (don't fire IPC at a dead one).
     const tapBtn = this.el.querySelector<HTMLButtonElement>("#emu-tap")!;
     const shakeBtn = this.el.querySelector<HTMLButtonElement>("#emu-shake")!;
-    tapBtn.addEventListener("click", () => void window.studio.accelTap());
+    this.tapBtn = tapBtn;
+    this.shakeBtn = shakeBtn;
+    tapBtn.addEventListener("click", () => {
+      if (this.state !== "live") return;
+      void window.studio.accelTap();
+    });
     shakeBtn.addEventListener("click", () => {
+      if (this.state !== "live") return;
       void window.studio.accelTap();
       setTimeout(() => void window.studio.accelTap(), 120);
     });
 
-    // Lifecycle buttons
-    this.relaunchBtn.addEventListener("click", () => void this.relaunch());
+    // Lifecycle buttons. The single Launch/Relaunch button routes to relaunch()
+    // when live and launch() otherwise.
+    this.relaunchBtn.addEventListener("click", () => {
+      if (this.state === "live") void this.relaunch();
+      else void this.launch();
+    });
     this.forceCloseBtn.addEventListener("click", () => void this.forceClose());
 
     // Zoom segmented control
@@ -265,56 +287,152 @@ export class EmulatorView {
     localStorage.setItem(SCREEN_BEZEL_KEY, c);
   }
 
-  /** Update the enabled/disabled state of lifecycle buttons. */
+  /**
+   * Reflect the lifecycle state on the buttons:
+   *  - Launch/Relaunch: label is "Relaunch" when live, "Launch" otherwise;
+   *    enabled iff (stopped && a platform is selected) || live — disabled while
+   *    booting/stopping so it can't be spammed.
+   *  - Force-close: enabled while booting or live (something to cancel).
+   *  - Tap/Shake + the four nubs: disabled unless live (no IPC at a dead emu).
+   */
   private updateLifecycleButtons(): void {
-    const canAct = this.started && !this.busy;
-    this.relaunchBtn.disabled = !canAct;
-    this.forceCloseBtn.disabled = !canAct;
+    const s = this.state;
+    this.relaunchBtn.textContent = s === "live" ? "Relaunch" : "Launch";
+    this.relaunchBtn.disabled = !((s === "stopped" && this.currentPlatform) || s === "live");
+    this.forceCloseBtn.disabled = !(s === "booting" || s === "live");
+
+    const liveActions = s === "live";
+    this.tapBtn.disabled = !liveActions;
+    this.shakeBtn.disabled = !liveActions;
+    for (const el of this.buttonEls) el.disabled = !liveActions;
   }
 
-  /** Relaunch: stop the current emulator then boot the same platform. */
+  /**
+   * Morph to a new platform's chrome WITHOUT booting. Used by manual mode (both
+   * startup and model switches): apply the new geometry, leave the emulator
+   * stopped, and show "Launch". Any live VNC is torn down first.
+   */
+  loadChrome(platformId: PlatformId): void {
+    // A new boot generation invalidates any in-flight boot from a prior model.
+    this.bootGen++;
+    this.currentPlatform = platformId;
+    this.disconnectVnc();
+    this.beginSwitch();
+    this.applyGeometry(platformId);
+    this.state = "stopped";
+    this.status.textContent = "Ready";
+    this.status.classList.remove("emu-status--live");
+    this.updateLifecycleButtons();
+  }
+
+  /**
+   * Boot a platform: capture a fresh boot generation, morph to its geometry, and
+   * start the backend. When start() resolves, connect VNC and go `live` ONLY if
+   * this boot's gen is still current — otherwise a force-close (or a newer boot)
+   * superseded us, so bail silently without touching state. Assumes any previous
+   * emulator is already stopped (the caller handles that).
+   */
+  private async boot(platformId: PlatformId): Promise<void> {
+    const info = getPlatform(platformId);
+    const gen = ++this.bootGen;
+
+    this.state = "booting";
+    this.currentPlatform = platformId;
+    this.disconnectVnc();
+    this.beginSwitch();
+    this.applyGeometry(platformId);
+    this.status.textContent = `Booting ${info.label}…`;
+    this.status.classList.remove("emu-status--live");
+    this.updateLifecycleButtons();
+
+    let ep;
+    try {
+      ep = await window.studio.start(platformId);
+    } catch (err) {
+      // start() failed or was aborted. Only react if we're still the current
+      // boot; otherwise a force-close/newer boot owns the state now.
+      if (gen !== this.bootGen) return;
+      this.state = "stopped";
+      this.status.textContent = `Failed to start ${info.label}`;
+      this.status.classList.remove("emu-status--live");
+      console.error("[emu] start failed", err);
+      this.updateLifecycleButtons();
+      return;
+    }
+
+    // Superseded while start() was settling (force-close or another boot) — bail
+    // silently; the owner of the new gen already drives the UI.
+    if (gen !== this.bootGen) return;
+
+    this.state = "live";
+    this.status.textContent = "● Live";
+    this.status.classList.add("emu-status--live");
+    this.vnc = connectVnc(this.screenHost, ep as { host: string; port: number; wsPath: string }, info.touch);
+    this.updateLifecycleButtons();
+
+    // Re-install library apps after boot so a platform switch picks them up.
+    try {
+      await window.studio.libInstallAll();
+    } catch (err) {
+      console.error("[emu] libInstallAll failed", err);
+    }
+  }
+
+  /**
+   * Launch: boot the currently-selected platform. Only valid from `stopped` with
+   * a platform selected; ignored otherwise (spam/re-entrancy guard).
+   */
+  async launch(): Promise<void> {
+    if (this.state !== "stopped" || !this.currentPlatform) return;
+    await this.boot(this.currentPlatform);
+  }
+
+  /** Relaunch: stop the current emulator then boot the same platform. Only when live. */
   async relaunch(): Promise<void> {
-    if (this.busy || !this.started || !this.currentPlatform) return;
+    if (this.state !== "live" || !this.currentPlatform) return;
     const id = this.currentPlatform;
-    this.busy = true;
+    this.state = "stopping";
+    this.disconnectVnc();
+    this.status.textContent = "Stopping…";
+    this.status.classList.remove("emu-status--live");
     this.updateLifecycleButtons();
     try {
-      this.disconnectVnc();
-      this.status.textContent = "Stopping…";
-      this.status.classList.remove("emu-status--live");
-      try {
-        await window.studio.stop();
-      } catch (err) {
-        console.warn("[emu] stop() during relaunch failed (ignored):", err);
-      }
-      await this.bootPlatform(id);
-    } finally {
-      this.busy = false;
-      this.updateLifecycleButtons();
+      await window.studio.stop();
+    } catch (err) {
+      console.warn("[emu] stop() during relaunch failed (ignored):", err);
     }
+    await this.boot(id);
   }
 
-  /** Force-close: stop the emulator and show an idle state. */
+  /**
+   * Force-close: the override. Allowed from booting/live/stopping (no-op when
+   * already stopped). Increments bootGen so any in-flight boot bails when its
+   * start() finally settles, then aborts + stops the backend (ignoring errors)
+   * and returns to a stopped idle state. Works even mid-boot/mid-relaunch — it
+   * is the interrupt that reaps hung processes.
+   */
   async forceClose(): Promise<void> {
-    if (this.busy || !this.started) return;
-    this.busy = true;
+    if (this.state === "stopped") return;
+    this.bootGen++; // invalidate any in-flight boot
+    this.state = "stopping";
+    this.status.textContent = "Stopping…";
+    this.status.classList.remove("emu-status--live");
     this.updateLifecycleButtons();
     try {
-      this.disconnectVnc();
-      this.status.textContent = "Stopping…";
-      this.status.classList.remove("emu-status--live");
-      try {
-        await window.studio.stop();
-      } catch (err) {
-        console.warn("[emu] stop() during force-close failed (ignored):", err);
-      }
-      this.started = false;
-      this.status.textContent = "Stopped";
-      this.screenHost.innerHTML = "";
-    } finally {
-      this.busy = false;
-      this.updateLifecycleButtons();
+      await window.studio.abort();
+    } catch (err) {
+      console.warn("[emu] abort() during force-close failed (ignored):", err);
     }
+    try {
+      await window.studio.stop();
+    } catch (err) {
+      console.warn("[emu] stop() during force-close failed (ignored):", err);
+    }
+    this.disconnectVnc();
+    this.state = "stopped";
+    this.status.textContent = "Stopped";
+    this.status.classList.remove("emu-status--live");
+    this.updateLifecycleButtons();
   }
 
   /** Disconnect VNC without stopping the backend. */
@@ -398,90 +516,42 @@ export class EmulatorView {
     if (this.zoom === "fit") this.applyFitScale();
   }
 
-  async show(platformId: PlatformId): Promise<void> {
-    const info = getPlatform(platformId);
-
-    // A4 — Gate ALL new geometry behind a clean transition so old and new never
-    // co-render. Immediately blank the stage, hide the button overlay, and show a
-    // neutral "Switching…" placeholder. The new frame shape, caption, stage size,
-    // and buttons are deferred to bootPlatform() once the new geometry is known.
-    this.beginSwitch();
-
-    this.status.textContent = `Booting ${info.label}…`;
-    this.status.classList.remove("emu-status--live");
-
-    // D1 — Fully stop the current emulator before switching to a new platform.
-    this.disconnectVnc();
-    if (this.started) {
-      try {
-        await window.studio.stop();
-      } catch (err) {
-        // Nothing was running yet, or stop failed — don't block the boot.
-        console.warn("[emu] stop() before platform switch failed (ignored):", err);
-      }
-    }
-
-    this.currentPlatform = platformId;
-    this.busy = true;
-    this.updateLifecycleButtons();
-
-    try {
-      await this.bootPlatform(platformId);
-    } finally {
-      this.busy = false;
-      this.updateLifecycleButtons();
-    }
-  }
-
-  /** Internal: size the stage and start the emulator. Assumes VNC is already disconnected. */
-  private async bootPlatform(platformId: PlatformId): Promise<void> {
-    const info = getPlatform(platformId);
-
-    this.status.textContent = `Booting ${info.label}…`;
-    this.status.classList.remove("emu-status--live");
-
-    // A4 — apply the new watch's frame shape, caption, stage size, button overlay,
-    // and bezel color as one grouped mutation, then reveal everything together.
-    this.applyGeometry(platformId);
-
-    let ep;
-    try {
-      ep = await window.studio.start(platformId);
-      this.started = true;
-      this.currentPlatform = platformId;
-    } catch (err) {
-      this.status.textContent = `Failed to start ${info.label}`;
-      console.error("[emu] start failed", err);
+  /**
+   * Switch to a platform's chrome. With `opts.boot` (auto mode) stop any current
+   * emulator then boot the new one; without it (manual mode) just morph to the
+   * new chrome idle, leaving "Launch" for the user. This is the single entry
+   * point used by startup and model switches.
+   */
+  async show(platformId: PlatformId, opts: { boot: boolean }): Promise<void> {
+    if (!opts.boot) {
+      this.loadChrome(platformId);
       return;
     }
-
-    this.status.textContent = "● Live";
-    this.status.classList.add("emu-status--live");
-    this.vnc = connectVnc(this.screenHost, ep as { host: string; port: number; wsPath: string }, info.touch);
-
-    // Re-install library apps after boot so a platform switch picks them up.
-    try {
-      await window.studio.libInstallAll();
-    } catch (err) {
-      console.error("[emu] libInstallAll failed", err);
+    // Auto: tear down any current emulator (force-close also invalidates any
+    // in-flight boot via bootGen) before booting the new chrome.
+    if (this.state !== "stopped") {
+      await this.forceClose();
     }
+    await this.boot(platformId);
   }
 
   /**
    * Reconnect VNC to the already-running emulator after a wipe+reboot triggered
-   * externally (e.g. "Clear emulator"). Unlike `show()` / `bootPlatform()`, this
+   * externally (e.g. "Clear emulator"). Unlike `show()` / `boot()`, this
    * does NOT call `start()` (the emulator is already booted) and does NOT call
    * `libInstallAll()` (the whole point of Clear is to leave it empty).
    */
   async reconnectAfterClear(platformId: PlatformId): Promise<void> {
-    if (!this.started || !this.currentPlatform) return;
+    if (this.state !== "live" || !this.currentPlatform) return;
     const info = getPlatform(platformId);
     this.disconnectVnc();
+    this.state = "live";
     this.status.textContent = "● Live";
     this.status.classList.add("emu-status--live");
     // The IPC handler already rebooted — re-use the same VNC endpoint.
     const ep = { host: "localhost", port: 6080, wsPath: "/" };
     this.vnc = connectVnc(this.screenHost, ep, info.touch);
+    this.updateLifecycleButtons();
   }
 
   /**

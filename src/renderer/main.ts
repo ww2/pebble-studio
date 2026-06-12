@@ -12,10 +12,13 @@ interface StudioApi {
   initBackend(): Promise<{ kind: string }>;
   start(id: string): Promise<{ host: string; port: number; wsPath: string }>;
   stop(): Promise<unknown>;
+  abort(): Promise<void>;
   install(pbwPath: string): Promise<unknown>;
   button(id: string): Promise<unknown>;
   accelTap(): Promise<unknown>;
   screenshot(out: string): Promise<unknown>;
+  pickDirectory(): Promise<string | null>;
+  setCaptureDir(dir: string): Promise<void>;
   libAdd(pbwPath: string): Promise<string[]>;
   libList(): Promise<string[]>;
   libRemove(p: string): Promise<string[]>;
@@ -72,15 +75,23 @@ const storedPlatform = localStorage.getItem("pebble-studio:platform");
 const initialPlatform: PlatformId =
   PLATFORMS.some((p) => p.id === storedPlatform) ? (storedPlatform as PlatformId) : "emery";
 
+// Boot mode: "manual" (default) loads a model's chrome idle with a Launch button;
+// "auto" boots on selection. main.ts owns the live value so selectPlatform() and
+// startup both consult it; the Settings toggle updates it via setBootMode().
+type BootMode = "auto" | "manual";
+let bootMode: BootMode =
+  localStorage.getItem("pebble-studio:boot-mode") === "auto" ? "auto" : "manual";
+
 const view = new EmulatorView();
 
 // Persist the active platform and keep both the top combo and the Settings
 // "Startup watch" dropdown in sync, regardless of which control changed it.
+// In manual mode this only morphs to the new chrome; in auto mode it boots.
 function selectPlatform(id: PlatformId): void {
   localStorage.setItem("pebble-studio:platform", id);
   switcher.value = id;        // no-op set when the combo originated the change
   settings.setPlatform(id);   // no-op set when Settings originated the change
-  void view.show(id);
+  void view.show(id, { boot: bootMode === "auto" });
 }
 
 const switcher = new VersionSwitcher((id: PlatformId) => selectPlatform(id), initialPlatform);
@@ -92,7 +103,13 @@ const captureBar = new CaptureBar(
   () => document.querySelector<HTMLElement>("#emu-screen"),
   () => getPlatform(switcher.value as PlatformId).round,
 );
-const settings = new SettingsPane(themeMode, initialPlatform, (id: PlatformId) => selectPlatform(id));
+const settings = new SettingsPane(themeMode, initialPlatform, (id: PlatformId) => selectPlatform(id), {
+  initialBootMode: bootMode,
+  onBootModeChange: (mode: BootMode) => {
+    bootMode = mode;
+    localStorage.setItem("pebble-studio:boot-mode", mode);
+  },
+});
 
 // Command bar: version switcher (Fluent combobox) controls the persistent
 // live preview, so it stays in the top command bar. The theme toggle now lives
@@ -142,11 +159,25 @@ showPane(navRail.value);
 
 async function init(): Promise<void> {
   const kindEl = document.getElementById("backend-kind")!;
+
+  // Sync the persisted capture directory into main once (CaptureBar then saves
+  // through it). Unset = main keeps its Downloads default.
+  const storedCaptureDir = localStorage.getItem("pebble-studio:capture-dir");
+  if (storedCaptureDir) {
+    try {
+      await window.studio.setCaptureDir(storedCaptureDir);
+    } catch (err) {
+      console.warn("[main] setCaptureDir on startup failed (ignored):", err);
+    }
+  }
+
   try {
     const { kind } = await window.studio.initBackend();
     kindEl.textContent = kind;
     await library.refresh();
-    await view.show(switcher.value);
+    // Manual (default): load the chrome idle with a Launch button — do NOT boot.
+    // Auto: boot the resolved startup watch.
+    await view.show(switcher.value, { boot: bootMode === "auto" });
   } catch (err) {
     kindEl.textContent = "error";
     document.getElementById("backend-pill")?.classList.add("backend-pill--error");
