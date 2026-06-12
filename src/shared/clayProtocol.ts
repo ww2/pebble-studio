@@ -87,6 +87,10 @@
 export const PHONESIM_CONFIG_OPCODE = 0x0a;
 
 const SUB_SETUP = 0x01; // client->pypkjs AppConfigSetup
+// SUB_URL intentionally shares 0x01 with SUB_SETUP: same byte value, opposite
+// direction (pypkjs->client AppConfigURL vs client->pypkjs AppConfigSetup) —
+// per the protocol notes in the header above. The direction is determined by
+// which side sends the frame, not by the subcommand byte.
 const SUB_URL = 0x01; // pypkjs->client AppConfigURL
 const SUB_RESPONSE = 0x02; // client->pypkjs AppConfigResponse
 const SUB_CANCELLED = 0x03; // client->pypkjs AppConfigCancelled

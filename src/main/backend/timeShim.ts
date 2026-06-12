@@ -71,17 +71,26 @@ export function chunkB64(b64: string, max = 4000): string[] {
  *   1. mkdir + clear any leftover .b64 accumulator file
  *   2. `echo <chunk> >> file.b64`  for each base64 chunk (no quotes needed —
  *      the base64 alphabet is shell-safe)
- *   3. `base64 -d file.b64 > file && rm file.b64 && chmod +x file`
+ *   3. `base64 -d file.b64 > file && rm file.b64`
+ *      (+ `&& chmod +x file` only when executable=true)
  *
  * One code path works for both native Linux and WSL because we never reference
  * /mnt/c or Windows paths.
+ *
+ * @param name        Filename relative to STUDIO_DIR.
+ * @param bytes       File content to deploy.
+ * @param executable  Whether to `chmod +x` the deployed file (default true).
+ *                    Pass false for plain data files such as the .c source.
  */
-export function deployFileCmds(name: string, bytes: Buffer): string[] {
+export function deployFileCmds(name: string, bytes: Buffer, executable = true): string[] {
   const target = `${STUDIO_DIR}/${name}`;
   const b64 = bytes.toString("base64");
   const cmds: string[] = [`mkdir -p ${STUDIO_DIR} && rm -f ${target}.b64`];
   for (const c of chunkB64(b64)) cmds.push(`echo ${c} >> ${target}.b64`);
-  cmds.push(`base64 -d ${target}.b64 > ${target} && rm -f ${target}.b64 && chmod +x ${target}`);
+  const finalCmd = executable
+    ? `base64 -d ${target}.b64 > ${target} && rm -f ${target}.b64 && chmod +x ${target}`
+    : `base64 -d ${target}.b64 > ${target} && rm -f ${target}.b64`;
+  cmds.push(finalCmd);
   return cmds;
 }
 
@@ -219,11 +228,18 @@ export type ShimRunner = (cmdline: string) => Promise<{ code: number; stdout: st
 /** Tri-state: null = never checked, true/false = cached result. */
 let shimReady: boolean | null = null;
 
+/**
+ * In-flight Promise cache: if a call to ensureTimeShim is already running,
+ * subsequent concurrent callers join it rather than starting a duplicate
+ * deploy sequence. Cleared only by _resetShimState().
+ */
+let shimReadyPromise: Promise<boolean> | null = null;
+
 /** Returns the cached shim readiness (false if never checked). */
 export function isShimReady(): boolean { return shimReady === true; }
 
 /** Reset cached state — used in tests and for future "force-redeploy" UX. */
-export function _resetShimState(): void { shimReady = null; }
+export function _resetShimState(): void { shimReady = null; shimReadyPromise = null; }
 
 // ---------------------------------------------------------------------------
 // ensureTimeShim — idempotent deploy + self-test
@@ -240,21 +256,24 @@ export function _resetShimState(): void { shimReady = null; }
  * @param deps  Injectable overrides for testing: `resources` loader, `now`
  *              clock (returns ms like Date.now())
  */
-export async function ensureTimeShim(
+/**
+ * Inner implementation — called at most once per shimReadyPromise lifetime.
+ * Separating it out keeps the public API clean and allows shimReady to be set
+ * for isShimReady() even when callers share a single Promise.
+ */
+async function runEnsure(
   run: ShimRunner,
   deps: {
     resources?: () => Promise<{ so: Buffer; src: Buffer }>;
     now?: () => number;
-  } = {},
+  },
 ): Promise<boolean> {
-  if (shimReady !== null) return shimReady;
-
   try {
     const { so, src } = await (deps.resources ?? readShimResources)();
 
-    // Deploy binary, source, and wrapper script in sequence.
+    // Deploy binary (executable), source (NOT executable), and wrapper script (executable).
     for (const c of deployFileCmds("timeshim.so", so)) await run(c);
-    for (const c of deployFileCmds("timeshim.c", src)) await run(c);
+    for (const c of deployFileCmds("timeshim.c", src, false)) await run(c);
     for (const c of deployFileCmds("qemu-pebble", Buffer.from(wrapperScript()))) await run(c);
 
     const nowMs = (deps.now ?? (() => Date.now()));
@@ -273,5 +292,17 @@ export async function ensureTimeShim(
     shimReady = false;
   }
 
-  return shimReady;
+  return shimReady!;
+}
+
+export function ensureTimeShim(
+  run: ShimRunner,
+  deps: {
+    resources?: () => Promise<{ so: Buffer; src: Buffer }>;
+    now?: () => number;
+  } = {},
+): Promise<boolean> {
+  if (shimReadyPromise !== null) return shimReadyPromise;
+  shimReadyPromise = runEnsure(run, deps);
+  return shimReadyPromise;
 }

@@ -22,6 +22,24 @@ describe("timeShim command builders", () => {
     expect(cmds[cmds.length - 1]).toContain("base64 -d");
   });
 
+  it("deployFileCmds(executable=true) includes chmod +x in the final command", () => {
+    const cmds = deployFileCmds("timeshim.so", Buffer.from("bytes"), true);
+    const last = cmds[cmds.length - 1];
+    expect(last).toContain("chmod +x");
+  });
+
+  it("deployFileCmds(executable=false) omits chmod from the final command", () => {
+    const cmds = deployFileCmds("timeshim.c", Buffer.from("bytes"), false);
+    const last = cmds[cmds.length - 1];
+    expect(last).toContain("base64 -d");
+    expect(last).not.toContain("chmod");
+  });
+
+  it("deployFileCmds defaults to executable=true (backward compat)", () => {
+    const cmds = deployFileCmds("timeshim.so", Buffer.from("bytes"));
+    expect(cmds[cmds.length - 1]).toContain("chmod +x");
+  });
+
   it("wrapper script execs the current-symlink qemu and exports the control file", () => {
     const w = wrapperScript();
     expect(w).toContain("SDKs/current/toolchain/bin/qemu-pebble");
@@ -46,6 +64,14 @@ describe("timeShim command builders", () => {
     expect(parseSelfTest(String(now + 86400), now)).toBe(true);
     expect(parseSelfTest(String(now), now)).toBe(false);
     expect(parseSelfTest("garbage", now)).toBe(false);
+  });
+
+  it("parseSelfTest boundary: +120s from expected → true; +121s → false; -121s → false", () => {
+    const now = 1_700_000_000;
+    const expected = now + 86400;
+    expect(parseSelfTest(String(expected + 120), now)).toBe(true);
+    expect(parseSelfTest(String(expected + 121), now)).toBe(false);
+    expect(parseSelfTest(String(expected - 121), now)).toBe(false);
   });
 });
 
@@ -174,6 +200,39 @@ describe("ensureTimeShim", () => {
     expect(isShimReady()).toBe(false);
     // No deploy commands should have been issued
     expect(calls.length).toBe(0);
+  });
+
+  it("concurrent calls: deploy commands issued exactly once; both resolve to same value", async () => {
+    const now = fakeNow() / 1000;
+    const selfTestOutput = String(now + 86400);
+    // The runner records every call; all commands succeed. Self-test returns valid output.
+    const calls: string[] = [];
+    const run = async (cmd: string) => {
+      calls.push(cmd);
+      if (cmd.includes("date +%s")) {
+        return { code: 0, stdout: selfTestOutput, stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    // Fire both concurrently without awaiting the first — they must share one Promise.
+    const [r1, r2] = await Promise.all([
+      ensureTimeShim(run, { resources: fakeResources, now: () => fakeNow() }),
+      ensureTimeShim(run, { resources: fakeResources, now: () => fakeNow() }),
+    ]);
+    expect(r1).toBe(true);
+    expect(r2).toBe(true);
+    // Exactly one self-test command should appear in the call log.
+    const selfTestCalls = calls.filter(c => c.includes("date +%s"));
+    expect(selfTestCalls.length).toBe(1);
+    // .c file deploy must NOT contain chmod
+    const cFileCmds = calls.filter(c => c.includes("timeshim.c"));
+    for (const c of cFileCmds) expect(c).not.toContain("chmod");
+    // .so file deploy must contain chmod
+    const soDeployCmds = calls.filter(
+      c => c.includes("timeshim.so") && c.includes("base64 -d"),
+    );
+    expect(soDeployCmds.length).toBeGreaterThan(0);
+    for (const c of soDeployCmds) expect(c).toContain("chmod +x");
   });
 
   it("second call returns cached result without re-running the runner", async () => {
