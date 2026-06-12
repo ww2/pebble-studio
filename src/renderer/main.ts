@@ -33,6 +33,8 @@ interface StudioApi {
   nextCaptureName(base: string, ext: string): Promise<string>;
   backlightAlways(on: boolean): Promise<void>;
   backlightCaptureHold(on: boolean): Promise<void>;
+  backlightMethod(m: string): Promise<void>;
+  backlightPulse(): Promise<void>;
 }
 
 declare global {

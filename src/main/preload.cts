@@ -28,6 +28,9 @@ const studio = {
     ipcRenderer.invoke("emu:backlightAlways", on),
   backlightCaptureHold: (on: boolean): Promise<void> =>
     ipcRenderer.invoke("emu:backlightCaptureHold", on),
+  backlightMethod: (m: string): Promise<void> =>
+    ipcRenderer.invoke("emu:backlightMethod", m),
+  backlightPulse: (): Promise<void> => ipcRenderer.invoke("emu:backlightPulse"),
   // Time control (Task 5).
   getTimeConfig: () => ipcRenderer.invoke("time:get"),
   setTimeConfig: (cfg: unknown) => ipcRenderer.invoke("time:set", cfg),

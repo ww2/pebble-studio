@@ -89,7 +89,7 @@ export function registerIpc(): void {
   // Backlight keepalive (Task K). It reads the qemu monitor port through the
   // Shell matching the active driver kind (recorded at backend:init), so it works
   // on a Windows+WSL host too.
-  const backlight = createBacklightController(() => driverKind);
+  const backlight = createBacklightController(() => driverKind, () => driver!.accelTap());
 
   // Time controller (Task 5). Uses a getter so it always references the current driver.
   const time = makeTimeController(() => driver);
@@ -164,6 +164,9 @@ export function registerIpc(): void {
   // either is set and stops when both clear (or on emu:stop above).
   ipcMain.handle("emu:backlightAlways", async (_e, on: boolean) => { backlight.setAlways(on); });
   ipcMain.handle("emu:backlightCaptureHold", async (_e, on: boolean) => { backlight.setCaptureHold(on); });
+  // Selectable keepalive method (back | motion | off) + a manual one-shot pulse.
+  ipcMain.handle("emu:backlightMethod", async (_e, m: "back" | "motion" | "off") => { backlight.setMethod(m); });
+  ipcMain.handle("emu:backlightPulse", async () => { backlight.pulseOnce(); });
 
   // Time control (Task 5): get/set persisted time config and re-apply on boot.
   ipcMain.handle("time:get", async () => time.getConfig());
