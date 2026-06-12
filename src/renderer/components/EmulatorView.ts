@@ -49,6 +49,8 @@ export class EmulatorView {
   private readonly forceCloseBtn: HTMLButtonElement;
   private readonly tapBtn: HTMLButtonElement;
   private readonly shakeBtn: HTMLButtonElement;
+  private readonly timelineBtn: HTMLButtonElement;
+  private timelinePeek = false;
   private readonly zoomSelect: HTMLSelectElement;
   private readonly frameWrapper: HTMLElement;
   private readonly frame: HTMLElement;
@@ -131,6 +133,7 @@ export class EmulatorView {
       <div class="emu-actions">
         <button class="emu-action emu-action--subtle" id="emu-tap" type="button">Tap</button>
         <button class="emu-action emu-action--subtle" id="emu-shake" type="button">Shake</button>
+        <button class="emu-action emu-action--subtle" id="emu-timeline" type="button" title="Toggle timeline quick view (peek)">Timeline</button>
         <div class="emu-actions-sep" aria-hidden="true"></div>
         <button class="emu-action emu-action--subtle" id="emu-relaunch" type="button" title="Stop and reboot the current platform">Relaunch</button>
         <button class="emu-action emu-action--subtle emu-action--danger" id="emu-force-close" type="button" title="Force-close the emulator">Force-close</button>
@@ -188,6 +191,7 @@ export class EmulatorView {
     const shakeBtn = this.el.querySelector<HTMLButtonElement>("#emu-shake")!;
     this.tapBtn = tapBtn;
     this.shakeBtn = shakeBtn;
+    this.timelineBtn = this.el.querySelector<HTMLButtonElement>("#emu-timeline")!;
     tapBtn.addEventListener("click", () => {
       if (this.state !== "live") return;
       void window.studio.accelTap();
@@ -196,6 +200,12 @@ export class EmulatorView {
       if (this.state !== "live") return;
       void window.studio.accelTap();
       setTimeout(() => void window.studio.accelTap(), 120);
+    });
+    this.timelineBtn.addEventListener("click", () => {
+      if (this.state !== "live") return;
+      this.timelinePeek = !this.timelinePeek;
+      this.timelineBtn.classList.toggle("emu-action--on", this.timelinePeek);
+      void window.studio.timelineQuickView(this.timelinePeek).catch(() => {});
     });
 
     // Lifecycle buttons. The single Launch/Relaunch button routes to relaunch()
@@ -441,6 +451,7 @@ export class EmulatorView {
     const liveActions = s === "live";
     this.tapBtn.disabled = !liveActions;
     this.shakeBtn.disabled = !liveActions;
+    this.timelineBtn.disabled = !liveActions;
     for (const el of this.buttonEls) el.disabled = !liveActions;
 
     // J-runtime: the FPS sampler only runs while diagnostics on AND live.
@@ -450,6 +461,12 @@ export class EmulatorView {
   /** E: remove the launch-failure highlight ring from the Launch button. */
   private clearLaunchAttn(): void {
     this.relaunchBtn.classList.remove("emu-action--attn");
+  }
+
+  /** Reset the timeline quick-view toggle to off (called on any teardown from live). */
+  private resetTimelinePeek(): void {
+    this.timelinePeek = false;
+    this.timelineBtn.classList.remove("emu-action--on");
   }
 
   /**
@@ -674,6 +691,7 @@ export class EmulatorView {
   async relaunch(): Promise<void> {
     if (this.state !== "live" || !this.currentPlatform) return;
     const id = this.currentPlatform;
+    this.resetTimelinePeek();
     this.state = "stopping";
     this.disconnectVnc();
     this.status.textContent = "Stopping…";
@@ -696,6 +714,7 @@ export class EmulatorView {
    */
   async forceClose(): Promise<void> {
     if (this.state === "stopped") return;
+    this.resetTimelinePeek();
     this.bootGen++; // invalidate any in-flight boot
     this.state = "stopping";
     this.status.textContent = "Stopping…";
