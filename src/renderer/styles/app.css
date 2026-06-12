@@ -1138,6 +1138,24 @@ body {
   transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
 .lib-remove:hover { color: var(--danger); background: var(--danger-soft); }
+/* Per-app Clay config gear — same neutral icon-button pattern as .lib-remove. */
+.lib-gear {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.lib-gear:hover:not(:disabled) { color: var(--accent); background: var(--control-hover); }
+.lib-gear:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
 
 /* Loaded-state header row */
 .lib-header {

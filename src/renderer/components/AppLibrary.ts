@@ -1,3 +1,5 @@
+import { fetchConfigUrl, sendConfigResult, NoConfigPageError } from "../clayClient.js";
+
 /** Extract the filename from an absolute path (works on both / and \ separators). */
 function basename(p: string): string {
   return p.split(/[\\/]/).pop() ?? p;
@@ -12,6 +14,10 @@ function basename(p: string): string {
  * E2: A "Clear emulator" button wipes all apps from the running emulator
  *     (calls loaded:clear), then refreshes. The persisted library is NOT
  *     affected. The button is disabled while no apps are loaded.
+ *
+ * B3: A per-row gear opens the app's Clay config page (phonesim AppConfig
+ *     round-trip) — enabled only while the emulator is live and no other
+ *     config round-trip is in flight.
  */
 export class AppLibrary {
   readonly el: HTMLElement;
@@ -32,6 +38,9 @@ export class AppLibrary {
    * install` against a dead emulator — that would error or boot a stray non-VNC
    * qemu. Queued apps install on the next Launch via libInstallAll. */
   private readonly isLive: (() => boolean) | undefined;
+  /** True while a Clay config round-trip is running — all gears disabled
+   * (prevents a second Setup overwriting pypkjs' pending config_callback). */
+  private clayInFlight = false;
 
   constructor(
     getPlatformId: () => string,
@@ -191,6 +200,56 @@ export class AppLibrary {
     await this.refresh();
   }
 
+  /** Same liveness signal the install path uses (absent injection = live,
+   * mirroring installPath's `this.isLive && !this.isLive()` queue check). */
+  private live(): boolean {
+    return this.isLive ? this.isLive() : true;
+  }
+
+  /** Re-apply the disabled state to every gear without a full refresh —
+   * used to lock the gears while a config round-trip is in flight. */
+  private updateGearButtons(): void {
+    const disabled = this.clayInFlight || !this.live();
+    for (const btn of this.list.querySelectorAll<HTMLButtonElement>(".lib-gear")) {
+      btn.disabled = disabled;
+    }
+  }
+
+  /**
+   * Clay config round-trip: ask pypkjs for the foreground app's config URL,
+   * open it in a window (main process), send the result back. A cancelled
+   * window resolves with "" and still sends the cancel frame — not an error.
+   */
+  private async handleClayConfig(pbwPath: string): Promise<void> {
+    if (this.clayInFlight) return; // double-click guard
+    this.clayInFlight = true;
+    this.updateGearButtons();
+    this.errorMsg.classList.remove("lib-error--info");
+    this.errorMsg.textContent = "";
+    try {
+      const port = await window.studio.clayPhonesimPort();
+      if (port == null) throw new Error("emulator not running");
+      const url = await fetchConfigUrl(port);
+      // RAW still-percent-encoded fragment ("" = cancelled) — passed back
+      // undecoded; the app's JS decodes it itself.
+      const rawFragment = await window.studio.clayOpenWindow(url);
+      await sendConfigResult(port, rawFragment);
+    } catch (err) {
+      console.error("[lib] clay config failed", pbwPath, err);
+      this.errorMsg.classList.remove("lib-error--info");
+      if (err instanceof NoConfigPageError) {
+        this.errorMsg.textContent =
+          "No config page (app may not support Clay — make sure it's running)";
+      } else {
+        const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
+        this.errorMsg.textContent = reason || "App config failed";
+      }
+    } finally {
+      this.clayInFlight = false;
+      this.updateGearButtons();
+    }
+  }
+
   async refresh(): Promise<void> {
     const [entries, loadedPaths] = await Promise.all([
       window.studio.libList(),
@@ -222,6 +281,17 @@ export class AppLibrary {
       } else {
         li.appendChild(name);
       }
+
+      // Per-app config (Clay). The bridge configures whichever app is in the
+      // foreground on the watch, so the gear only makes sense while live.
+      const gearBtn = document.createElement("button");
+      gearBtn.className = "lib-gear";
+      gearBtn.type = "button";
+      gearBtn.textContent = "⚙";
+      gearBtn.title = "App settings (Clay) — the app must be running on the watch";
+      gearBtn.disabled = this.clayInFlight || !this.live();
+      gearBtn.addEventListener("click", () => void this.handleClayConfig(p));
+      li.appendChild(gearBtn);
 
       const removeBtn = document.createElement("button");
       removeBtn.className = "lib-remove";

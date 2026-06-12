@@ -44,6 +44,10 @@ interface StudioApi {
   setBackgroundThrottling(throttle: boolean): Promise<void>;
   // v0.0.8: timeline quick-view (Task 1).
   timelineQuickView(on: boolean): Promise<void>;
+  // v0.0.13: Clay / per-app config (Task B). clayOpenWindow resolves with the
+  // RAW still-percent-encoded close fragment ("" = cancelled).
+  clayPhonesimPort(): Promise<number | null>;
+  clayOpenWindow(url: string): Promise<string>;
 }
 
 declare global {
