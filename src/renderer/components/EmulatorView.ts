@@ -2,6 +2,22 @@ import type { PlatformId, ButtonId } from "../../shared/types.js";
 import { getChrome } from "../chrome/chromeRegistry.js";
 import { getPlatform } from "../../main/backend/emulatorRegistry.js"; // pure module, bundled by Vite
 import { connectVnc, type VncHandle } from "../vncClient.js";
+import { loadBindings, resolveAction, type Bindings } from "../keybindings.js";
+
+const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
+
+/**
+ * The renderer's StudioApi (declared in main.ts, owned by Wave 2b) doesn't yet
+ * list the v0.0.6 boot-progress channel that the preload exposes. Until Wave 2b
+ * extends that interface, narrow `window.studio` to the extra method at the call
+ * site via this typed accessor — no change to main.ts required.
+ */
+interface BootProgressApi {
+  onBootProgress(cb: (msg: string) => void): () => void;
+}
+function studioBootProgress(): BootProgressApi {
+  return window.studio as unknown as BootProgressApi;
+}
 
 type ZoomLevel = "1" | "1.5" | "2" | "3" | "fit";
 const ZOOM_KEY = "pebble-studio:emu-zoom";
@@ -42,6 +58,8 @@ export class EmulatorView {
   private zoom: ZoomLevel = "1";
   /** Observer used only while zoom === "fit"; disconnected otherwise. */
   private fitObserver: ResizeObserver | null = null;
+  /** The element the fit observer is currently watching (column once attached). */
+  private fitObserverTarget: Element | null = null;
   /** Selected screen-bezel color (B5); persisted, applied to round models. */
   private bezelColor: BezelColor = "black";
   /** True while the current platform is round (gates the bezel toggle + bezel color). */
@@ -63,6 +81,35 @@ export class EmulatorView {
    * promise may still be settling.
    */
   private bootGen = 0;
+
+  /** Current keyboard bindings (I-runtime); re-read on the change event. */
+  private bindings: Bindings = loadBindings();
+  /** Bound keydown handler so it can be added/removed against `window`. */
+  private readonly onKeyDown = (e: KeyboardEvent): void => this.handleKeyDown(e);
+  /** Listeners re-reading bindings / diagnostics flag on Settings changes. */
+  private readonly onBindingsChanged = (): void => { this.bindings = loadBindings(); };
+  private readonly onDiagnosticsChanged = (): void => {
+    this.setDiagnostics(localStorage.getItem(DIAGNOSTICS_KEY) === "on");
+  };
+
+  /** Diagnostics overlay (J-runtime): created lazily, surfaces FPS + boot notes. */
+  private diagnostics = false;
+  private readonly diagLine: HTMLElement;
+  /** Disposer for the boot-progress subscription (active for diagnostics). */
+  private bootProgressDispose: (() => void) | null = null;
+  /** Latest boot-progress note (shown in the diag line when diagnostics on). */
+  private lastBootNote = "";
+  /** rAF id for the FPS sampler; non-null only while diagnostics on + live. */
+  private fpsRaf: number | null = null;
+  /** Most recent measured fps (changed-frames-per-second). */
+  private fps = 0;
+  /** Per-second accumulator: changed-frame count + window-start timestamp. */
+  private fpsChanged = 0;
+  private fpsWindowStart = 0;
+  /** Previous sampled-region signature, to detect canvas changes between frames. */
+  private fpsPrevSig = -1;
+  /** Tiny offscreen 2D context used to read a sample region of the noVNC canvas. */
+  private fpsSampleCtx: CanvasRenderingContext2D | null = null;
 
   constructor() {
     this.el = document.createElement("div");
@@ -103,6 +150,7 @@ export class EmulatorView {
         </div>
         <span class="emu-status" id="emu-status"></span>
       </div>
+      <div class="emu-diag" id="emu-diag" hidden></div>
     `;
 
     this.screenHost = this.el.querySelector<HTMLElement>("#emu-screen")!;
@@ -118,6 +166,7 @@ export class EmulatorView {
     this.stage = this.el.querySelector<HTMLElement>("#emu-stage")!;
     this.switchOverlay = this.el.querySelector<HTMLElement>("#emu-switch-overlay")!;
     this.bezelToggle = this.el.querySelector<HTMLElement>("#emu-bezel-toggle")!;
+    this.diagLine = this.el.querySelector<HTMLElement>("#emu-diag")!;
 
     // Create the four physical button nubs ONCE. They persist across model
     // switches; applyGeometry only toggles the square/round classes so CSS can
@@ -174,8 +223,52 @@ export class EmulatorView {
     const savedZoom = this.normalizeZoom(localStorage.getItem(ZOOM_KEY));
     this.applyZoom(savedZoom);
 
+    // I-runtime: keyboard shortcuts (only fire when live). Bound to window so a
+    // press anywhere drives the emulator; re-read bindings on the change event.
+    window.addEventListener("keydown", this.onKeyDown);
+    window.addEventListener("pebble-studio:keybindings-changed", this.onBindingsChanged);
+
+    // J-runtime: diagnostics overlay. Restore the persisted flag; re-read on the
+    // change event so the Settings toggle (Wave 2b) reflects live.
+    window.addEventListener("pebble-studio:diagnostics-changed", this.onDiagnosticsChanged);
+    this.setDiagnostics(localStorage.getItem(DIAGNOSTICS_KEY) === "on");
+
     // Start disabled until something is running
     this.updateLifecycleButtons();
+  }
+
+  /**
+   * I-runtime: map a key press to an emulator action and fire it — only when the
+   * emulator is `live`. Ignores keys typed into form controls/contentEditable and
+   * any chord with a modifier (ctrl/alt/meta) so app shortcuts aren't hijacked.
+   */
+  private handleKeyDown(e: KeyboardEvent): void {
+    if (this.state !== "live") return;
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
+    const t = e.target as HTMLElement | null;
+    if (t) {
+      const tag = t.tagName;
+      if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || t.isContentEditable) return;
+    }
+    const action = resolveAction(e.key, this.bindings);
+    if (!action) return;
+    e.preventDefault();
+    switch (action) {
+      case "back":
+      case "up":
+      case "select":
+      case "down":
+        void window.studio.button(action);
+        break;
+      case "tap":
+        void window.studio.accelTap();
+        break;
+      case "shake":
+        // Mirror the Shake button: a double-tap.
+        void window.studio.accelTap();
+        setTimeout(() => void window.studio.accelTap(), 120);
+        break;
+    }
   }
 
   /** Coerce a stored zoom string to a valid ZoomLevel, defaulting to "1". */
@@ -213,31 +306,57 @@ export class EmulatorView {
   }
 
   /**
-   * C3 (v0.0.5 — real fit): scale the watch to fill the stage column. The old
-   * version measured `frameWrapper.clientWidth`, but the wrapper shrinks to the
-   * frame (avail ≈ natural → scale ≈ 1, no effect). Instead we measure the PANEL
-   * (`this.el`) and subtract the non-stage rows (caption + actions + zoom) plus
-   * the wrapper's vertical margins to get the height available for the watch,
-   * then take the min of width/height fit so it stays fully visible.
+   * A (v0.0.6 — Fit actually adapts to window size): scale the watch to fill the
+   * available STAGE COLUMN, not the panel. The panel (`this.el`) is centered in
+   * `.stage-col` with `place-items:center`, so it shrinks to its content — a
+   * panel-relative measurement gives avail ≈ natural → scale stuck ≈ 1.5. Instead
+   * we measure the panel's PARENT (`.stage-col`, the real available box), then:
+   *   availW = stage-col width  − panel horizontal padding
+   *   availH = stage-col height − (non-frame rows: caption + actions + zoom +
+   *            diag) − panel vertical padding − the inter-row gaps
+   * and fit the NATURAL (unscaled) frame into that box. This grows the watch in a
+   * large window and shrinks it (keeping the rows on-screen) in a small one. The
+   * row heights are included in the budget so the zoom row is never cut off.
    */
   private applyFitScale(): void {
-    const availW = this.el.clientWidth;
-    if (availW <= 0) return; // panel not laid out yet — observer will retry
-
-    // Available height = panel height minus every sibling row of the wrapper and
-    // the wrapper's own vertical margins. Summing actual row heights keeps this
-    // correct regardless of how the rows wrap.
-    let usedH = 0;
-    for (const child of Array.from(this.el.children) as HTMLElement[]) {
-      if (child === this.frameWrapper) continue;
-      usedH += child.offsetHeight;
-      const cs = getComputedStyle(child);
-      usedH += parseFloat(cs.marginTop) + parseFloat(cs.marginBottom);
+    const col = this.el.parentElement; // .stage-col (place-items:center container)
+    if (!col) return;
+    // If the observer was created before the panel was attached, it may be
+    // watching the panel as a fallback — retarget it to the column now.
+    if (this.fitObserver && this.fitObserverTarget !== col) {
+      this.fitObserver.disconnect();
+      this.fitObserver.observe(col);
+      this.fitObserverTarget = col;
     }
-    const wrapCs = getComputedStyle(this.frameWrapper);
-    usedH += parseFloat(wrapCs.marginTop) + parseFloat(wrapCs.marginBottom);
-    const availH = this.el.clientHeight - usedH;
-    if (availH <= 0) return;
+    const colW = col.clientWidth;
+    const colH = col.clientHeight;
+    if (colW <= 0 || colH <= 0) return; // not laid out yet — observer will retry
+
+    // Subtract the panel's own padding (horizontal from width, vertical from
+    // height) so the watch + its rows fit inside the panel box.
+    const panelCs = getComputedStyle(this.el);
+    const padX = parseFloat(panelCs.paddingLeft) + parseFloat(panelCs.paddingRight);
+    const padY = parseFloat(panelCs.paddingTop) + parseFloat(panelCs.paddingBottom);
+    const gap = parseFloat(panelCs.rowGap || panelCs.gap) || 0;
+
+    // Height needed by every non-frame row (caption, actions, zoom, diag) plus
+    // the flex gaps between all rows — reserve it so those rows stay visible.
+    let rowsH = 0;
+    const children = Array.from(this.el.children) as HTMLElement[];
+    for (const child of children) {
+      if (child === this.frameWrapper) continue;
+      if (child.offsetParent === null && child.hidden) continue; // skip hidden rows
+      rowsH += child.offsetHeight;
+    }
+    // One gap between each adjacent pair of (visible) children.
+    const visibleCount = children.filter(
+      (c) => !(c.offsetParent === null && c.hidden),
+    ).length;
+    const gapsH = gap * Math.max(0, visibleCount - 1);
+
+    const availW = colW - padX;
+    const availH = colH - padY - rowsH - gapsH;
+    if (availW <= 0 || availH <= 0) return;
 
     // Natural (unscaled) frame size: clear the transform so offset* reflects the
     // true size regardless of the previous scale.
@@ -248,7 +367,7 @@ export class EmulatorView {
     this.frame.style.transform = prev;
     if (naturalW <= 0 || naturalH <= 0) return; // not measurable yet
 
-    const scale = Math.max(0.25, Math.min(availW / naturalW, availH / naturalH, 4));
+    const scale = Math.max(0.25, Math.min(availW / naturalW, availH / naturalH, 6));
     this.setScale(scale);
   }
 
@@ -258,8 +377,12 @@ export class EmulatorView {
     this.fitObserver = new ResizeObserver(() => {
       if (this.zoom === "fit") this.applyFitScale();
     });
-    // Observe the PANEL (not the inner wrapper) so it re-fits on window resize.
-    this.fitObserver.observe(this.el);
+    // Observe the STAGE COLUMN (the panel's parent), not the inner wrapper or the
+    // panel itself — that's the box that grows/shrinks with the window, so Fit
+    // re-fits live after the window is resized.
+    const target = this.el.parentElement ?? this.el;
+    this.fitObserver.observe(target);
+    this.fitObserverTarget = target;
   }
 
   /** Disconnect/ignore the fit observer when a non-fit zoom is selected. */
@@ -267,6 +390,7 @@ export class EmulatorView {
     if (this.fitObserver) {
       this.fitObserver.disconnect();
       this.fitObserver = null;
+      this.fitObserverTarget = null;
     }
   }
 
@@ -305,6 +429,126 @@ export class EmulatorView {
     this.tapBtn.disabled = !liveActions;
     this.shakeBtn.disabled = !liveActions;
     for (const el of this.buttonEls) el.disabled = !liveActions;
+
+    // J-runtime: the FPS sampler only runs while diagnostics on AND live.
+    this.syncFpsSampler();
+  }
+
+  /** E: remove the launch-failure highlight ring from the Launch button. */
+  private clearLaunchAttn(): void {
+    this.relaunchBtn.classList.remove("emu-action--attn");
+  }
+
+  /**
+   * J-runtime: toggle the diagnostics overlay (FPS + boot notes). Public so
+   * main.ts/Settings can flip it live; also driven by the
+   * `pebble-studio:diagnostics-changed` window event. When off, the overlay is
+   * hidden, the rAF FPS sampler is stopped (zero overhead), and boot-progress
+   * notes are dropped.
+   */
+  setDiagnostics(on: boolean): void {
+    this.diagnostics = on;
+    this.diagLine.hidden = !on;
+    if (on) {
+      // Subscribe to boot-progress notes only while diagnostics is on.
+      if (!this.bootProgressDispose) {
+        this.bootProgressDispose = studioBootProgress().onBootProgress((msg) => {
+          this.lastBootNote = msg;
+          if (this.diagnostics) this.renderDiagLine();
+        });
+      }
+      this.renderDiagLine();
+    } else {
+      if (this.bootProgressDispose) {
+        this.bootProgressDispose();
+        this.bootProgressDispose = null;
+      }
+      this.lastBootNote = "";
+    }
+    this.syncFpsSampler();
+  }
+
+  /** Compose the diagnostics line from the current fps + latest boot note. */
+  private renderDiagLine(): void {
+    if (!this.diagnostics) return;
+    const parts: string[] = [`~${this.fps} fps`];
+    if (this.lastBootNote) parts.push(this.lastBootNote);
+    this.diagLine.textContent = parts.join("  ·  ");
+  }
+
+  /**
+   * J-runtime: start/stop the rAF FPS sampler so it runs ONLY while diagnostics
+   * is on and the emulator is live (no overhead otherwise). Each frame we read a
+   * small region of the noVNC canvas, hash it, and compare to the previous frame;
+   * the count of CHANGED frames over a 1s window is the "~fps" (QEMU VNC only
+   * pushes on change, so this is a best-effort liveness rate, not vsync).
+   */
+  private syncFpsSampler(): void {
+    const shouldRun = this.diagnostics && this.state === "live";
+    if (shouldRun && this.fpsRaf === null) {
+      this.fpsChanged = 0;
+      this.fpsWindowStart = performance.now();
+      this.fpsPrevSig = -1;
+      this.fpsRaf = requestAnimationFrame(this.sampleFps);
+    } else if (!shouldRun && this.fpsRaf !== null) {
+      cancelAnimationFrame(this.fpsRaf);
+      this.fpsRaf = null;
+      this.fps = 0;
+    }
+  }
+
+  /** One rAF tick of the FPS sampler (bound; re-schedules itself while running). */
+  private readonly sampleFps = (now: number): void => {
+    if (!this.diagnostics || this.state !== "live") {
+      this.fpsRaf = null;
+      return;
+    }
+    const sig = this.sampleCanvasSignature();
+    if (sig !== null && sig !== this.fpsPrevSig) {
+      this.fpsChanged++;
+      this.fpsPrevSig = sig;
+    }
+    if (now - this.fpsWindowStart >= 1000) {
+      this.fps = this.fpsChanged;
+      this.fpsChanged = 0;
+      this.fpsWindowStart = now;
+      this.renderDiagLine();
+    }
+    this.fpsRaf = requestAnimationFrame(this.sampleFps);
+  };
+
+  /**
+   * Read a small region of the noVNC canvas and reduce it to a cheap integer
+   * signature for frame-change detection. Returns null if no canvas is present
+   * yet. Uses a tiny reusable offscreen 2D context (drawImage-downscale) so it's
+   * a fixed, small per-frame cost regardless of screen size.
+   */
+  private sampleCanvasSignature(): number | null {
+    const canvas = this.screenHost.querySelector("canvas");
+    if (!canvas || canvas.width === 0 || canvas.height === 0) return null;
+    const N = 8; // sample into an 8×8 thumbnail
+    if (!this.fpsSampleCtx) {
+      const off = document.createElement("canvas");
+      off.width = N;
+      off.height = N;
+      this.fpsSampleCtx = off.getContext("2d", { willReadFrequently: true });
+    }
+    const ctx = this.fpsSampleCtx;
+    if (!ctx) return null;
+    try {
+      ctx.drawImage(canvas, 0, 0, N, N);
+      const data = ctx.getImageData(0, 0, N, N).data;
+      // FNV-1a-ish hash over the downscaled pixels.
+      let h = 0x811c9dc5;
+      for (let i = 0; i < data.length; i += 4) {
+        h ^= data[i] + (data[i + 1] << 3) + (data[i + 2] << 6);
+        h = Math.imul(h, 0x01000193);
+      }
+      return h | 0;
+    } catch {
+      // Cross-origin/tainted canvas (shouldn't happen for noVNC) → bail.
+      return null;
+    }
   }
 
   /**
@@ -338,6 +582,7 @@ export class EmulatorView {
 
     this.state = "booting";
     this.currentPlatform = platformId;
+    this.clearLaunchAttn(); // E: a new attempt clears any prior failure highlight
     this.disconnectVnc();
     this.beginSwitch();
     this.applyGeometry(platformId);
@@ -355,6 +600,8 @@ export class EmulatorView {
       this.state = "stopped";
       this.status.textContent = `Failed to start ${info.label}`;
       this.status.classList.remove("emu-status--live");
+      // E: draw the eye to the Launch button with an accent/danger glow ring.
+      this.relaunchBtn.classList.add("emu-action--attn");
       console.error("[emu] start failed", err);
       this.updateLifecycleButtons();
       return;
@@ -365,6 +612,7 @@ export class EmulatorView {
     if (gen !== this.bootGen) return;
 
     this.state = "live";
+    this.clearLaunchAttn(); // E: success clears the failure highlight
     this.status.textContent = "● Live";
     this.status.classList.add("emu-status--live");
     this.vnc = connectVnc(this.screenHost, ep as { host: string; port: number; wsPath: string }, info.touch);
@@ -504,16 +752,76 @@ export class EmulatorView {
     // rather than being rebuilt. (renderButtons is not called per-switch anymore.)
     this.buttonsOverlay.classList.toggle("emu-buttons--round", info.round);
 
-    // B5: bezel-color toggle is only meaningful for round models; re-apply the
-    // persisted color when switching to a round watch, hide the control otherwise.
+    // C (v0.0.6): place round Up/Down ON the case circle with their LONG (tall)
+    // edge TANGENT to the rim. The CSS .emu-buttons--round rules put them in the
+    // empty corner outside the case; we override with a JS-computed inline
+    // transform here (and CLEAR it for square so the CSS classes take over).
+    this.applyRoundUpDownPlacement(info.round, chrome.bodyWidth);
+
+    // B (v0.0.6): square models are black-only. Force the SCREEN bezel to black
+    // regardless of the persisted (round-scoped) preference so a white bezel from
+    // a round watch doesn't leak onto a square one. For round, apply the persisted
+    // color. The white preference stays round-scoped and is restored on return.
     this.bezelToggle.hidden = !info.round;
-    if (info.round) this.applyScreenBezelColor(this.bezelColor);
+    if (info.round) {
+      this.applyScreenBezelColor(this.bezelColor);
+    } else {
+      this.stage.style.setProperty("--screen-bezel-color", BEZEL_COLORS.black);
+    }
 
     // Reveal new frame + buttons + screen together.
     this.frame.classList.remove("emu-frame--switching");
 
     // C3: the natural frame size just changed; re-fit if Fit is the active zoom.
     if (this.zoom === "fit") this.applyFitScale();
+  }
+
+  /**
+   * C (v0.0.6): position the round Up/Down nubs ON the outer case circle so each
+   * sits with its LONG (tall) edge TANGENT to the rim — riding the arc like the
+   * Back/Select nubs do at 9- and 3-o'clock.
+   *
+   * Circle-placement pattern: the overlay (`.emu-buttons`) is `inset:0` over the
+   * frame, so its center is the watch center. We center the nub there and push it
+   * out along a rotated radius:
+   *   left:50%; top:50%; transform: translate(-50%,-50%) rotate(θ) translateX(R)
+   * At θ=0 a tall rectangle is tangent at 3-o'clock (exactly like Select);
+   * rotating by θ rides it around the arc keeping the long edge tangent.
+   *
+   *   R ≈ bodyWidth/2 + framePad(18 for round) + ~2px   (the outer rim radius)
+   *   θ = -38° for Up (up the right arc), +38° for Down (negative = upward).
+   *
+   * R is derived from the REAL chrome.bodyWidth so chalk (208) AND gabbro (288)
+   * both land on their own rim. For square we clear the inline transform so the
+   * CSS .emu-hit--up/--down rules take over. θ/R eye-tuned against screenshots.
+   */
+  private applyRoundUpDownPlacement(round: boolean, bodyWidth: number): void {
+    const up = this.buttonEls.find((b) => b.dataset.button === "up");
+    const down = this.buttonEls.find((b) => b.dataset.button === "down");
+    if (!up || !down) return;
+
+    if (!round) {
+      // Clear inline left/top/transform so the square CSS classes position them.
+      for (const el of [up, down]) {
+        el.style.left = "";
+        el.style.top = "";
+        el.style.transform = "";
+      }
+      return;
+    }
+
+    // Outer rim radius: half the body + the round frame padding (18px, matches
+    // .emu-frame--round { --frame-pad:18px }) + a ~2px nudge so the nub root tucks
+    // just under the rim edge rather than floating clear of it.
+    const ROUND_FRAME_PAD = 18;
+    const R = bodyWidth / 2 + ROUND_FRAME_PAD + 2;
+    const placeAt = (el: HTMLElement, thetaDeg: number): void => {
+      el.style.left = "50%";
+      el.style.top = "50%";
+      el.style.transform = `translate(-50%, -50%) rotate(${thetaDeg}deg) translateX(${R}px)`;
+    };
+    placeAt(up, -38); // up the right arc (~1-2 o'clock)
+    placeAt(down, 38); // down the right arc (~4-5 o'clock)
   }
 
   /**

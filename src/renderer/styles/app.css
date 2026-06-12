@@ -394,6 +394,16 @@ body {
   padding: 24px;
 }
 
+/* A (v0.0.6): at small viewport heights, tighten the panel padding + gap so the
+   controls (esp. the zoom row) are never pushed off-screen. The Fit calculation
+   reads the live padding/gap, so the watch budget adjusts to match. */
+@media (max-height: 720px) {
+  .emu-panel { gap: 10px; padding: 12px; }
+}
+@media (max-height: 560px) {
+  .emu-panel { gap: 6px; padding: 8px; }
+}
+
 /* Tasteful device frame around the live stage. The frame is the positioning
    context for both the live stage and the physical-button overlay; buttons are
    tucked against the frame edge and partly hidden under a rim pseudo-element so
@@ -604,29 +614,16 @@ body {
   transform: translateY(-50%);
   border-radius: 0 3px 3px 0;
 }
-/* Up/Down on the upper/lower-right arc. v0.0.5: re-oriented so the nub's LONG
-   edge (its tall flat face) points toward the center — consistent with how Back
-   and Select read — by keeping the rectangle tangent to the rim (the long axis
-   follows the arc). They're also tucked BEHIND the bezel rim with a negative
-   offset (like the other nubs) so the rim conceals their inner half, instead of
-   floating in front at right:1px. ~40° tilt sits them on the ~1-2 / 4-5 o'clock
-   arc; tuned by eye — nudge the offset/tilt/arc % if a screenshot looks off. */
-.emu-buttons--round .emu-hit--up {
-  right: -9px;
-  top: 19%;
-  height: 40px;
-  transform: rotate(-40deg);
-  transform-origin: center;
-  border-radius: 0 3px 3px 0;
-}
+/* Up/Down on the upper/lower-right arc. C (v0.0.6): positioning is now done in JS
+   (applyRoundUpDownPlacement) — each nub is centered at the watch center and
+   pushed out along a rotated radius so its LONG (tall) edge stays TANGENT to the
+   outer case circle (rides the ~1-2 / 4-5 o'clock arc). The JS sets inline
+   left/top/transform for round and CLEARS them for square (so the square
+   .emu-hit--up/--down rules take over). Here we only carry the shared look. */
+.emu-buttons--round .emu-hit--up,
 .emu-buttons--round .emu-hit--down {
-  right: -9px;
-  bottom: 19%;
-  top: auto;
   height: 40px;
-  transform: rotate(40deg);
-  transform-origin: center;
-  border-radius: 0 3px 3px 0;
+  border-radius: 3px;
 }
 
 /* ── Zoom wrapper: reserves layout space so scaled frame doesn't overlap ─── */
@@ -644,10 +641,13 @@ body {
   transition: height 180ms var(--ease);
 }
 
+/* F (v0.0.6): the "● Live" status reads as a clearly green pill — the dot + text
+   share the green --success token, weight bumped so it doesn't look dim. */
 .emu-status--live {
   color: var(--success);
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: 0.3px;
+  text-shadow: 0 0 6px color-mix(in srgb, var(--success) 45%, transparent);
 }
 
 .emu-caption {
@@ -806,6 +806,34 @@ body {
 .emu-action--subtle:hover { background: var(--control-hover); border-color: var(--border-strong); }
 .emu-action--subtle:active { background: var(--control-press); transform: translateY(1px); }
 .emu-action:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent); }
+
+/* E (v0.0.6): launch-failure highlight. A pulsing danger glow ring drawn on the
+   Launch/Relaunch button to draw the eye after a failed start. Added in
+   EmulatorView on boot() failure; cleared on the next attempt or on success. */
+.emu-action--attn {
+  border-color: var(--danger);
+  color: var(--danger);
+  animation: emu-attn-pulse 1.4s var(--ease) infinite;
+}
+@keyframes emu-attn-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 55%, transparent); }
+  50%      { box-shadow: 0 0 0 4px color-mix(in srgb, var(--danger) 0%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .emu-action--attn { animation: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 40%, transparent); }
+}
+
+/* J (v0.0.6): diagnostics line — a small mono read-out (FPS + latest boot note)
+   shown below the zoom row only when diagnostic mode is on. */
+.emu-diag {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: var(--type-caption);
+  color: var(--text-tertiary);
+  letter-spacing: 0.2px;
+  min-height: 1em;
+  text-align: center;
+}
+.emu-diag[hidden] { display: none; }
 
 .emu-status {
   font-size: var(--type-caption);
