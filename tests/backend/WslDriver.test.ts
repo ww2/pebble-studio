@@ -1,5 +1,6 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { WslDriver } from "../../src/main/backend/WslDriver.js";
+import { _resetShimState } from "../../src/main/backend/timeShim.js";
 
 describe("WslDriver", () => {
   it("runs discrete commands via a wsl.exe login shell so PATH finds pebble", async () => {
@@ -60,5 +61,61 @@ describe("WslDriver", () => {
     const d = new WslDriver({ run });
     d.setPlatform("basalt");
     await expect(d.install("/x.pbw")).rejects.toThrow(/wsl boom/);
+  });
+
+  describe("setFakeTime", () => {
+    it("crosses as wsl.exe -- bash -lc with a quote-free inner cmdline", async () => {
+      const calls: { cmd: string; args: string[] }[] = [];
+      const run = vi.fn(async (cmd: string, args: string[]) => { calls.push({ cmd, args }); return { code: 0, stdout: "", stderr: "" }; });
+      const d = new WslDriver({ run });
+      await d.setFakeTime(123456, 0);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].cmd).toBe("wsl.exe");
+      expect(calls[0].args.slice(0, 3)).toEqual(["--", "bash", "-lc"]);
+      // The outer cmdline passed to bash -lc (the wsl wrapper)
+      const outerCmdline = calls[0].args[3];
+      // Must contain the inner bash -lc invocation
+      expect(outerCmdline).toContain("bash");
+      expect(outerCmdline).toContain("-lc");
+      // Must reference the ctl path and the target/rate values
+      expect(outerCmdline).toContain("123456");
+      expect(outerCmdline).toContain("pb-faketime.ctl");
+    });
+
+    it("does NOT throw on nonzero exit", async () => {
+      const run = vi.fn(async () => ({ code: 1, stdout: "", stderr: "error" }));
+      const d = new WslDriver({ run });
+      await expect(d.setFakeTime(123456, 0)).resolves.toBeUndefined();
+    });
+  });
+
+  describe("ensureTimeShim", () => {
+    beforeEach(() => {
+      _resetShimState();
+    });
+
+    it("delegates ensureTimeShim to the inner driver (crosses wsl.exe)", async () => {
+      const calls: { cmd: string; args: string[] }[] = [];
+      const nowSec = Math.floor(Date.now() / 1000);
+      const run = vi.fn(async (cmd: string, args: string[]) => {
+        calls.push({ cmd, args });
+        // The wsl runner receives wsl.exe -- bash -lc <cmdline>
+        // We need to satisfy the self-test inside
+        if (cmd === "wsl.exe" && args[3]?.includes("date +%s")) {
+          return { code: 0, stdout: String(nowSec + 86400), stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      });
+      const d = new WslDriver({ run });
+      const result = await d.ensureTimeShim();
+      expect(typeof result).toBe("boolean");
+      // All calls must go through wsl.exe
+      const wslCalls = calls.filter(c => c.cmd === "wsl.exe");
+      expect(wslCalls.length).toBeGreaterThan(0);
+      // Each wsl.exe call uses bash -lc
+      for (const c of wslCalls) {
+        expect(c.args.slice(0, 3)).toEqual(["--", "bash", "-lc"]);
+      }
+    });
   });
 });

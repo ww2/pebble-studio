@@ -20,6 +20,12 @@ export interface BackendDriver {
    * moves the displayed time on qemu-pebble (see timeController's contract).
    * `tzName` (IANA zone) is sent as the SetUTC tz_name; falls back to "UTC±h". */
   setTzOffset(offsetMin: number, tzName?: string): Promise<void>;
+  /** Write the qemu time-shim control file (true custom date/freeze/rate).
+   * target=null keeps the current fake time; rate 0=frozen, 1=real, N=N×. */
+  setFakeTime(targetUnix: number | null, rate: number): Promise<void>;
+  /** Deploy + verify the LD_PRELOAD time shim (cached). False ⇒ fall back to
+   * utc_offset-only behavior. */
+  ensureTimeShim(): Promise<boolean>;
   timeFormat(hour24: boolean): Promise<void>;
   bluetooth(connected: boolean): Promise<void>;
   battery(percent: number, charging: boolean): Promise<void>;

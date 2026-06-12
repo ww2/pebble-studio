@@ -97,6 +97,14 @@ export class WslDriver implements BackendDriver {
     return this.inner.setTzOffset(offsetMin, tzName);
   }
 
+  async setFakeTime(targetUnix: number | null, rate: number): Promise<void> {
+    return this.inner.setFakeTime(targetUnix, rate);
+  }
+
+  async ensureTimeShim(): Promise<boolean> {
+    return this.inner.ensureTimeShim();
+  }
+
   async timeFormat(hour24: boolean): Promise<void> {
     return this.inner.timeFormat(hour24);
   }

@@ -3,6 +3,7 @@ import type { BackendDriver, Runner, RunResult, VncEndpoint } from "./BackendDri
 import type { PebbleCommand } from "./pebbleCli.js";
 import * as cli from "./pebbleCli.js";
 import { bootEmulator, stopEmulator, type BootToken, type OnStep } from "./bootEmulator.js";
+import { setFakeTimeCmd, ensureTimeShim } from "./timeShim.js";
 
 /** Default stop uses the native (current-host) teardown. */
 const defaultStop: StopFn = () => stopEmulator();
@@ -65,6 +66,16 @@ export class NativeDriver implements BackendDriver {
     if (r.code !== 0) {
       console.warn(`[time] setTzOffset(${offsetMin}) exit ${r.code}: ${r.stderr || r.stdout}`);
     }
+  }
+
+  async setFakeTime(targetUnix: number | null, rate: number): Promise<void> {
+    const c = setFakeTimeCmd(targetUnix, rate);
+    const r = await this.deps.run(c.cmd, c.args, c.env);
+    if (r.code !== 0) console.warn(`[time] setFakeTime exit ${r.code}: ${r.stderr || r.stdout}`);
+  }
+
+  async ensureTimeShim(): Promise<boolean> {
+    return ensureTimeShim((cmdline) => this.deps.run("bash", ["-lc", cmdline]));
   }
 
   async timeFormat(hour24: boolean): Promise<void> {

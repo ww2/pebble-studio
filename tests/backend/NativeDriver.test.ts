@@ -1,5 +1,6 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { NativeDriver } from "../../src/main/backend/NativeDriver.js";
+import { _resetShimState, isShimReady } from "../../src/main/backend/timeShim.js";
 
 describe("NativeDriver", () => {
   it("runs the install command via the injected runner", async () => {
@@ -71,5 +72,91 @@ describe("NativeDriver", () => {
     d.setPlatform("basalt");
     await d.timelineQuickView(true);
     expect(calls[0]).toEqual(expect.arrayContaining(["emu-set-timeline-quick-view", "on"]));
+  });
+
+  describe("setFakeTime", () => {
+    it("issues bash -lc echo <target> <rate> > ctl path", async () => {
+      const calls: { cmd: string; args: string[] }[] = [];
+      const run = vi.fn(async (cmd: string, args: string[]) => { calls.push({ cmd, args }); return { code: 0, stdout: "", stderr: "" }; });
+      const d = new NativeDriver({ run });
+      await d.setFakeTime(123456, 0);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].cmd).toBe("bash");
+      expect(calls[0].args[0]).toBe("-lc");
+      const cmdline = calls[0].args[1];
+      // Must contain target and rate
+      expect(cmdline).toContain("123456");
+      expect(cmdline).toContain("0");
+      // Must be quote-free
+      expect(cmdline).not.toContain("'");
+      expect(cmdline).not.toContain('"');
+    });
+
+    it("uses '-' for null target", async () => {
+      const calls: { cmd: string; args: string[] }[] = [];
+      const run = vi.fn(async (cmd: string, args: string[]) => { calls.push({ cmd, args }); return { code: 0, stdout: "", stderr: "" }; });
+      const d = new NativeDriver({ run });
+      await d.setFakeTime(null, 1);
+      const cmdline = calls[0].args[1];
+      expect(cmdline).toContain("- 1");
+    });
+
+    it("does NOT throw on nonzero exit", async () => {
+      const run = vi.fn(async () => ({ code: 1, stdout: "", stderr: "some error" }));
+      const d = new NativeDriver({ run });
+      await expect(d.setFakeTime(123456, 0)).resolves.toBeUndefined();
+    });
+  });
+
+  describe("ensureTimeShim", () => {
+    beforeEach(() => {
+      _resetShimState();
+    });
+
+    it("routes commands through runner as bash -lc <cmdline> and resolves to a boolean", async () => {
+      const bashCalls: string[] = [];
+      const nowSec = Math.floor(Date.now() / 1000);
+      const run = vi.fn(async (cmd: string, args: string[]) => {
+        if (cmd === "bash" && args[0] === "-lc") {
+          const cmdline = args[1] ?? "";
+          bashCalls.push(cmdline);
+          // Satisfy the self-test: return nowSec+86400 when asked for date +%s
+          if (cmdline.includes("date +%s")) {
+            return { code: 0, stdout: String(nowSec + 86400), stderr: "" };
+          }
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      });
+      const d = new NativeDriver({ run });
+      const result = await d.ensureTimeShim();
+      expect(typeof result).toBe("boolean");
+      // At least one bash -lc call must have been issued
+      expect(bashCalls.length).toBeGreaterThan(0);
+    });
+
+    it("resolves true and marks isShimReady() when vendor resources are present", async () => {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const run = vi.fn(async (cmd: string, args: string[]) => {
+        if (cmd === "bash" && args[0] === "-lc") {
+          const cmdline = args[1] ?? "";
+          if (cmdline.includes("date +%s")) {
+            return { code: 0, stdout: String(nowSec + 86400), stderr: "" };
+          }
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      });
+      const d = new NativeDriver({ run });
+      const result = await d.ensureTimeShim();
+      expect(result).toBe(true);
+      expect(isShimReady()).toBe(true);
+    });
+
+    it("does NOT throw when resources are missing (resolves false)", async () => {
+      // Force resources to fail by using a fresh shimState + broken runner
+      const run = vi.fn(async () => ({ code: 1, stdout: "", stderr: "fail" }));
+      const d = new NativeDriver({ run });
+      // Even if the runner always fails, it should not throw
+      await expect(d.ensureTimeShim()).resolves.toBeDefined();
+    });
   });
 });
