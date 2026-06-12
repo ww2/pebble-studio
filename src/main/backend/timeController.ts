@@ -42,7 +42,7 @@ export const OFFSET_MIN_MINUTES = -32767;
 export const OFFSET_MAX_MINUTES = 32767;
 
 export const DEFAULT_TIME_CONFIG: TimeConfig = {
-  source: "system", rate: "1x", timezone: "UTC", hour24: false, customWallMs: 0,
+  source: "system", rate: "1x", timezone: "UTC", hour24: true, customWallMs: 0,
 };
 
 /** Minutes east of UTC for `tz` at instant `at`. Invalid zones → 0. (Pure; uses Intl.) */

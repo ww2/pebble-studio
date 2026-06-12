@@ -107,12 +107,26 @@ export function registerIpc(): void {
 
   ipcMain.handle("lib:add", async (_e, pbwPath: string) => { library.add(pbwPath); return library.list(); });
   ipcMain.handle("lib:list", async () => library.list());
-  ipcMain.handle("lib:remove", async (_e, p: string) => { library.remove(p); return library.list(); });
+  ipcMain.handle("lib:remove", async (_e, p: string) => {
+    library.remove(p);
+    // Also drop it from the loaded set. There is no per-app uninstall command
+    // (only `pebble wipe`), so the app stays on disk until a wipe — but from the
+    // user's point of view a removed app is no longer one of "their" loaded apps.
+    // Pruning here keeps the "N loaded" count from drifting ABOVE the visible
+    // library list (the "removed 2, added 1 → 3 loaded" bug).
+    loaded.delete(p);
+    return library.list();
+  });
   ipcMain.handle("lib:installAll", async () => {
     for (const p of library.list()) {
       await driver!.install(p);
       loaded.add(p);
     }
+    // Each `pebble install` re-syncs host time on connect (post_connect),
+    // clobbering any custom/timezone offset. installAll runs AFTER emu:start's
+    // applyAll() (the renderer reinstalls once VNC is up), so without this the
+    // watch reverts to host time on every boot with a non-system time set.
+    reassertTime();
   });
 
   ipcMain.handle("loaded:list", async () => Array.from(loaded));

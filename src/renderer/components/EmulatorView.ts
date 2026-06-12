@@ -197,6 +197,8 @@ export class EmulatorView {
             <button class="emu-bezel-opt" data-bezel="white" type="button">White</button>
           </div>
         </div>
+      </div>
+      <div class="emu-status-row">
         <span class="emu-status" id="emu-status"></span>
       </div>
       <div class="emu-diag" id="emu-diag" hidden></div>
@@ -764,6 +766,15 @@ export class EmulatorView {
     } catch (err) {
       console.error("[emu] libInstallAll failed", err);
     }
+    // The loaded-app set just changed — tell the App Library to refresh its
+    // "N loaded" count + pills (it only otherwise refreshes on a drop/pick).
+    window.dispatchEvent(new Event("pebble-studio:apps-changed"));
+  }
+
+  /** Whether the emulator is currently live (VNC connected). Injected into
+   * AppLibrary so it can queue installs instead of hitting a dead emulator. */
+  isLive(): boolean {
+    return this.state === "live";
   }
 
   /**

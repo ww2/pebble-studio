@@ -59,6 +59,10 @@ describe("offsetMinutesFor", () => {
   });
 });
 
+describe("DEFAULT_TIME_CONFIG", () => {
+  it("defaults to a 24-hour clock", () => expect(DEFAULT_TIME_CONFIG.hour24).toBe(true));
+});
+
 describe("isVirtualClock", () => {
   it("true only for Custom with a non-1× rate", () => {
     expect(isVirtualClock(cfg({ source: "custom", rate: "frozen" }))).toBe(true);

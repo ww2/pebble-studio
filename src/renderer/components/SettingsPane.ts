@@ -145,6 +145,10 @@ export class SettingsPane {
   private hour24 = false;
   /** True when a custom field was edited but not yet applied via Run. */
   private timeDirty = false;
+  /** The last TimeConfig actually pushed to the watch — re-pushed (with the new
+   * hour24) when the 12/24h toggle flips so the format updates without changing
+   * which time mode is active. */
+  private lastApplied: TimeConfig = { ...DEFAULT_TIME_CONFIG };
 
   constructor(
     initialTheme: ThemeChoice,
@@ -385,16 +389,22 @@ export class SettingsPane {
     }
     tzControl.append(tzLabel, this.tzSelect);
 
-    // 24-hour clock toggle (default OFF).
+    // 24-hour clock toggle (default ON).
     const hour24Row = this.makeSwitchRow(
       "24-hour clock",
       "Sets what clock_is_24h_style() returns on the watch.",
-      localStorage.getItem(TIME_HOUR24_KEY) === "true", // default OFF
+      localStorage.getItem(TIME_HOUR24_KEY) !== "false", // default ON
       (on) => {
         this.hour24 = on;
         localStorage.setItem(TIME_HOUR24_KEY, on ? "true" : "false");
         this.applyHour24ToInput();
-        this.timeDirty = true;
+        // The 12/24h format is independent of the time offset, so toggling it
+        // must push to the watch RIGHT NOW (re-applying the active config so the
+        // emu-time-format command actually fires) — not wait for a later "Run".
+        // Preserve the staged-edit ("dirty") indicator across the re-push.
+        const wasDirty = this.timeDirty;
+        this.applyConfig({ ...this.lastApplied, hour24: on });
+        this.timeDirty = wasDirty;
         this.renderTimeStatus();
       },
     );
@@ -566,7 +576,7 @@ export class SettingsPane {
       opt.textContent = text;
       blMethodSelect.appendChild(opt);
     }
-    blMethodSelect.value = localStorage.getItem(BACKLIGHT_METHOD_KEY) ?? "back";
+    blMethodSelect.value = localStorage.getItem(BACKLIGHT_METHOD_KEY) ?? "off";
     blMethodSelect.addEventListener("change", () => {
       const value = blMethodSelect.value;
       localStorage.setItem(BACKLIGHT_METHOD_KEY, value);
@@ -584,8 +594,10 @@ export class SettingsPane {
     blMethodDesc.textContent =
       "Back-press wakes the screen but navigates menus; Motion wakes it but triggers shake handlers; Off disables the keepalive.";
 
-    // Apply persisted backlight method to main on startup.
-    const initialBlMethod = localStorage.getItem(BACKLIGHT_METHOD_KEY) ?? "back";
+    // Apply persisted backlight method to main on startup. Default OFF — the
+    // keepalive sends real Back presses / motion taps that can navigate menus,
+    // so it should be opt-in, not on by default.
+    const initialBlMethod = localStorage.getItem(BACKLIGHT_METHOD_KEY) ?? "off";
     void window.studio.backlightMethod(initialBlMethod).catch(() => {});
     void window.studio.backlightAlways(initialBlMethod !== "off").catch(() => {});
 
@@ -654,7 +666,7 @@ export class SettingsPane {
       this.dateInput.value = localStorage.getItem(TIME_CUSTOM_DATE_KEY) ?? stored.date;
       this.timeInput.value = localStorage.getItem(TIME_CUSTOM_TIME_KEY) ?? stored.time;
       this.rateSelect.value = localStorage.getItem(TIME_RATE_KEY) ?? "1x";
-      this.hour24 = localStorage.getItem(TIME_HOUR24_KEY) === "true";
+      this.hour24 = localStorage.getItem(TIME_HOUR24_KEY) !== "false"; // default ON
       this.applyHour24ToInput();
       // Time source always starts at System on launch — a persisted Custom time
       // (often a now-stale timestamp) shouldn't silently drive the watch across
@@ -711,6 +723,7 @@ export class SettingsPane {
 
   /** Push a config to the emulator and notify the badge. Single apply path. */
   private applyConfig(cfg: TimeConfig): void {
+    this.lastApplied = cfg;
     void window.studio.setTimeConfig(cfg).catch(() => {});
     window.dispatchEvent(new CustomEvent("pebble-studio:time-changed", { detail: cfg }));
     this.timeDirty = false;

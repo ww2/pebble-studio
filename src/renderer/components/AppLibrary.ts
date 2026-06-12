@@ -27,10 +27,20 @@ export class AppLibrary {
   private readonly getPlatformId: () => string;
   /** Called after a successful clear so the EmulatorView can reconnect VNC. */
   private readonly onClear: ((platformId: string) => Promise<void>) | undefined;
+  /** Is the emulator currently live? Injected from main.ts (EmulatorView state).
+   * When not live we queue installs (libAdd only) instead of running `pebble
+   * install` against a dead emulator — that would error or boot a stray non-VNC
+   * qemu. Queued apps install on the next Launch via libInstallAll. */
+  private readonly isLive: (() => boolean) | undefined;
 
-  constructor(getPlatformId: () => string, onClear?: (platformId: string) => Promise<void>) {
+  constructor(
+    getPlatformId: () => string,
+    onClear?: (platformId: string) => Promise<void>,
+    isLive?: () => boolean,
+  ) {
     this.getPlatformId = getPlatformId;
     this.onClear = onClear;
+    this.isLive = isLive;
 
     this.el = document.createElement("div");
     this.el.className = "lib-panel";
@@ -104,6 +114,12 @@ export class AppLibrary {
       this.dropZone.classList.remove("over");
       void this.handleDrop(e);
     });
+
+    // Refresh when the emulator's loaded-app set changes outside this panel —
+    // e.g. after a boot/relaunch reinstalls the library (libInstallAll) or a
+    // Clear wipes it. EmulatorView dispatches this once those complete, keeping
+    // the "N loaded" count + pills in sync rather than only after a drop/pick.
+    window.addEventListener("pebble-studio:apps-changed", () => void this.refresh());
   }
 
   private async handleDrop(e: DragEvent): Promise<void> {
@@ -140,9 +156,19 @@ export class AppLibrary {
     }
     try {
       await window.studio.libAdd(filePath);
+      // No running emulator → just add to the library; it installs on the next
+      // Launch (libInstallAll). Installing against a dead emulator errors or
+      // spawns a stray non-VNC qemu. Same code path for drag-drop AND file-pick.
+      if (this.isLive && !this.isLive()) {
+        this.errorMsg.classList.add("lib-error--info");
+        this.errorMsg.textContent = `Added ${name} — it will install when the watch launches`;
+        return;
+      }
+      this.errorMsg.classList.remove("lib-error--info");
       await window.studio.install(filePath);
     } catch (err) {
       console.error("[lib] install failed", filePath, err);
+      this.errorMsg.classList.remove("lib-error--info");
       const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
       this.errorMsg.textContent = reason
         ? `Install failed: ${name} — ${reason}`
@@ -172,8 +198,10 @@ export class AppLibrary {
     ]);
     const loadedSet = new Set(loadedPaths);
 
-    // Update header
-    const count = loadedSet.size;
+    // Update header. Count ONLY apps that are both in the library AND loaded, so
+    // the "N loaded" badge can never claim more than the visible list shows
+    // (the count used to track a main-process set that outlived removals).
+    const count = entries.filter((p) => loadedSet.has(p)).length;
     this.loadedCount.textContent = count > 0 ? `${count} loaded` : "";
     this.clearBtn.disabled = count === 0;
 

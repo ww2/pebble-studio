@@ -891,6 +891,16 @@ body {
   text-align: center;
 }
 
+/* Status row: its own line BELOW the zoom row and ABOVE the diagnostics/FPS
+   line. Hosts the "● Live" status + the non-system-time badge, centered. */
+.emu-status-row {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  min-height: 1em;
+}
+
 /* ── Inspector column (swappable pane) ───────────────────────────────────── */
 .inspector {
   min-width: 0;
@@ -1087,6 +1097,10 @@ body {
   color: var(--danger);
   font-size: var(--type-caption);
   min-height: 1em;
+}
+/* Neutral (non-error) variant — e.g. "added, will install on launch". */
+.lib-error--info {
+  color: var(--text-secondary);
 }
 
 .lib-list {

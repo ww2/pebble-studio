@@ -121,6 +121,7 @@ const switcher = new VersionSwitcher((id: PlatformId) => selectPlatform(id), ini
 const library = new AppLibrary(
   () => switcher.value,
   (platformId: string) => view.reconnectAfterClear(platformId as PlatformId),
+  () => view.isLive(),
 );
 const captureBar = new CaptureBar(
   () => document.querySelector<HTMLElement>("#emu-screen"),
