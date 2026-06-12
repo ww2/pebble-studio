@@ -1,6 +1,7 @@
 import type { PlatformId, ButtonId, ButtonAction } from "../../shared/types.js";
 import type { BackendDriver, Runner, RunResult, VncEndpoint } from "./BackendDriver.js";
 import { NativeDriver, type BootFn, type StopFn } from "./NativeDriver.js";
+import type { BootToken } from "./bootEmulator.js";
 import { toWslPath } from "./wslPath.js";
 
 export interface WslDriverDeps {
@@ -55,13 +56,14 @@ export class WslDriver implements BackendDriver {
     this.inner.setPlatform(id);
   }
 
-  async start(id: PlatformId): Promise<VncEndpoint> {
+  async start(id: PlatformId, token?: BootToken): Promise<VncEndpoint> {
     // NOTE: This boots the emulator through the injectable boot fn (or the
     // WSL-side default boot). On a real Windows+WSL2 host, the boot fn would
     // invoke `wsl.exe -- pebble emu-control ...`. WSL2 forwards the VNC port
     // to the Windows host automatically, so the endpoint host remains localhost.
-    // This path is NOT exercised in the Linux/WSL dev environment.
-    const endpoint = await this.inner.start(id);
+    // This path is NOT exercised in the Linux/WSL dev environment. The token
+    // threads through so a force-close aborts the in-WSL boot's wait loops.
+    const endpoint = await this.inner.start(id, token);
     return { ...endpoint, host: "localhost" };
   }
 

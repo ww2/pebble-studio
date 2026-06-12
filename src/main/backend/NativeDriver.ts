@@ -2,12 +2,12 @@ import type { PlatformId, ButtonId, ButtonAction } from "../../shared/types.js";
 import type { BackendDriver, Runner, RunResult, VncEndpoint } from "./BackendDriver.js";
 import type { PebbleCommand } from "./pebbleCli.js";
 import * as cli from "./pebbleCli.js";
-import { bootEmulator, stopEmulator } from "./bootEmulator.js";
+import { bootEmulator, stopEmulator, type BootToken } from "./bootEmulator.js";
 
 /** Default stop uses the native (current-host) teardown. */
 const defaultStop: StopFn = () => stopEmulator();
 
-export type BootFn = (id: PlatformId) => Promise<VncEndpoint>;
+export type BootFn = (id: PlatformId, token?: BootToken) => Promise<VncEndpoint>;
 export type StopFn = () => Promise<void>;
 
 export interface NativeDriverDeps {
@@ -25,9 +25,13 @@ export class NativeDriver implements BackendDriver {
     cli.setActivePlatform(id);
   }
 
-  async start(id: PlatformId): Promise<VncEndpoint> {
+  async start(id: PlatformId, token?: BootToken): Promise<VncEndpoint> {
     this.setPlatform(id);
-    return (this.deps.boot ?? bootEmulator)(id);
+    // The default boot (no injected boot) uses the native deps; the BootFn shape
+    // is (id, token) so the token threads through both the injected and default
+    // paths without exposing SpawnDeps here.
+    const boot: BootFn = this.deps.boot ?? ((bootId, bootToken) => bootEmulator(bootId, {}, bootToken));
+    return boot(id, token);
   }
 
   async stop(): Promise<void> {
