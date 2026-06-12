@@ -38,7 +38,7 @@ const studio = {
   getTimeConfig: (): Promise<TimeConfig> => ipcRenderer.invoke("time:get"),
   setTimeConfig: (cfg: TimeConfig): Promise<void> => ipcRenderer.invoke("time:set", cfg),
   // Time-shim readiness (v0.0.13): false → legacy offset fallback limits apply.
-  timeStatus: (): Promise<{ shim: boolean }> => ipcRenderer.invoke("time:status"),
+  timeStatus: (): Promise<{ shim: boolean; checked: boolean }> => ipcRenderer.invoke("time:status"),
   timelineQuickView: (on: boolean): Promise<void> => ipcRenderer.invoke("emu:timelineQuickView", on),
   // Clay / AppConfig (Task B2). clayOpenWindow resolves with the RAW
   // still-percent-encoded close fragment ("" = cancelled).

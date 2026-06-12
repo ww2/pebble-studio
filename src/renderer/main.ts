@@ -40,7 +40,7 @@ interface StudioApi {
   getTimeConfig(): Promise<TimeConfig>;
   setTimeConfig(cfg: TimeConfig): Promise<void>;
   // v0.0.13: time-shim readiness — false means the legacy offset fallback is active.
-  timeStatus(): Promise<{ shim: boolean }>;
+  timeStatus(): Promise<{ shim: boolean; checked: boolean }>;
   setBackgroundThrottling(throttle: boolean): Promise<void>;
   // v0.0.8: timeline quick-view (Task 1).
   timelineQuickView(on: boolean): Promise<void>;

@@ -528,6 +528,9 @@ export class SettingsPane {
     this.timeNoteEl = document.createElement("p");
     this.timeNoteEl.className = "settings-row-desc type-caption";
     this.refreshTimeNote(); // sets the base copy now; appends fallback info async
+    // ensureTimeShim runs at boot (emu:start), so the shim status becomes
+    // meaningful right after a launch — apps-changed fires post-boot.
+    window.addEventListener("pebble-studio:apps-changed", () => this.refreshTimeNote());
 
     time.append(
       timeHeading, sourceControl, dateControl, timeControl, rateControl, tzControl,
@@ -775,8 +778,11 @@ export class SettingsPane {
       "is re-applied automatically after commands.";
     this.timeNoteEl.textContent = base;
     void window.studio.timeStatus()
-      .then(({ shim }) => {
-        if (!shim) {
+      .then(({ shim, checked }) => {
+        // Only warn after a real probe failed — `checked` is false until the
+        // first boot/apply actually runs ensureTimeShim, and the unchecked
+        // default must not read as "unavailable" at app launch.
+        if (checked && !shim) {
           this.timeNoteEl.textContent =
             base +
             " (Advanced time control unavailable on this system — falling back " +

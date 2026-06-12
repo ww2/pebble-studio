@@ -120,8 +120,10 @@ export interface TimeController {
    * Timezone mode and the legacy custom fallback — shim-backed custom keeps the
    * offset at the host offset, so the clobber is already a no-op. */
   reassert(): Promise<void>;
-  /** Time-shim readiness as last reported by ensureTimeShim() (false until checked). */
-  getStatus(): { shim: boolean };
+  /** Time-shim readiness as last reported by ensureTimeShim(). `checked` is
+   * false until the first real probe (at boot/apply) — the renderer must not
+   * show "shim unavailable" off the unchecked default. */
+  getStatus(): { shim: boolean; checked: boolean };
   stop(): void;
 }
 
@@ -136,6 +138,7 @@ export function makeTimeController(
   const hostTz = deps.hostTz ?? (() => detectHostTimezone());
   let cfg: TimeConfig = { ...DEFAULT_TIME_CONFIG };
   let shimReady = false;     // last ensureTimeShim() result (false until first check)
+  let shimChecked = false;   // has ensureTimeShim() ever actually been probed?
   let legacyActive = false;  // custom mode is running on the legacy fallback
 
   // -------------------------------------------------------------------------
@@ -204,6 +207,7 @@ export function makeTimeController(
     try { await d.setTzOffset(offsetMinutesFor(cfg, now(), hostTz()), tzName); } catch { /* ignore */ }
 
     try { shimReady = await d.ensureTimeShim(); } catch { shimReady = false; }
+    shimChecked = true;
 
     if (cfg.source === "custom") {
       if (shimReady) {
@@ -251,7 +255,7 @@ export function makeTimeController(
       // Shim-backed custom: NO-OP (offset is the host offset — exactly what
       // post_connect pushes). Plain system mode (host zone): NO-OP.
     },
-    getStatus: () => ({ shim: shimReady }),
+    getStatus: () => ({ shim: shimReady, checked: shimChecked }),
     stop(): void { clearTimer(); },
   };
 }
