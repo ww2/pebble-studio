@@ -12,6 +12,27 @@ declare const __dirname: string;
 // the app actually starts. Harmless on platforms where the sandbox works.
 app.commandLine.appendSwitch("no-sandbox");
 
+// Single-instance lock (Task H). A second app instance would launch a second
+// competing emulator (the cause of the inconsistent-FPS report), so we refuse it
+// and instead surface the existing window. Must run before any window is created.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+}
+
+// Module ref to the main window so `second-instance` can restore + focus it.
+let mainWindow: BrowserWindow | null = null;
+
+// When a second instance is launched, Electron fires this in the FIRST (primary)
+// instance instead. Restore the existing main window (un-minimize) and focus it.
+app.on("second-instance", () => {
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+});
+
 // Show a frameless splash window immediately so the first visible window isn't
 // a blank frame while the (heavier) renderer bundle loads. Closed once the main
 // window fires `did-finish-load`. The version is injected via a query param so
@@ -55,6 +76,13 @@ function createWindow(): void {
       nodeIntegration: false,
       sandbox: false,
     },
+  });
+
+  // Track as the main window so `second-instance` can restore + focus it; clear
+  // the ref on close so we never poke a destroyed window.
+  mainWindow = win;
+  win.on("closed", () => {
+    if (mainWindow === win) mainWindow = null;
   });
 
   // Swap splash -> main once the renderer is ready. Guard against the splash
@@ -133,15 +161,19 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(() => {
-  registerIpc();
-  createWindow();
+// Only stand up the app when we hold the single-instance lock. Without it the
+// second instance has already called app.quit() above.
+if (gotSingleInstanceLock) {
+  app.whenReady().then(() => {
+    registerIpc();
+    createWindow();
 
-  app.on("activate", () => {
-    // macOS: re-create a window when the dock icon is clicked and none are open.
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    app.on("activate", () => {
+      // macOS: re-create a window when the dock icon is clicked and none are open.
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
   });
-});
+}
 
 app.on("window-all-closed", () => {
   // Quit on Windows/Linux; on macOS apps typically stay active.
