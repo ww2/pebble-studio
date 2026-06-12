@@ -1,43 +1,20 @@
 import { describe, it, expect } from "vitest";
-import { tzOffsetMinutes, computeTargetEpochSec, type TimeState } from "../../src/main/backend/timeController.js";
-import { detectHostTimezone, anchorFor, makeTimeController, type TimeConfig } from "../../src/main/backend/timeController.js";
+import {
+  tzOffsetMinutes, offsetMinutesFor, isVirtualClock, detectHostTimezone, makeTimeController,
+  OFFSET_MAX_MINUTES, OFFSET_MIN_MINUTES, DEFAULT_TIME_CONFIG, type TimeConfig,
+} from "../../src/main/backend/timeController.js";
 
 // A fixed winter instant (no US DST): 2026-01-15T12:00:00Z
 const WINTER = new Date("2026-01-15T12:00:00Z");
+/** Build a TimeConfig from partial overrides on the default. */
+const cfg = (o: Partial<TimeConfig>): TimeConfig => ({ ...DEFAULT_TIME_CONFIG, ...o });
 
 describe("tzOffsetMinutes", () => {
   it("UTC is 0", () => expect(tzOffsetMinutes("UTC", WINTER)).toBe(0));
   it("Los Angeles is -480 in winter (PST)", () =>
     expect(tzOffsetMinutes("America/Los_Angeles", WINTER)).toBe(-480));
-  it("Kolkata is +330", () =>
-    expect(tzOffsetMinutes("Asia/Kolkata", WINTER)).toBe(330));
-  it("invalid zone falls back to 0", () =>
-    expect(tzOffsetMinutes("Not/AZone", WINTER)).toBe(0));
-});
-
-describe("computeTargetEpochSec", () => {
-  const realMs = WINTER.getTime();
-  const realSec = Math.floor(realMs / 1000);
-
-  it("system + 1x shows zone wall-clock as a UTC epoch", () => {
-    const st: TimeState = { source: "system", multiplier: 1, timezone: "America/Los_Angeles", anchorUtcSec: realSec - 480 * 60, anchorRealMs: realMs };
-    expect(computeTargetEpochSec(st, realMs)).toBe(realSec - 480 * 60);
-  });
-
-  it("frozen holds the anchor regardless of elapsed real time", () => {
-    const st: TimeState = { source: "custom", multiplier: 0, timezone: "UTC", anchorUtcSec: 1000, anchorRealMs: realMs };
-    expect(computeTargetEpochSec(st, realMs + 60_000)).toBe(1000);
-  });
-
-  it("4x advances 4 virtual seconds per real second", () => {
-    const st: TimeState = { source: "custom", multiplier: 4, timezone: "UTC", anchorUtcSec: 1000, anchorRealMs: realMs };
-    expect(computeTargetEpochSec(st, realMs + 10_000)).toBe(1000 + 40);
-  });
-
-  it("1x advances one-for-one", () => {
-    const st: TimeState = { source: "system", multiplier: 1, timezone: "UTC", anchorUtcSec: 1000, anchorRealMs: realMs };
-    expect(computeTargetEpochSec(st, realMs + 5_000)).toBe(1005);
-  });
+  it("Tokyo is +540", () => expect(tzOffsetMinutes("Asia/Tokyo", WINTER)).toBe(540));
+  it("invalid zone falls back to 0", () => expect(tzOffsetMinutes("Not/AZone", WINTER)).toBe(0));
 });
 
 describe("detectHostTimezone", () => {
@@ -48,43 +25,87 @@ describe("detectHostTimezone", () => {
   });
 });
 
-describe("anchorFor", () => {
-  // Winter instant so the host (LA) offset is a stable −480 (PST, no DST).
-  const realMs = new Date("2026-01-15T12:00:00Z").getTime();
+describe("offsetMinutesFor", () => {
   const HOST = "America/Los_Angeles";
-  it("System mode (zone === host) nets out to true UTC", () => {
-    // The firmware re-applies the host offset, so we send plain UTC and it renders host-local.
-    const a = anchorFor({ source: "system", rate: "1x", timezone: HOST, hour24: true, customWallMs: 0 }, realMs, HOST);
-    expect(a.anchorUtcSec).toBe(Math.floor(realMs / 1000));
-    expect(a.multiplier).toBe(1);
+  const t0 = WINTER.getTime();
+
+  it("System → host offset; Timezone → the chosen zone's offset", () => {
+    expect(offsetMinutesFor(cfg({ source: "system", timezone: HOST }), t0, HOST)).toBe(-480);
+    expect(offsetMinutesFor(cfg({ source: "system", timezone: "Asia/Tokyo" }), t0, HOST)).toBe(540);
   });
-  it("Timezone mode shifts by (zone − host)", () => {
-    // host LA (−480), view Tokyo (+540) → net shift +1020 min.
-    const a = anchorFor({ source: "system", rate: "1x", timezone: "Asia/Tokyo", hour24: true, customWallMs: 0 }, realMs, HOST);
-    expect(a.anchorUtcSec).toBe(Math.floor(realMs / 1000) + (540 - -480) * 60);
+
+  it("Custom 1× → constant (entered − now); at apply shows entered, then drifts", () => {
+    const c = cfg({ source: "custom", rate: "1x", customWallMs: t0 + 30 * 60_000 });
+    expect(offsetMinutesFor(c, t0, HOST, t0)).toBe(30);
+    // 10 min later the offset is unchanged (display advanced 10 min on its own).
+    expect(offsetMinutesFor(c, t0 + 10 * 60_000, HOST, t0)).toBe(30);
   });
-  it("custom subtracts the host offset so the entered wall-clock displays", () => {
-    const customWallMs = Date.UTC(2026, 5, 1, 14, 30, 0); // user typed 2026-06-01 14:30
-    const a = anchorFor({ source: "custom", rate: "frozen", timezone: "UTC", hour24: false, customWallMs }, realMs, HOST);
-    // host offset measured at realMs (Jan) → LA −480; subtracting a negative adds 28800s.
-    expect(a.anchorUtcSec).toBe(Math.floor(customWallMs / 1000) - -480 * 60);
-    expect(a.multiplier).toBe(0);
+
+  it("Custom Frozen → offset decreases ~1/min so the displayed minute holds", () => {
+    const c = cfg({ source: "custom", rate: "frozen", customWallMs: t0 + 3 * 3600_000 });
+    expect(offsetMinutesFor(c, t0, HOST, t0)).toBe(180);          // +3h at apply
+    expect(offsetMinutesFor(c, t0 + 5 * 60_000, HOST, t0)).toBe(175); // 5 min later → still displays +3h
+  });
+
+  it("Custom 10× → offset grows 9/min (fast-forward)", () => {
+    const c = cfg({ source: "custom", rate: "10x", customWallMs: t0 });
+    expect(offsetMinutesFor(c, t0, HOST, t0)).toBe(0);
+    expect(offsetMinutesFor(c, t0 + 60_000, HOST, t0)).toBe(9); // +1 real min → display +10 min
+  });
+
+  it("Custom clamps to the Int16 utc_offset range (far dates)", () => {
+    expect(offsetMinutesFor(cfg({ source: "custom", rate: "1x", customWallMs: t0 + 1000 * 86_400_000 }), t0, HOST, t0)).toBe(OFFSET_MAX_MINUTES);
+    expect(offsetMinutesFor(cfg({ source: "custom", rate: "1x", customWallMs: t0 - 1000 * 86_400_000 }), t0, HOST, t0)).toBe(OFFSET_MIN_MINUTES);
   });
 });
 
-describe("makeTimeController applies on config change", () => {
-  it("sends epoch+utc and the 12/24h format", async () => {
-    const setTimeCalls: Array<{ v: string; utc: boolean }> = [];
+describe("isVirtualClock", () => {
+  it("true only for Custom with a non-1× rate", () => {
+    expect(isVirtualClock(cfg({ source: "custom", rate: "frozen" }))).toBe(true);
+    expect(isVirtualClock(cfg({ source: "custom", rate: "10x" }))).toBe(true);
+    expect(isVirtualClock(cfg({ source: "custom", rate: "1x" }))).toBe(false);
+    expect(isVirtualClock(cfg({ source: "system", rate: "1x" }))).toBe(false);
+  });
+});
+
+describe("makeTimeController", () => {
+  function fakeDriver() {
+    const offsets: number[] = [];
     let fmt: boolean | null = null;
-    const driver = {
-      setTime: async (v: string, opts?: { utc?: boolean }) => { setTimeCalls.push({ v, utc: !!opts?.utc }); },
+    return {
+      offsets, get fmt() { return fmt; },
+      setTzOffset: async (o: number) => { offsets.push(o); },
       timeFormat: async (h: boolean) => { fmt = h; },
     };
-    // host = UTC → zero host offset, so the pushed epoch equals the raw anchor.
-    const tc = makeTimeController(() => driver, { now: () => new Date("2026-01-15T12:00:00Z").getTime(), hostTz: () => "UTC" });
-    await tc.setConfig({ source: "custom", rate: "frozen", timezone: "UTC", hour24: true, customWallMs: 1000 * 1000 });
-    expect(setTimeCalls[0]).toEqual({ v: "1000", utc: true });
-    expect(fmt).toBe(true);
+  }
+
+  it("setConfig pushes the computed offset and the 12/24h format", async () => {
+    const d = fakeDriver();
+    const tc = makeTimeController(() => d, { now: () => WINTER.getTime(), hostTz: () => "America/Los_Angeles" });
+    await tc.setConfig(cfg({ source: "system", rate: "1x", timezone: "Asia/Tokyo", hour24: true }));
+    expect(d.offsets).toEqual([540]);
+    expect(d.fmt).toBe(true);
+    tc.stop();
+  });
+
+  it("reassert force-re-pushes the current offset (heals a clobber)", async () => {
+    const d = fakeDriver();
+    const tc = makeTimeController(() => d, { now: () => WINTER.getTime(), hostTz: () => "America/Los_Angeles" });
+    await tc.setConfig(cfg({ source: "system", timezone: "Asia/Tokyo" }));
+    await tc.reassert();
+    expect(d.offsets).toEqual([540, 540]);
+    tc.stop();
+  });
+
+  it("a frozen custom config advances its pushed offset as real time passes", async () => {
+    const d = fakeDriver();
+    let t = WINTER.getTime();
+    const tc = makeTimeController(() => d, { now: () => t, hostTz: () => "America/Los_Angeles" });
+    await tc.setConfig(cfg({ source: "custom", rate: "frozen", customWallMs: t + 3600_000 })); // +60 min
+    expect(d.offsets).toEqual([60]);
+    t += 5 * 60_000;          // 5 real minutes pass
+    await tc.reassert();      // (the 1 s timer would do this; reassert exercises the recompute)
+    expect(d.offsets).toEqual([60, 55]); // offset dropped 5 → displayed minute held
     tc.stop();
   });
 });

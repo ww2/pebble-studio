@@ -1,13 +1,49 @@
 export type TimeSource = "system" | "custom";
+export type Rate = "frozen" | "1x" | "2x" | "4x" | "10x";
 
-/** Internal stepping state: a wall-clock anchor (as a UTC epoch) advancing at `multiplier`. */
-export interface TimeState {
+/** Virtual-clock multiplier per rate. 0 = frozen, 1 = real-time, N = N× faster. */
+export const RATE_MULT: Record<Rate, number> = { frozen: 0, "1x": 1, "2x": 2, "4x": 4, "10x": 10 };
+
+/**
+ * EMULATOR TIME CONTRACT (verified empirically against qemu-pebble + pebble-tool
+ * v5.0.37 / SDK 4.9.169 — see memory `pebble-emu-time-mechanism`):
+ *
+ *   - The qemu RTC is slaved to the HOST wall-clock UTC. A pushed absolute time is
+ *     IGNORED — both SetUTC.unix_time AND SetLocaltime are no-ops (the clock stays
+ *     at host UTC, ticking 1×). We can NOT set absolute time.
+ *   - The firmware DOES honor `utc_offset` (Int16 minutes): displayed local =
+ *     host_UTC + utc_offset. (Verified: +540 → Tokyo, −240 → New York.)
+ *   - pypkjs (the phone bridge we push through) serves ONE client at a time, so a
+ *     PERSISTENT pusher would starve the app's button/screenshot commands. We
+ *     therefore push via SHORT-LIVED connections (driver.setTzOffset), and only
+ *     when the integer offset actually changes — leaving the bridge free between.
+ *
+ * The single lever is `utc_offset`. We model a virtual clock V(t)=base+rate·(t−anchor)
+ * and, on a 1 s main-process timer, push offset=round((V−host_UTC)/60) whenever that
+ * minute value changes. Consequences:
+ *   - System   → constant host offset (no timer churn).
+ *   - Timezone → constant zone offset.
+ *   - Custom 1× → constant (entered − now); shows the entered time, drifts at 1×.
+ *   - Custom Frozen → offset decrements ~1/min so the displayed minute holds.
+ *   - Custom 2×/4×/10× → offset grows so the display fast-forwards.
+ * Minute granularity means SECONDS always come from the host (can't be frozen), and
+ * |offset| ≤ 32767 min caps absolute displacement at ~±22.7 days. Resets on reboot.
+ */
+export interface TimeConfig {
   source: TimeSource;
-  multiplier: number;      // 0=frozen, 1,2,4,10
-  timezone: string;        // IANA name
-  anchorUtcSec: number;    // displayed wall-clock at anchorRealMs, encoded as a UTC epoch
-  anchorRealMs: number;    // real wall-clock (Date.now) when the anchor was set
+  rate: Rate;
+  timezone: string;     // IANA name. System: the host zone. Timezone mode: a chosen zone.
+  hour24: boolean;
+  customWallMs: number; // custom mode: the entered wall-clock as a UTC-naive epoch ms (Date.UTC).
 }
+
+/** SetUTC.utc_offset is an Int16 (minutes) → ~±22.7 days of shift. */
+export const OFFSET_MIN_MINUTES = -32767;
+export const OFFSET_MAX_MINUTES = 32767;
+
+export const DEFAULT_TIME_CONFIG: TimeConfig = {
+  source: "system", rate: "1x", timezone: "UTC", hour24: false, customWallMs: 0,
+};
 
 /** Minutes east of UTC for `tz` at instant `at`. Invalid zones → 0. (Pure; uses Intl.) */
 export function tzOffsetMinutes(tz: string, at: Date): number {
@@ -26,29 +62,6 @@ export function tzOffsetMinutes(tz: string, at: Date): number {
   }
 }
 
-/** The epoch (seconds) to send via `emu-set-time <epoch> --utc` at real time `nowMs`. */
-export function computeTargetEpochSec(st: TimeState, nowMs: number): number {
-  if (st.multiplier === 0) return st.anchorUtcSec; // frozen
-  const elapsedSec = (nowMs - st.anchorRealMs) / 1000;
-  return Math.floor(st.anchorUtcSec + elapsedSec * st.multiplier);
-}
-
-export type Rate = "frozen" | "1x" | "2x" | "4x" | "10x";
-
-export interface TimeConfig {
-  source: TimeSource;
-  rate: Rate;
-  timezone: string;
-  hour24: boolean;
-  customWallMs: number; // when source==="custom": the wall-clock the user entered, as a UTC-naive epoch ms
-}
-
-const RATE_MULT: Record<Rate, number> = { frozen: 0, "1x": 1, "2x": 2, "4x": 4, "10x": 10 };
-
-export const DEFAULT_TIME_CONFIG: TimeConfig = {
-  source: "system", rate: "1x", timezone: "UTC", hour24: false, customWallMs: 0,
-};
-
 /** Pick the host IANA zone; fall back to PST when empty or a bare "UTC". */
 export function detectHostTimezone(get: () => string = () => Intl.DateTimeFormat().resolvedOptions().timeZone): string {
   const tz = (get() || "").trim();
@@ -56,37 +69,36 @@ export function detectHostTimezone(get: () => string = () => Intl.DateTimeFormat
   return tz;
 }
 
+function clampOffset(min: number): number {
+  return Math.max(OFFSET_MIN_MINUTES, Math.min(OFFSET_MAX_MINUTES, Math.round(min)));
+}
+
 /**
- * Build the stepping anchor from a config at real time `nowMs`.
- *
- * Firmware offset contract: in practice the emulator firmware renders the pushed
- * epoch through the HOST's local UTC offset — it does NOT treat `--utc` as
- * offset 0 (that assumption put the watch a full host-offset off, e.g. −5h).
- * So we compute the wall-clock we want *displayed* and subtract the host offset
- * once; the firmware adds it back, landing on the intended time. Consequences:
- *   - System mode (cfg.timezone === host): nets out to plain true UTC.
- *   - Timezone mode (cfg.timezone === some zone Z): shifts by (Z − host).
- *   - Custom mode: the entered host-local wall-clock, minus the host offset.
- * `hostTz` is injectable so the math is deterministic under test.
+ * The `utc_offset` (minutes) to display the configured time at real instant `nowMs`.
+ * For non-1× custom rates this is time-varying (the virtual clock); for everything
+ * else it is constant. `anchorMs` is the real time the config was applied (so the
+ * virtual clock advances from there). `hostTz` is injectable for tests.
  */
-export function anchorFor(
+export function offsetMinutesFor(
   cfg: TimeConfig,
   nowMs: number,
   hostTz: string = detectHostTimezone(),
-): TimeState {
-  const multiplier = RATE_MULT[cfg.rate];
-  const at = new Date(nowMs);
-  const hostOffsetSec = tzOffsetMinutes(hostTz, at) * 60;
-  let anchorUtcSec: number;
-  if (cfg.source === "system") {
-    // Desired display = live wall-clock in cfg.timezone (host for System mode, a
-    // chosen zone for Timezone mode). Minus the host offset the firmware re-adds.
-    anchorUtcSec = Math.floor(nowMs / 1000) + tzOffsetMinutes(cfg.timezone, at) * 60 - hostOffsetSec;
-  } else {
-    // Desired display = the entered host-local wall-clock. Minus the host offset.
-    anchorUtcSec = Math.floor(cfg.customWallMs / 1000) - hostOffsetSec;
+  anchorMs: number = nowMs,
+): number {
+  void hostTz; // System & Timezone both encode the desired zone in cfg.timezone.
+  if (cfg.source === "custom") {
+    // virtual(now) = entered + rate·(elapsed since apply); display = host_UTC + offset,
+    // host_UTC = now, so offset = virtual − now.
+    const mult = RATE_MULT[cfg.rate];
+    const virtualMs = cfg.customWallMs + mult * (nowMs - anchorMs);
+    return clampOffset((virtualMs - nowMs) / 60000);
   }
-  return { source: cfg.source, multiplier, timezone: cfg.timezone, anchorUtcSec, anchorRealMs: nowMs };
+  return clampOffset(tzOffsetMinutes(cfg.timezone, new Date(nowMs)));
+}
+
+/** Does this config use a time-varying offset (needs the 1 s pusher)? */
+export function isVirtualClock(cfg: TimeConfig): boolean {
+  return cfg.source === "custom" && RATE_MULT[cfg.rate] !== 1;
 }
 
 /** Watch time differs from plain host system time? (drives the renderer badge.) */
@@ -95,7 +107,8 @@ export function isNonSystemTime(cfg: TimeConfig, hostTz: string): boolean {
 }
 
 interface TimeDriver {
-  setTime(value: string, opts?: { utc?: boolean }): Promise<void>;
+  /** Push a UTC offset (minutes) via a short-lived raw SetUTC. */
+  setTzOffset(offsetMin: number): Promise<void>;
   timeFormat(hour24: boolean): Promise<void>;
 }
 
@@ -104,11 +117,14 @@ export interface TimeController {
   getConfig(): TimeConfig;
   /** Re-assert current config on the (re)booted emulator. */
   applyAll(): Promise<void>;
+  /** Force-push the current offset after a command that may have reset it (every
+   * pebble command re-syncs host time on connect). Heals the clobber immediately. */
+  reassert(): Promise<void>;
   stop(): void;
 }
 
-const TICK_MS = 1000;
-const RESYNC_MS = 30_000;
+/** How often the virtual-clock pusher recomputes (it only sends on minute change). */
+const VCLOCK_TICK_MS = 1000;
 
 export function makeTimeController(
   getDriver: () => TimeDriver | null,
@@ -117,56 +133,59 @@ export function makeTimeController(
   const now = deps.now ?? (() => Date.now());
   const hostTz = deps.hostTz ?? (() => detectHostTimezone());
   let cfg: TimeConfig = { ...DEFAULT_TIME_CONFIG };
-  let state: TimeState = anchorFor(cfg, now(), hostTz());
+  let anchorMs = now();           // real time the current cfg was applied
+  let lastPushed: number | null = null;  // last offset minutes actually sent
   let timer: ReturnType<typeof setInterval> | null = null;
-  let lastSyncMs = 0;
   let pushing = false;
 
-  async function push(): Promise<void> {
+  /** Send the offset for instant `t` if it differs from the last sent value. */
+  async function push(force: boolean): Promise<void> {
     if (pushing) return;
     pushing = true;
     try {
       const d = getDriver();
       if (!d) return;
-      const epoch = computeTargetEpochSec(state, now());
-      await d.setTime(String(epoch), { utc: true });
-    } catch { /* patched CLI may be absent; degrade silently */ }
+      const off = offsetMinutesFor(cfg, now(), hostTz(), anchorMs);
+      if (!force && off === lastPushed) return; // no minute change → leave bridge free
+      await d.setTzOffset(off);
+      lastPushed = off;
+    } catch { /* tool/emulator may be absent; degrade silently */ }
     finally { pushing = false; }
   }
 
-  function syncTimer(): void {
-    // Frozen (mult 0) and acceleration (mult>1) need the ~1s loop. Plain 1x lets
-    // the watch RTC tick on its own; we only resync occasionally for drift.
-    const needsFastLoop = state.multiplier !== 1;
+  function clearTimer(): void {
     if (timer) { clearInterval(timer); timer = null; }
-    if (needsFastLoop) {
-      timer = setInterval(() => void push(), TICK_MS);
-    } else {
-      timer = setInterval(() => {
-        if (now() - lastSyncMs >= RESYNC_MS) { lastSyncMs = now(); void push(); }
-      }, TICK_MS);
-    }
+  }
+
+  function syncTimer(): void {
+    clearTimer();
+    // Only a virtual clock needs periodic re-pushing (offset changes over time).
+    // Static modes hold a constant offset; clobbers are healed by reassert().
+    if (isVirtualClock(cfg)) timer = setInterval(() => void push(false), VCLOCK_TICK_MS);
+  }
+
+  /** Apply the current cfg: set the 12/24h format and push the initial offset. */
+  async function apply(): Promise<void> {
+    anchorMs = now();
+    lastPushed = null;
+    const d = getDriver();
+    if (d) { try { await d.timeFormat(cfg.hour24); } catch { /* ignore */ } }
+    await push(true);
+    syncTimer();
   }
 
   return {
     getConfig: () => ({ ...cfg }),
     async setConfig(next: TimeConfig): Promise<void> {
       cfg = { ...next };
-      state = anchorFor(cfg, now(), hostTz());
-      lastSyncMs = now();
-      const d = getDriver();
-      if (d) { try { await d.timeFormat(cfg.hour24); } catch { /* ignore */ } }
-      await push();
-      syncTimer();
+      await apply();
     },
     async applyAll(): Promise<void> {
-      state = anchorFor(cfg, now(), hostTz());
-      lastSyncMs = now();
-      const d = getDriver();
-      if (d) { try { await d.timeFormat(cfg.hour24); } catch { /* ignore */ } }
-      await push();
-      syncTimer();
+      await apply();
     },
-    stop(): void { if (timer) { clearInterval(timer); timer = null; } },
+    async reassert(): Promise<void> {
+      await push(true);
+    },
+    stop(): void { clearTimer(); },
   };
 }

@@ -93,6 +93,10 @@ export class WslDriver implements BackendDriver {
     return this.inner.setTime(value, opts);
   }
 
+  async setTzOffset(offsetMin: number): Promise<void> {
+    return this.inner.setTzOffset(offsetMin);
+  }
+
   async timeFormat(hour24: boolean): Promise<void> {
     return this.inner.timeFormat(hour24);
   }

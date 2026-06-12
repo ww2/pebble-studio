@@ -344,7 +344,8 @@ export class SettingsPane {
     this.timeInput.className = "settings-watch-select";
     timeControl.append(timeInputLabel, this.timeInput);
 
-    // Rate dropdown (Frozen / 1× / 2× / 4× / 10×).
+    // Rate dropdown (Custom only): Frozen / 1× / 2× / 4× / 10×. Non-1× rates are
+    // driven by the virtual-clock daemon (see timeController).
     const rateControl = document.createElement("label");
     rateControl.className = "settings-watch-control";
     const rateLabel = document.createElement("span");
@@ -392,6 +393,7 @@ export class SettingsPane {
       (on) => {
         this.hour24 = on;
         localStorage.setItem(TIME_HOUR24_KEY, on ? "true" : "false");
+        this.applyHour24ToInput();
         this.timeDirty = true;
         this.renderTimeStatus();
       },
@@ -495,7 +497,9 @@ export class SettingsPane {
     const timeNote = document.createElement("p");
     timeNote.className = "settings-row-desc type-caption";
     timeNote.textContent =
-      "Speeding up time only fast-forwards clock-driven display (hands, date, ticks), not app animations.";
+      "The emulator's clock is slaved to your computer. Timezone shifts the displayed time live; " +
+      "Custom sets the entered time and Frozen/2×/4×/10× hold or fast-forward it. Limits: seconds " +
+      "still come from the host, dates must be within ~22 days of today, and it resets on reboot.";
 
     time.append(
       timeHeading, sourceControl, dateControl, timeControl, rateControl, tzControl,
@@ -651,10 +655,11 @@ export class SettingsPane {
       this.timeInput.value = localStorage.getItem(TIME_CUSTOM_TIME_KEY) ?? stored.time;
       this.rateSelect.value = localStorage.getItem(TIME_RATE_KEY) ?? "1x";
       this.hour24 = localStorage.getItem(TIME_HOUR24_KEY) === "true";
+      this.applyHour24ToInput();
       // Time source always starts at System on launch — a persisted Custom time
-      // (often a frozen, now-stale timestamp) shouldn't silently drive the watch
-      // across restarts. The custom field values above stay populated so switching
-      // to Custom restores the last-used date/time/rate/timezone.
+      // (often a now-stale timestamp) shouldn't silently drive the watch across
+      // restarts. The custom field values above stay populated so switching to
+      // Custom restores the last-used date/time/timezone.
       this.sourceSelect.value = "system";
       localStorage.setItem(TIME_SOURCE_KEY, "system");
       this.tzSelect.value = TZ_SYSTEM;
@@ -674,12 +679,19 @@ export class SettingsPane {
     return this.hour24;
   }
 
+  /** Drive the native time input's 12/24h display off the toggle. Chromium renders
+   * `<input type=time>` per the element's `lang`: en-GB → 24h (no AM/PM), en-US →
+   * 12h. (The control has no direct 12/24 attribute.) */
+  private applyHour24ToInput(): void {
+    this.timeInput.lang = this.hour24 ? "en-GB" : "en-US";
+  }
+
   /**
    * Enable/disable + show/hide controls for the active Time source mode, so the
    * UI only ever exposes inputs that make sense:
    *  - System: everything greyed; no buttons (auto-applies).
-   *  - Custom: date/time/rate enabled, timezone greyed (host-local); Run + Reset.
-   *  - Timezone: timezone enabled, date/time/rate greyed; "Reset to host zone".
+   *  - Custom: date/time enabled, timezone greyed (host-local); Run + Reset.
+   *  - Timezone: timezone enabled, date/time greyed; "Reset to host zone".
    */
   private syncTimeEnabled(): void {
     const mode = this.sourceSelect.value;
@@ -704,7 +716,7 @@ export class SettingsPane {
     this.timeDirty = false;
   }
 
-  /** Apply System time (1× host clock) — called from source→system & Reset. */
+  /** Apply System time (host clock) — called from source→system & Reset. */
   private applySystem(): void {
     localStorage.setItem(TIME_SOURCE_KEY, "system");
     this.applyConfig({
@@ -721,8 +733,8 @@ export class SettingsPane {
   private applyZone(): void {
     const timezone = this.tzSelect.value === TZ_SYSTEM ? detectHostTimezone() : this.tzSelect.value;
     localStorage.setItem(TIME_SOURCE_KEY, "zone");
-    // Encoded as system-source with a chosen zone; the timeController offset math
-    // renders live wall-clock in `timezone` (see anchorFor's firmware contract).
+    // Encoded as system-source with a chosen zone; the timeController sets the
+    // watch's utc_offset to that zone so it shows the zone's live wall clock.
     this.applyConfig({
       ...DEFAULT_TIME_CONFIG,
       source: "system",
@@ -792,18 +804,24 @@ export class SettingsPane {
     const d = new Date(ms);
     const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let h = d.getUTCHours();
-    const ampm = h >= 12 ? "PM" : "AM";
-    h = h % 12;
-    if (h === 0) h = 12;
     const mm = String(d.getUTCMinutes()).padStart(2, "0");
-    const when =
-      `${months[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()} ${h}:${mm} ${ampm}`;
-    const rateLabels: Record<string, string> = {
-      frozen: "Frozen", "1x": "1×", "2x": "2×", "4x": "4×", "10x": "10×",
-    };
-    const rateLabel = rateLabels[this.rateSelect.value] ?? this.rateSelect.value;
-    el.textContent = `● Running — ${when} · ${rateLabel}`;
+    let timeStr: string;
+    if (this.hour24) {
+      timeStr = `${String(d.getUTCHours()).padStart(2, "0")}:${mm}`;
+    } else {
+      let h = d.getUTCHours();
+      const ampm = h >= 12 ? "PM" : "AM";
+      h = h % 12;
+      if (h === 0) h = 12;
+      timeStr = `${h}:${mm} ${ampm}`;
+    }
+    const when = `${months[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()} ${timeStr}`;
+    const rate = this.rateSelect.value;
+    const suffix =
+      rate === "frozen" ? "frozen"
+      : rate === "1x" ? "ticking at 1×"
+      : `running at ${rate}`;
+    el.textContent = `● ${when} · ${suffix}`;
     el.classList.add("settings-time-status--running");
     el.classList.remove("settings-time-status--edited");
   }

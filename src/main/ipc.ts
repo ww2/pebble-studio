@@ -6,7 +6,7 @@ import type { BackendDriver } from "./backend/BackendDriver.js";
 import type { BootToken } from "./backend/bootEmulator.js";
 import type { DriverKind } from "./backend/driverFactory.js";
 import { createBacklightController } from "./backend/backlight.js";
-import { makeTimeController, type TimeConfig } from "./backend/timeController.js";
+import { makeTimeController, isNonSystemTime, detectHostTimezone, type TimeConfig } from "./backend/timeController.js";
 import type { PlatformId, ButtonId } from "../shared/types.js";
 import { LibraryStore } from "./library.js";
 
@@ -97,6 +97,14 @@ export function registerIpc(): void {
   // Time controller (Task 5). Uses a getter so it always references the current driver.
   const time = makeTimeController(() => driver);
 
+  // Every `pebble` command re-syncs HOST time to the watch on connect (pebble-tool
+  // commands/base.py post_connect), clobbering a custom/timezone offset. After any
+  // discrete command that connects, re-assert the active offset (fire-and-forget;
+  // skipped when showing plain host/system time so we don't spawn needlessly).
+  const reassertTime = (): void => {
+    if (isNonSystemTime(time.getConfig(), detectHostTimezone())) void time.reassert();
+  };
+
   ipcMain.handle("lib:add", async (_e, pbwPath: string) => { library.add(pbwPath); return library.list(); });
   ipcMain.handle("lib:list", async () => library.list());
   ipcMain.handle("lib:remove", async (_e, p: string) => { library.remove(p); return library.list(); });
@@ -185,11 +193,21 @@ export function registerIpc(): void {
   ipcMain.handle("emu:install", async (_e, pbwPath: string) => {
     await driver!.install(pbwPath);
     loaded.add(pbwPath);
+    reassertTime();
   });
-  ipcMain.handle("emu:button", async (_e, id: ButtonId) => driver!.button(id, "press"));
-  ipcMain.handle("emu:accelTap", async () => driver!.accelTap());
+  ipcMain.handle("emu:button", async (_e, id: ButtonId) => {
+    await driver!.button(id, "press");
+    reassertTime();
+  });
+  ipcMain.handle("emu:accelTap", async () => {
+    await driver!.accelTap();
+    reassertTime();
+  });
   ipcMain.handle("emu:screenshot", async (_e, out: string) => driver!.screenshot(out));
-  ipcMain.handle("emu:timelineQuickView", async (_e, on: boolean) => driver!.timelineQuickView(on));
+  ipcMain.handle("emu:timelineQuickView", async (_e, on: boolean) => {
+    await driver!.timelineQuickView(on);
+    reassertTime();
+  });
 
   ipcMain.handle("dialog:pickDirectory", async (): Promise<string | null> => {
     const result = await dialog.showOpenDialog({
