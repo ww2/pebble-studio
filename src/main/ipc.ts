@@ -4,10 +4,19 @@ import fs from "node:fs/promises";
 import { createDriver } from "./backend/createDriver.js";
 import type { BackendDriver } from "./backend/BackendDriver.js";
 import type { BootToken } from "./backend/bootEmulator.js";
+import type { DriverKind } from "./backend/driverFactory.js";
+import { createBacklightController } from "./backend/backlight.js";
 import type { PlatformId, ButtonId } from "../shared/types.js";
 import { LibraryStore } from "./library.js";
 
 let driver: BackendDriver | null = null;
+
+/**
+ * The active driver kind (native | wsl), recorded at `backend:init`. The backlight
+ * controller uses it to pick the matching Shell (native vs wsl) for reading the
+ * emulator state file, mirroring how createDriver decides.
+ */
+let driverKind: DriverKind | null = null;
 
 /**
  * The cancellation token for the current/most-recent boot. `emu:start` creates a
@@ -48,11 +57,38 @@ export function resolveCapturePath(dir: string, name: string): string {
   return out;
 }
 
+/**
+ * Find the highest existing capture index for a base (Task G).
+ *
+ * Pure (no fs) so it is unit-testable. Scans `existingNames` for files matching
+ * `^<base>-(\d+)\.<ext>$` (ext + base matched case-insensitively, base regex-
+ * escaped) and returns the highest index found, or -1 when none match. The next
+ * filename is then `<base>-<nextIndexedName(...) + 1>.<ext>` (so it starts at 1).
+ */
+export function nextIndexedName(existingNames: string[], base: string, ext: string): number {
+  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^${escaped}-(\\d+)\\.${ext}$`, "i");
+  let max = -1;
+  for (const name of existingNames) {
+    const m = re.exec(name);
+    if (m) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > max) max = n;
+    }
+  }
+  return max;
+}
+
 export function registerIpc(): void {
   const library = new LibraryStore(path.join(app.getPath("userData"), "library.json"));
   // Default capture target is the user's Downloads; settings:setCaptureDir can
   // repoint it. Resolved here (not at module load) so app paths are ready.
   captureDir = path.resolve(app.getPath("downloads"));
+
+  // Backlight keepalive (Task K). It reads the qemu monitor port through the
+  // Shell matching the active driver kind (recorded at backend:init), so it works
+  // on a Windows+WSL host too.
+  const backlight = createBacklightController(() => driverKind);
 
   ipcMain.handle("lib:add", async (_e, pbwPath: string) => { library.add(pbwPath); return library.list(); });
   ipcMain.handle("lib:list", async () => library.list());
@@ -89,14 +125,17 @@ export function registerIpc(): void {
   ipcMain.handle("backend:init", async () => {
     const { driver: d, kind } = await createDriver();
     driver = d;
+    driverKind = kind;
     console.log(`[backend] initialized kind=${kind}`);
     return { kind };
   });
-  ipcMain.handle("emu:start", async (_e, id: PlatformId) => {
+  ipcMain.handle("emu:start", async (e, id: PlatformId) => {
     // Fresh token per boot, stored as current so abort/stop can cancel it.
     const token: BootToken = { cancelled: false };
     currentBootToken = token;
-    return driver!.start(id, token);
+    // Forward each boot step to the renderer (diagnostic boot notes, Task J).
+    const onStep = (msg: string): void => { e.sender.send("emu:boot-progress", msg); };
+    return driver!.start(id, token, onStep);
   });
   ipcMain.handle("emu:abort", async () => {
     // Cancel any in-flight boot so its wait loops bail promptly. No-op (no throw)
@@ -104,12 +143,20 @@ export function registerIpc(): void {
     if (currentBootToken) currentBootToken.cancelled = true;
   });
   ipcMain.handle("emu:stop", async () => {
+    // Stop the backlight keepalive first so we don't tap a dead emulator.
+    backlight.stop();
     // Cancel the in-flight boot BEFORE teardown so a mid-boot wait aborts and the
     // killAll sweep reliably reaps qemu/websockify/emu-control/pypkjs.
     if (currentBootToken) currentBootToken.cancelled = true;
     await driver!.stop();
     loaded.clear();
   });
+
+  // Backlight keepalive toggles (Task K). "Always on" is independent of captures;
+  // "capture hold" is held only for a capture's duration. The interval runs while
+  // either is set and stops when both clear (or on emu:stop above).
+  ipcMain.handle("emu:backlightAlways", async (_e, on: boolean) => { backlight.setAlways(on); });
+  ipcMain.handle("emu:backlightCaptureHold", async (_e, on: boolean) => { backlight.setCaptureHold(on); });
   ipcMain.handle("emu:install", async (_e, pbwPath: string) => {
     await driver!.install(pbwPath);
     loaded.add(pbwPath);
@@ -136,6 +183,17 @@ export function registerIpc(): void {
       throw new Error(`capture dir does not exist or is not a directory: ${dir}`);
     }
     captureDir = path.resolve(dir);
+  });
+
+  ipcMain.handle("capture:nextName", async (_e, base: string, ext: "png" | "gif") => {
+    // Sanitize the base (allow [\w.\-] only) so the filename + scan regex are safe.
+    const safeBase = String(base).replace(/[^\w.\-]/g, "");
+    const safeExt = ext === "gif" ? "gif" : "png";
+    const dir = captureDir ?? path.resolve(app.getPath("downloads"));
+    // Scan the configured capture dir; an unreadable dir just means "start at 1".
+    const names = await fs.readdir(dir).catch(() => [] as string[]);
+    const max = nextIndexedName(names, safeBase, safeExt);
+    return `${safeBase}-${max + 1}.${safeExt}`;
   });
 
   ipcMain.handle("capture:save", async (_e, name: string, bytes: Uint8Array) => {

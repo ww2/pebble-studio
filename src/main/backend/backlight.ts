@@ -1,0 +1,155 @@
+import { connect as netConnect } from "node:net";
+import { makeNativeShell, makeWslShell, type Shell } from "./bootEmulator.js";
+import type { DriverKind } from "./driverFactory.js";
+
+/**
+ * Backlight keepalive (Task K).
+ *
+ * The qemu-pebble screen backlight dims after a few seconds. pebble-tool's GIF
+ * capture keeps it bright by tapping a button every second; we mirror that. While
+ * `always` OR `captureHold` is set, a ~1000ms interval:
+ *   1. reads the qemu HMP **monitor** port from /tmp/pb-emulator.json
+ *      (`<platform>.<version>.qemu.monitor`) — THROUGH the same Shell abstraction
+ *      bootEmulator uses, so it works on a Windows+WSL host where the file lives
+ *      in the WSL filesystem and Node (on Windows) can't read that POSIX path.
+ *   2. opens a TCP socket to 127.0.0.1:<monitor>, writes `sendkey left\n`
+ *      (a Back press = backlight wake), and closes.
+ *
+ * A Back press is harmless on a watchface but can navigate inside an app — that
+ * caveat is surfaced in the Settings UI, not here.
+ */
+
+const EMU_INFO_PATH = "/tmp/pb-emulator.json";
+const TICK_MS = 1000;
+
+/**
+ * Extract the qemu HMP monitor port from the emulator state file's JSON text.
+ *
+ * Pure (no fs / no shell) so it is unit-testable. The file shape is
+ *   { "<platform>": { "<version>": { "qemu": { "monitor": <port>, ... } } } }
+ * (e.g. `{ "basalt": { "4.9": { "qemu": { "monitor": 63215 } } } }`). We return
+ * the first live `monitor` port found, or null if the json is missing/malformed
+ * or has no monitor entry.
+ */
+export function parseMonitorPort(jsonText: string): number | null {
+  try {
+    const json = JSON.parse(jsonText) as Record<
+      string,
+      Record<string, { qemu?: { monitor?: number } }>
+    >;
+    for (const versions of Object.values(json)) {
+      if (!versions || typeof versions !== "object") continue;
+      for (const v of Object.values(versions)) {
+        const port = v?.qemu?.monitor;
+        if (typeof port === "number" && Number.isFinite(port)) return port;
+      }
+    }
+  } catch {
+    /* missing / partial / malformed json → no port */
+  }
+  return null;
+}
+
+/** Read the emulator state file through the shell and parse the monitor port. */
+async function readMonitorPort(shell: Shell): Promise<number | null> {
+  const { code, stdout } = await shell.run(`cat ${EMU_INFO_PATH} 2>/dev/null`);
+  if (code !== 0 || !stdout.trim()) return null;
+  return parseMonitorPort(stdout);
+}
+
+/** Open a TCP socket to the HMP monitor, send a Back press, then close. */
+function sendBackKey(port: number): Promise<void> {
+  return new Promise((resolve) => {
+    const sock = netConnect({ host: "127.0.0.1", port });
+    sock.setTimeout(1000);
+    const done = () => {
+      sock.destroy();
+      resolve();
+    };
+    sock.once("connect", () => {
+      // HMP command: `sendkey left` taps the Back button (backlight wake).
+      sock.write("sendkey left\n", () => {
+        // Give the monitor a beat to receive before we tear down the socket.
+        setTimeout(done, 50);
+      });
+    });
+    sock.once("error", done);
+    sock.once("timeout", done);
+  });
+}
+
+export interface BacklightController {
+  /** "Keep backlight on" — independent of captures. */
+  setAlways(on: boolean): void;
+  /** "Backlight during capture" — held only for the duration of a capture. */
+  setCaptureHold(on: boolean): void;
+  /** Stop the keepalive entirely (e.g. on emulator stop). Clears both flags. */
+  stop(): void;
+}
+
+/**
+ * Construct a BacklightController. The shell is chosen to mirror createDriver's
+ * native/wsl decision (passed in by the caller, which knows the active driver
+ * kind) so the monitor-port read works on the same host the emulator runs on.
+ *
+ * `shellFor` is injectable for tests; it defaults to the real native/wsl shells.
+ */
+export function createBacklightController(
+  getKind: () => DriverKind | null,
+  shellFor: (kind: DriverKind) => Shell = defaultShellFor,
+): BacklightController {
+  let always = false;
+  let captureHold = false;
+  let timer: ReturnType<typeof setInterval> | null = null;
+  // Guard so a slow tick (shell read + TCP) doesn't overlap the next interval.
+  let ticking = false;
+
+  async function tick(): Promise<void> {
+    if (ticking) return;
+    ticking = true;
+    try {
+      const kind = getKind();
+      if (!kind) return; // backend not initialized yet — skip this tick
+      const port = await readMonitorPort(shellFor(kind));
+      if (port == null) return; // json/monitor missing — skip silently
+      await sendBackKey(port);
+    } catch {
+      /* never let a tick crash the app — skip and try again next interval */
+    } finally {
+      ticking = false;
+    }
+  }
+
+  function sync(): void {
+    const wantActive = always || captureHold;
+    if (wantActive && timer == null) {
+      timer = setInterval(() => void tick(), TICK_MS);
+      // Fire once immediately so the backlight rises without a full tick's wait.
+      void tick();
+    } else if (!wantActive && timer != null) {
+      clearInterval(timer);
+      timer = null;
+    }
+  }
+
+  return {
+    setAlways(on: boolean): void {
+      always = on;
+      sync();
+    },
+    setCaptureHold(on: boolean): void {
+      captureHold = on;
+      sync();
+    },
+    stop(): void {
+      always = false;
+      captureHold = false;
+      sync();
+    },
+  };
+}
+
+/** Pick the native or wsl shell, mirroring how createDriver decides. */
+function defaultShellFor(kind: DriverKind): Shell {
+  return kind === "wsl" ? makeWslShell() : makeNativeShell();
+}

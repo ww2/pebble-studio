@@ -34,8 +34,9 @@ describe("WslDriver", () => {
     const d = new WslDriver({ run, boot, stop });
     const token = { cancelled: false };
     const ep = await d.start("basalt", token);
-    // The cancellation token threads through to the inner boot fn unchanged.
-    expect(boot).toHaveBeenCalledWith("basalt", token);
+    // The cancellation token threads through to the inner boot fn unchanged;
+    // onStep is undefined here.
+    expect(boot).toHaveBeenCalledWith("basalt", token, undefined);
     // WslDriver forces host back to localhost (WSL2 forwards to the Windows host).
     expect(ep.host).toBe("localhost");
     await d.stop();

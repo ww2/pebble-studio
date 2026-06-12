@@ -1,5 +1,5 @@
 import type { PlatformId, ButtonId, ButtonAction } from "../../shared/types.js";
-import type { BootToken } from "./bootEmulator.js";
+import type { BootToken, OnStep } from "./bootEmulator.js";
 
 export interface RunResult { code: number; stdout: string; stderr: string; }
 export type Runner = (cmd: string, args: string[], env?: Record<string, string>) => Promise<RunResult>;
@@ -8,8 +8,9 @@ export interface VncEndpoint { host: string; port: number; wsPath: string; }
 export interface BackendDriver {
   setPlatform(id: PlatformId): void;
   /** Boot the emulator. An optional cancellation token lets an in-flight boot
-   * abort promptly (the boot's wait loops check it). */
-  start(id: PlatformId, token?: BootToken): Promise<VncEndpoint>;
+   * abort promptly (the boot's wait loops check it). An optional `onStep` receives
+   * a label before each major boot step (for diagnostic boot notes). */
+  start(id: PlatformId, token?: BootToken, onStep?: OnStep): Promise<VncEndpoint>;
   stop(): Promise<void>;
   install(pbwPath: string): Promise<void>;
   button(id: ButtonId, action: ButtonAction): Promise<void>;

@@ -280,28 +280,45 @@ export function makeWslBootDeps(): SpawnDeps {
 
 const defaultDeps: SpawnDeps = makeNativeBootDeps();
 
+/**
+ * Optional progress callback. `bootEmulator` calls it with a short human label
+ * before each major step ("Killing stale emulator…", …, "Ready") so the renderer
+ * can surface verbose boot notes in diagnostic mode. Always optional; omitting it
+ * leaves the boot unchanged.
+ */
+export type OnStep = (msg: string) => void;
+
 export async function bootEmulator(
   platformId: PlatformId,
   deps: Partial<SpawnDeps> = {},
   token?: BootToken,
+  onStep?: OnStep,
 ): Promise<VncEndpoint> {
   const d: SpawnDeps = { ...defaultDeps, ...deps };
+  // Best-effort step notifier; never let a bad callback break the boot.
+  const step = (msg: string): void => { try { onStep?.(msg); } catch { /* ignore */ } };
 
   // Throw promptly if cancellation already happened (e.g. force-close fired
   // before/right after start). Each wait step below also rechecks the token.
   if (token?.cancelled) throw new BootAborted();
   // 1. Tear down any prior emulator so we own a clean stack.
+  step("Killing stale emulator…");
   await d.killAll();
   // 2. Make the tool's VNC keymap path valid.
+  step("Preparing keymap…");
   await d.ensureKeymap();
   // 3. Boot the full stack (qemu + pypkjs + websockify) under the pebble tool.
+  step("Launching qemu…");
   await d.bootControl(platformId);
   // 4. Wait for readiness: state file, raw RFB, and the websocket proxy. The
   //    token threads into each wait so a cancel interrupts the active loop.
+  step("Waiting for emulator state…");
   await d.waitForEmuInfo(platformId, 60_000, token);
+  step("Waiting for VNC…");
   await d.waitForPort("localhost", VNC_RFB_PORT, 60_000, token);
   await d.waitForPort("localhost", WS_PORT, 60_000, token);
 
+  step("Ready");
   return { host: "localhost", port: WS_PORT, wsPath: "/" };
 }
 

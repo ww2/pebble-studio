@@ -26,8 +26,9 @@ describe("NativeDriver", () => {
     const stop = vi.fn(async () => {});
     const d = new NativeDriver({ run, boot, stop });
     const ep = await d.start("basalt");
-    // start now threads an optional cancellation token through to boot.
-    expect(boot).toHaveBeenCalledWith("basalt", undefined);
+    // start now threads an optional cancellation token + onStep callback through
+    // to boot (both undefined here).
+    expect(boot).toHaveBeenCalledWith("basalt", undefined, undefined);
     expect(ep).toEqual({ host: "localhost", port: 6080, wsPath: "/" });
     await d.stop();
     expect(stop).toHaveBeenCalledOnce();
