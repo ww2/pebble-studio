@@ -6,6 +6,7 @@ import type { BackendDriver } from "./backend/BackendDriver.js";
 import type { BootToken } from "./backend/bootEmulator.js";
 import type { DriverKind } from "./backend/driverFactory.js";
 import { createBacklightController } from "./backend/backlight.js";
+import { makeTimeController, type TimeConfig } from "./backend/timeController.js";
 import type { PlatformId, ButtonId } from "../shared/types.js";
 import { LibraryStore } from "./library.js";
 
@@ -32,8 +33,11 @@ let currentBootToken: BootToken | null = null;
 let captureDir: string | null = null;
 
 /**
- * The set of .pbw paths currently installed on the running emulator.
- * Populated when install succeeds; cleared when the emulator is stopped or wiped.
+ * The set of .pbw paths currently installed on the emulator's on-disk data dir.
+ * Populated when install succeeds; cleared ONLY on a real wipe (loaded:clear).
+ * A plain stop/kill preserves installed apps on disk, so it must NOT clear this.
+ * Known limitation: a fresh app process starts with an empty set even if apps
+ * persist on disk from a previous run (no cross-process persistence by design).
  */
 const loaded = new Set<string>();
 
@@ -88,7 +92,10 @@ export function registerIpc(): void {
   // Backlight keepalive (Task K). It reads the qemu monitor port through the
   // Shell matching the active driver kind (recorded at backend:init), so it works
   // on a Windows+WSL host too.
-  const backlight = createBacklightController(() => driverKind);
+  const backlight = createBacklightController(() => driverKind, () => driver!.accelTap());
+
+  // Time controller (Task 5). Uses a getter so it always references the current driver.
+  const time = makeTimeController(() => driver);
 
   ipcMain.handle("lib:add", async (_e, pbwPath: string) => { library.add(pbwPath); return library.list(); });
   ipcMain.handle("lib:list", async () => library.list());
@@ -110,6 +117,7 @@ export function registerIpc(): void {
     // 3. Reboot the current platform clean — WITHOUT reinstalling library apps
     //    (that's what "clear" means: the watch starts fresh with no user apps).
     await driver!.start(platformId);
+    void time.applyAll(); // re-assert time settings on the clear-rebooted emulator (fire-and-forget)
     // loaded remains empty after the clear reboot.
   });
 
@@ -135,7 +143,9 @@ export function registerIpc(): void {
     currentBootToken = token;
     // Forward each boot step to the renderer (diagnostic boot notes, Task J).
     const onStep = (msg: string): void => { e.sender.send("emu:boot-progress", msg); };
-    return driver!.start(id, token, onStep);
+    const ep = await driver!.start(id, token, onStep);
+    void time.applyAll(); // re-assert time settings on the fresh emulator (fire-and-forget)
+    return ep;
   });
   ipcMain.handle("emu:abort", async () => {
     // Cancel any in-flight boot so its wait loops bail promptly. No-op (no throw)
@@ -143,13 +153,21 @@ export function registerIpc(): void {
     if (currentBootToken) currentBootToken.cancelled = true;
   });
   ipcMain.handle("emu:stop", async () => {
-    // Stop the backlight keepalive first so we don't tap a dead emulator.
+    // Stop the backlight keepalive and time controller first so we don't tap a dead emulator.
     backlight.stop();
+    time.stop();
     // Cancel the in-flight boot BEFORE teardown so a mid-boot wait aborts and the
     // killAll sweep reliably reaps qemu/websockify/emu-control/pypkjs.
     if (currentBootToken) currentBootToken.cancelled = true;
     await driver!.stop();
-    loaded.clear();
+    // NOTE: do NOT clear `loaded` here. A stop/kill (killAll) only reaps the
+    // qemu/websockify/pypkjs/emu-control processes + the state file — it does NOT
+    // delete installed apps, which persist on disk and are removed ONLY by
+    // `pebble wipe` (driver.wipe(), called from loaded:clear). Clearing the set on
+    // stop desynced it from disk: after a relaunch/force-close/model-switch the
+    // apps were still installed but `loaded` was empty, so loaded:list returned []
+    // and the renderer's "Clear emulator" button stayed disabled. The set now
+    // mirrors on-disk install state and is cleared only on a real wipe.
   });
 
   // Backlight keepalive toggles (Task K). "Always on" is independent of captures;
@@ -157,6 +175,13 @@ export function registerIpc(): void {
   // either is set and stops when both clear (or on emu:stop above).
   ipcMain.handle("emu:backlightAlways", async (_e, on: boolean) => { backlight.setAlways(on); });
   ipcMain.handle("emu:backlightCaptureHold", async (_e, on: boolean) => { backlight.setCaptureHold(on); });
+  // Selectable keepalive method (back | motion | off) + a manual one-shot pulse.
+  ipcMain.handle("emu:backlightMethod", async (_e, m: "back" | "motion" | "off") => { backlight.setMethod(m); });
+  ipcMain.handle("emu:backlightPulse", async () => { backlight.pulseOnce(); });
+
+  // Time control (Task 5): get/set persisted time config and re-apply on boot.
+  ipcMain.handle("time:get", async () => time.getConfig());
+  ipcMain.handle("time:set", async (_e, cfg: TimeConfig) => { await time.setConfig(cfg); });
   ipcMain.handle("emu:install", async (_e, pbwPath: string) => {
     await driver!.install(pbwPath);
     loaded.add(pbwPath);

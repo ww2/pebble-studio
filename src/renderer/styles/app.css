@@ -251,7 +251,7 @@ body {
   box-shadow: 0 0 0 1px var(--accent);
 }
 
-/* Acrylic flyout: translucent menu fill + backdrop blur (transient surface). */
+/* Opaque flyout: solid surface (no blur) — user preference. */
 .version-combo-popup {
   position: absolute;
   top: calc(100% + 6px);
@@ -261,14 +261,13 @@ body {
   max-height: 320px;
   overflow-y: auto;
   padding: 4px;
-  background: var(--menu-bg);
-  -webkit-backdrop-filter: blur(40px) saturate(170%);
-  backdrop-filter: blur(40px) saturate(170%);
+  background: var(--surface);
   color: var(--menu-text);
   border: 1px solid var(--menu-border);
   border-radius: var(--radius-card);
   box-shadow: var(--elev-3);
 }
+.version-combo-popup[hidden] { display: none; }
 .version-combo-option {
   display: flex;
   align-items: baseline;
@@ -673,7 +672,6 @@ body {
   color: var(--success);
   font-weight: 700;
   letter-spacing: 0.3px;
-  text-shadow: 0 0 6px color-mix(in srgb, var(--success) 45%, transparent);
 }
 
 .emu-caption {
@@ -681,6 +679,18 @@ body {
   color: var(--text-secondary);
   font-weight: 600;
   letter-spacing: 0.2px;
+  padding-bottom: 12px;
+}
+
+.emu-time-badge {
+  font-size: var(--type-caption);
+  font-weight: 600;
+  color: var(--text-secondary);
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-secondary) 24%, transparent);
+  white-space: nowrap;
 }
 
 .emu-actions {

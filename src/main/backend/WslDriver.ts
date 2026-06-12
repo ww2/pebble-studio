@@ -89,8 +89,12 @@ export class WslDriver implements BackendDriver {
     return this.inner.accelTap();
   }
 
-  async setTime(value: string | "system"): Promise<void> {
-    return this.inner.setTime(value);
+  async setTime(value: string, opts?: { utc?: boolean }): Promise<void> {
+    return this.inner.setTime(value, opts);
+  }
+
+  async timeFormat(hour24: boolean): Promise<void> {
+    return this.inner.timeFormat(hour24);
   }
 
   async bluetooth(connected: boolean): Promise<void> {

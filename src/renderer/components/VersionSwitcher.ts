@@ -67,13 +67,13 @@ export class VersionSwitcher {
       id.textContent = p.id;
       opt.append(name, id);
 
-      opt.addEventListener("click", () => this.choose(i));
+      opt.addEventListener("click", (e) => { e.stopPropagation(); this.choose(i); });
       opt.addEventListener("mousemove", () => this.setActive(i));
       popup.appendChild(opt);
       this.options.push(opt);
     });
 
-    button.addEventListener("click", () => this.toggle());
+    button.addEventListener("click", (e) => { e.stopPropagation(); this.toggle(); });
     button.addEventListener("keydown", (e) => this.onKeydown(e));
     document.addEventListener("click", (e) => {
       if (this.open && !root.contains(e.target as Node)) this.close();

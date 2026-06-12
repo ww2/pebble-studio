@@ -25,6 +25,7 @@ export class CaptureBar {
   private readonly durationSelect: HTMLSelectElement;
   private readonly shotBtn: HTMLButtonElement;
   private readonly recBtn: HTMLButtonElement;
+  private readonly lightBtn: HTMLButtonElement;
   private readonly status: HTMLSpanElement;
 
   private recording = false;
@@ -85,6 +86,15 @@ export class CaptureBar {
     this.recBtn.textContent = "Record GIF";
     this.recBtn.addEventListener("click", () => void this.toggleRecord());
 
+    // "Light now": fire a single backlight pulse on demand (always available,
+    // independent of the automatic capture keepalive).
+    this.lightBtn = document.createElement("button");
+    this.lightBtn.type = "button";
+    this.lightBtn.className = "capture-btn";
+    this.lightBtn.dataset.act = "light";
+    this.lightBtn.textContent = "Light now";
+    this.lightBtn.addEventListener("click", () => void window.studio.backlightPulse());
+
     // Status span
     this.status = document.createElement("span");
     this.status.className = "capture-status";
@@ -95,6 +105,7 @@ export class CaptureBar {
     this.el.appendChild(this.durationSelect);
     this.el.appendChild(this.shotBtn);
     this.el.appendChild(this.recBtn);
+    this.el.appendChild(this.lightBtn);
     this.el.appendChild(this.status);
   }
 

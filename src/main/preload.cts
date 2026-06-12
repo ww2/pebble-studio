@@ -28,6 +28,16 @@ const studio = {
     ipcRenderer.invoke("emu:backlightAlways", on),
   backlightCaptureHold: (on: boolean): Promise<void> =>
     ipcRenderer.invoke("emu:backlightCaptureHold", on),
+  backlightMethod: (m: string): Promise<void> =>
+    ipcRenderer.invoke("emu:backlightMethod", m),
+  backlightPulse: (): Promise<void> => ipcRenderer.invoke("emu:backlightPulse"),
+  // Time control (Task 5).
+  getTimeConfig: () => ipcRenderer.invoke("time:get"),
+  setTimeConfig: (cfg: unknown) => ipcRenderer.invoke("time:set", cfg),
+  // Background-throttling toggle (Task 7). Pass false to keep full-speed when
+  // unfocused (the default); pass true to allow Electron's normal throttling.
+  setBackgroundThrottling: (throttle: boolean): Promise<void> =>
+    ipcRenderer.invoke("app:setBackgroundThrottling", throttle),
   // Subscribe to boot-progress notes (Task J). Returns a disposer that removes
   // the listener.
   onBootProgress: (cb: (msg: string) => void): (() => void) => {

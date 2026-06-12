@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from "electron";
+import { app, BrowserWindow, ipcMain } from "electron";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { registerIpc } from "./ipc.js";
@@ -75,6 +75,10 @@ function createWindow(): void {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      // Keep the renderer running at full rate even when the window loses focus.
+      // A runtime toggle (app:setBackgroundThrottling) lets the user re-enable
+      // throttling from Settings if they want to conserve CPU when unfocused.
+      backgroundThrottling: false,
     },
   });
 
@@ -83,6 +87,15 @@ function createWindow(): void {
   mainWindow = win;
   win.on("closed", () => {
     if (mainWindow === win) mainWindow = null;
+  });
+
+  // Runtime background-throttling toggle. Guard against duplicate registration
+  // if createWindow is ever called more than once (e.g. macOS re-activate).
+  ipcMain.removeHandler("app:setBackgroundThrottling");
+  ipcMain.handle("app:setBackgroundThrottling", (_e, throttle: boolean) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.setBackgroundThrottling(throttle);
+    }
   });
 
   // Swap splash -> main once the renderer is ready. Guard against the splash

@@ -7,6 +7,7 @@ import { NavRail } from "./components/NavRail.js";
 import { SettingsPane } from "./components/SettingsPane.js";
 import type { PlatformId } from "../shared/types.js";
 import { getPlatform, PLATFORMS } from "../main/backend/emulatorRegistry.js";
+import { detectHostTimezone, type TimeConfig } from "../main/backend/timeController.js";
 
 interface StudioApi {
   initBackend(): Promise<{ kind: string }>;
@@ -33,6 +34,12 @@ interface StudioApi {
   nextCaptureName(base: string, ext: string): Promise<string>;
   backlightAlways(on: boolean): Promise<void>;
   backlightCaptureHold(on: boolean): Promise<void>;
+  backlightMethod(m: string): Promise<void>;
+  backlightPulse(): Promise<void>;
+  // v0.0.7: time control (Task 5) and background-throttling toggle (Task 7).
+  getTimeConfig(): Promise<unknown>;
+  setTimeConfig(cfg: unknown): Promise<unknown>;
+  setBackgroundThrottling(throttle: boolean): Promise<void>;
 }
 
 declare global {
@@ -88,6 +95,15 @@ let bootMode: BootMode =
   localStorage.getItem("pebble-studio:boot-mode") === "auto" ? "auto" : "manual";
 
 const view = new EmulatorView();
+
+// Non-system-time badge: keep it in sync with the time config. Registered BEFORE
+// SettingsPane is constructed so we catch its startup dispatch (pushTimeConfig
+// fires `pebble-studio:time-changed` once on construction).
+const hostTz = detectHostTimezone();
+window.addEventListener("pebble-studio:time-changed", (e) => {
+  const cfg = (e as CustomEvent).detail as TimeConfig | null;
+  view.setTimeBadge(cfg, hostTz);
+});
 
 // Persist the active platform and keep both the top combo and the Settings
 // "Startup watch" dropdown in sync, regardless of which control changed it.
@@ -186,15 +202,6 @@ async function init(): Promise<void> {
   // J (v0.0.6): restore the diagnostics flag into EmulatorView. Canonical truthy
   // value is the string "on" (matches EmulatorView's own startup reader).
   view.setDiagnostics(localStorage.getItem("pebble-studio:diagnostics") === "on");
-
-  // K (v0.0.6): sync the persisted "keep backlight on" flag into main so the
-  // keepalive matches the saved preference (default OFF when unset).
-  const backlightAlways = localStorage.getItem("pebble-studio:backlight-always") === "true";
-  try {
-    await window.studio.backlightAlways(backlightAlways);
-  } catch (err) {
-    console.warn("[main] backlightAlways sync on startup failed (ignored):", err);
-  }
 
   // Sync the persisted capture directory into main once (CaptureBar then saves
   // through it). Unset = main keeps its Downloads default.

@@ -78,11 +78,25 @@ function sendBackKey(port: number): Promise<void> {
   });
 }
 
+/**
+ * How a keepalive fire wakes the backlight:
+ *   - `back`   → tap the Back button (qemu monitor `sendkey left`). Default.
+ *                Harmless on a watchface but can navigate inside an app.
+ *   - `motion` → inject an accel tap (a shake). Doesn't navigate menus, but
+ *                fires the app's shake/tap handlers.
+ *   - `off`    → no keepalive at all (the interval is never run).
+ */
+export type BacklightMethod = "back" | "motion" | "off";
+
 export interface BacklightController {
   /** "Keep backlight on" — independent of captures. */
   setAlways(on: boolean): void;
   /** "Backlight during capture" — held only for the duration of a capture. */
   setCaptureHold(on: boolean): void;
+  /** Choose how a fire wakes the backlight; re-syncs the interval. */
+  setMethod(m: BacklightMethod): void;
+  /** Fire a single keepalive now (current method; no-op when method is "off"). */
+  pulseOnce(): void;
   /** Stop the keepalive entirely (e.g. on emulator stop). Clears both flags. */
   stop(): void;
 }
@@ -92,27 +106,47 @@ export interface BacklightController {
  * native/wsl decision (passed in by the caller, which knows the active driver
  * kind) so the monitor-port read works on the same host the emulator runs on.
  *
+ * `sendMotion` is the accel-tap injector (the real wiring passes
+ * `() => driver!.accelTap()`); it's used by the "motion" method.
+ *
  * `shellFor` is injectable for tests; it defaults to the real native/wsl shells.
  */
 export function createBacklightController(
   getKind: () => DriverKind | null,
+  sendMotion: () => Promise<void>,
   shellFor: (kind: DriverKind) => Shell = defaultShellFor,
 ): BacklightController {
   let always = false;
   let captureHold = false;
+  let method: BacklightMethod = "back";
   let timer: ReturnType<typeof setInterval> | null = null;
-  // Guard so a slow tick (shell read + TCP) doesn't overlap the next interval.
+  // Guard so a slow fire (shell read + TCP) doesn't overlap the next interval.
   let ticking = false;
+
+  /** Perform a single keepalive action for the current method. */
+  async function fire(): Promise<void> {
+    if (method === "off") return; // disabled — nothing to do
+    if (method === "motion") {
+      try {
+        await sendMotion();
+      } catch {
+        /* never let a fire crash the app */
+      }
+      return;
+    }
+    // method === "back": read the monitor port through the shell, send a Back key.
+    const kind = getKind();
+    if (!kind) return; // backend not initialized yet — skip
+    const port = await readMonitorPort(shellFor(kind));
+    if (port == null) return; // json/monitor missing — skip silently
+    await sendBackKey(port);
+  }
 
   async function tick(): Promise<void> {
     if (ticking) return;
     ticking = true;
     try {
-      const kind = getKind();
-      if (!kind) return; // backend not initialized yet — skip this tick
-      const port = await readMonitorPort(shellFor(kind));
-      if (port == null) return; // json/monitor missing — skip silently
-      await sendBackKey(port);
+      await fire();
     } catch {
       /* never let a tick crash the app — skip and try again next interval */
     } finally {
@@ -121,7 +155,9 @@ export function createBacklightController(
   }
 
   function sync(): void {
-    const wantActive = always || captureHold;
+    // The loop runs while a flag is set AND a method is selected. "off" stops it
+    // even if always/captureHold are set.
+    const wantActive = (always || captureHold) && method !== "off";
     if (wantActive && timer == null) {
       timer = setInterval(() => void tick(), TICK_MS);
       // Fire once immediately so the backlight rises without a full tick's wait.
@@ -140,6 +176,14 @@ export function createBacklightController(
     setCaptureHold(on: boolean): void {
       captureHold = on;
       sync();
+    },
+    setMethod(m: BacklightMethod): void {
+      method = m;
+      sync();
+    },
+    pulseOnce(): void {
+      // A single immediate fire regardless of always/captureHold (respects "off").
+      void fire();
     },
     stop(): void {
       always = false;
