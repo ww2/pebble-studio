@@ -5,6 +5,16 @@ import { connectVnc, type VncHandle } from "../vncClient.js";
 import { loadBindings, resolveAction, type Bindings } from "../keybindings.js";
 import type { TimeConfig } from "../../main/backend/timeController.js";
 
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+/** Format hours/minutes as 12h "h:mm AM/PM" (default) or 24h "HH:MM". */
+function fmtHM(h: number, m: number, hour24: boolean): string {
+  const mm = String(m).padStart(2, "0");
+  if (hour24) return `${String(h).padStart(2, "0")}:${mm}`;
+  const ap = h < 12 ? "AM" : "PM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${mm} ${ap}`;
+}
+
 const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
 
 /**
@@ -115,6 +125,13 @@ export class EmulatorView {
   private fpsPrevSig = -1;
   /** Tiny offscreen 2D context used to read a sample region of the noVNC canvas. */
   private fpsSampleCtx: CanvasRenderingContext2D | null = null;
+
+  /** Last time config received via setTimeBadge; null = hidden. */
+  private timeCfg: TimeConfig | null = null;
+  /** Interval id for the live-clock ticker in the time badge. */
+  private badgeTimer: ReturnType<typeof setInterval> | null = null;
+  /** Host timezone string last passed to setTimeBadge (used by the ticker). */
+  private hostTz = "";
 
   constructor() {
     this.el = document.createElement("div");
@@ -471,24 +488,48 @@ export class EmulatorView {
 
   /**
    * Reflect the current time config in the non-system-time badge. Hidden for a
-   * plain System / 1x / host-tz config; otherwise shows a compact summary of
-   * what makes the watch clock diverge from real local time (frozen, accelerated,
-   * a non-home timezone, or a custom anchor). Driven by the
+   * plain System / 1x / host-tz config; otherwise shows the custom date+time (for
+   * a custom anchor) or a compact summary of divergence (frozen/accelerated/non-home-tz)
+   * plus a live system-clock readout updated every 10 s. Driven by the
    * `pebble-studio:time-changed` window event (wired in main.ts).
    */
   setTimeBadge(cfg: TimeConfig | null, hostTz: string): void {
-    if (!cfg) { this.timeBadge.hidden = true; return; }
+    this.timeCfg = cfg;
+    this.hostTz = hostTz;
+    this.renderTimeBadge();
+  }
+
+  private renderTimeBadge(): void {
+    const cfg = this.timeCfg;
+    if (!cfg) { this.hideTimeBadge(); return; }
     const parts: string[] = [];
-    if (cfg.rate === "frozen") parts.push("❄");
-    else if (cfg.rate !== "1x") parts.push(`⏩ ${cfg.rate}`);
-    if (cfg.timezone !== hostTz) {
-      const short = cfg.timezone.split("/").pop()?.replace(/_/g, " ") ?? cfg.timezone;
-      parts.push(`🌐 ${short}`);
+    if (cfg.source === "custom") {
+      const d = new Date(cfg.customWallMs); // UTC-naive → read via getUTC*
+      const label = `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()} ${d.getUTCFullYear()} ` +
+        fmtHM(d.getUTCHours(), d.getUTCMinutes(), cfg.hour24);
+      const icon = cfg.rate === "frozen" ? "❄" : cfg.rate !== "1x" ? `⏩ ${cfg.rate}` : "🕒";
+      parts.push(`${icon} ${label}`);
+    } else if (cfg.rate !== "1x" || cfg.timezone !== this.hostTz) {
+      if (cfg.rate === "frozen") parts.push("❄");
+      else if (cfg.rate !== "1x") parts.push(`⏩ ${cfg.rate}`);
+      if (cfg.timezone !== this.hostTz) parts.push(`🌐 ${cfg.timezone.split("/").pop()?.replace(/_/g, " ") ?? cfg.timezone}`);
     }
-    if (cfg.source === "custom" && parts.length === 0) parts.push("⏱ custom");
-    if (parts.length === 0) { this.timeBadge.hidden = true; return; }
+    if (parts.length === 0) { this.hideTimeBadge(); return; }
+    const now = new Date();
+    parts.push(`sys ${fmtHM(now.getHours(), now.getMinutes(), cfg.hour24)}`);
     this.timeBadge.textContent = parts.join(" · ");
     this.timeBadge.hidden = false;
+    this.startBadgeTicker();
+  }
+
+  private startBadgeTicker(): void {
+    if (this.badgeTimer) return;
+    this.badgeTimer = setInterval(() => this.renderTimeBadge(), 10_000);
+  }
+
+  private hideTimeBadge(): void {
+    if (this.badgeTimer) { clearInterval(this.badgeTimer); this.badgeTimer = null; }
+    this.timeBadge.hidden = true;
   }
 
   /**
