@@ -30,7 +30,7 @@ interface SettingsOptions {
 
 const CAPTURE_DIR_KEY = "pebble-studio:capture-dir";
 const BACKLIGHT_CAPTURE_KEY = "pebble-studio:backlight-capture";
-const BACKLIGHT_ALWAYS_KEY = "pebble-studio:backlight-always";
+const BACKLIGHT_METHOD_KEY = "pebble-studio:backlight-method";
 const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
 
 const TIME_SOURCE_KEY = "pebble-studio:time-source";
@@ -401,21 +401,48 @@ export class SettingsPane {
       },
     );
 
-    // K: "Keep backlight on" — runs a ~1s Back-press keepalive. Default OFF;
-    // persists AND tells main to start/stop the keepalive immediately.
-    const blAlwaysRow = this.makeSwitchRow(
-      "Keep backlight on",
-      "Sends a Back press about once a second so the screen stays lit; can navigate inside an app.",
-      localStorage.getItem(BACKLIGHT_ALWAYS_KEY) === "true", // default OFF
-      (on) => {
-        localStorage.setItem(BACKLIGHT_ALWAYS_KEY, on ? "true" : "false");
-        void window.studio.backlightAlways(on).catch((err: unknown) => {
-          console.warn("[settings] backlightAlways failed (ignored):", err);
-        });
-      },
-    );
+    // Backlight keepalive method selector (Back-press / Motion / Off).
+    const blMethodControl = document.createElement("label");
+    blMethodControl.className = "settings-watch-control";
+    const blMethodLabel = document.createElement("span");
+    blMethodLabel.className = "settings-watch-label type-body";
+    blMethodLabel.textContent = "Backlight keepalive";
+    const blMethodSelect = document.createElement("select");
+    blMethodSelect.className = "settings-watch-select";
+    for (const [value, text] of [
+      ["back", "Back-press"],
+      ["motion", "Motion"],
+      ["off", "Off"],
+    ]) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = text;
+      blMethodSelect.appendChild(opt);
+    }
+    blMethodSelect.value = localStorage.getItem(BACKLIGHT_METHOD_KEY) ?? "back";
+    blMethodSelect.addEventListener("change", () => {
+      const value = blMethodSelect.value;
+      localStorage.setItem(BACKLIGHT_METHOD_KEY, value);
+      void window.studio.backlightMethod(value).catch(() => {});
+      if (value !== "off") {
+        void window.studio.backlightAlways(true).catch(() => {});
+      } else {
+        void window.studio.backlightAlways(false).catch(() => {});
+      }
+    });
+    blMethodControl.append(blMethodLabel, blMethodSelect);
 
-    capture.append(blCaptureRow, blAlwaysRow);
+    const blMethodDesc = document.createElement("p");
+    blMethodDesc.className = "settings-row-desc type-caption";
+    blMethodDesc.textContent =
+      "Back-press wakes the screen but navigates menus; Motion wakes it but triggers shake handlers; Off disables the keepalive.";
+
+    // Apply persisted backlight method to main on startup.
+    const initialBlMethod = localStorage.getItem(BACKLIGHT_METHOD_KEY) ?? "back";
+    void window.studio.backlightMethod(initialBlMethod).catch(() => {});
+    void window.studio.backlightAlways(initialBlMethod !== "off").catch(() => {});
+
+    capture.append(blCaptureRow, blMethodControl, blMethodDesc);
 
     // ── Keyboard section (I) ──────────────────────────────────────────────
     const keyboard = document.createElement("section");
@@ -457,7 +484,17 @@ export class SettingsPane {
       },
     );
 
-    advanced.append(advHeading, diagRow);
+    const throttleRow = this.makeSwitchRow(
+      "Full speed when unfocused",
+      "Keep the emulator rendering at full rate even when the window isn't focused.",
+      localStorage.getItem("pebble-studio:no-throttle") !== "false", // default ON
+      (on) => {
+        localStorage.setItem("pebble-studio:no-throttle", on ? "true" : "false");
+        void window.studio.setBackgroundThrottling(!on).catch(() => {});
+      },
+    );
+
+    advanced.append(advHeading, diagRow, throttleRow);
 
     this.el.append(appearance, watch, time, capture, keyboard, advanced);
 
@@ -466,6 +503,11 @@ export class SettingsPane {
 
     // Push the persisted time config to the backend on startup (fire-and-forget).
     this.pushTimeConfig();
+
+    // Apply persisted throttle setting on startup.
+    void window.studio.setBackgroundThrottling(
+      localStorage.getItem("pebble-studio:no-throttle") === "false",
+    ).catch(() => {});
   }
 
   /** Read the persisted time settings from localStorage into a TimeConfig. */
