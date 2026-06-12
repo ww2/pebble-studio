@@ -183,6 +183,24 @@ describe("ensureTimeShim", () => {
     expect(isShimReady()).toBe(false);
   });
 
+  it("a FAILED deploy is retryable: next call re-runs and can succeed", async () => {
+    // First call: resources loader throws (transient fs/WSL hiccup) → false.
+    const badResources = async (): Promise<{ so: Buffer; src: Buffer }> => {
+      throw new Error("transient failure");
+    };
+    expect(await ensureTimeShim(async () => ({ code: 0, stdout: "", stderr: "" }),
+      { resources: badResources, now: () => fakeNow() })).toBe(false);
+    expect(isShimReady()).toBe(false);
+    // Second call (NO reset): must actually retry and succeed this time.
+    const selfTestOutput = String(fakeNow() / 1000 + 86400);
+    const run = async (cmd: string) =>
+      cmd.includes("date +%s")
+        ? { code: 0, stdout: selfTestOutput, stderr: "" }
+        : { code: 0, stdout: "", stderr: "" };
+    expect(await ensureTimeShim(run, { resources: fakeResources, now: () => fakeNow() })).toBe(true);
+    expect(isShimReady()).toBe(true);
+  });
+
   it("resources-throw: returns false, no throw", async () => {
     const badResources = async (): Promise<{ so: Buffer; src: Buffer }> => {
       throw new Error("disk read failure");

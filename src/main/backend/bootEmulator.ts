@@ -3,6 +3,10 @@ import { connect as netConnect } from "node:net";
 import type { PlatformId } from "../../shared/types.js";
 import type { VncEndpoint } from "./BackendDriver.js";
 import { EMU_INFO_PATH, EMU_LOG_PATH, SDK_ROOT } from "./hostPaths.js";
+// isShimReady() reads the module-level readiness cache populated by
+// ensureTimeShim() (driver.ensureTimeShim(), called from ipc before each boot).
+// bootEmulator never deploys the shim itself; it only reads the result to
+// decide whether to route qemu through the wrapper.
 import { isShimReady, WRAPPER } from "./timeShim.js";
 
 /**
@@ -400,6 +404,9 @@ export async function bootEmulator(
     await d.waitForEmuInfo(platformId, 60_000, token);
     step("Waiting for VNC…");
     await d.waitForPort("localhost", VNC_RFB_PORT, 60_000, token);
+    // websockify binds only after qemu's VNC is up, so it's often the slower
+    // wait — give it its own label so diagnostics show the real bottleneck.
+    step("Waiting for websockify…");
     await d.waitForPort("localhost", WS_PORT, 60_000, token);
     return { host: "localhost", port: WS_PORT, wsPath: "/" };
   };
@@ -413,6 +420,9 @@ export async function bootEmulator(
     // + ONE retry recovers it. Cancellation is never retried.
     if (err instanceof BootAborted || token?.cancelled) throw err;
     step("Boot stalled — retrying once…");
+    // The production killAll (makeKillAll) ends with waitUntilDead, so the
+    // retry's bootControl never races a not-yet-released qemu/port. Tests stub
+    // killAll, so they exercise the retry FLOW, not that teardown gate.
     await d.killAll();
     const ep = await attempt(); // second failure propagates
     step("Ready");

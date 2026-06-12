@@ -283,11 +283,12 @@ async function runEnsure(
     for (const c of deployFileCmds("qemu-pebble", Buffer.from(wrapperScript()))) await run(c);
 
     const nowMs = (deps.now ?? (() => Date.now()));
-    const nowSec = nowMs() / 1000;
 
-    // First self-test attempt with the pre-built binary.
+    // First self-test attempt with the pre-built binary. The clock is re-read
+    // immediately before each parse so a slow compile between attempts can't
+    // drift the ±120s acceptance window.
     let r = await run(selfTestCmd());
-    if (!(r.code === 0 && parseSelfTest(r.stdout, nowSec))) {
+    if (!(r.code === 0 && parseSelfTest(r.stdout, nowMs() / 1000))) {
       // Pre-built .so failed (likely glibc mismatch): rebuild from deployed source.
       await run(compileShimCmd());
       r = await run(selfTestCmd());
@@ -297,6 +298,12 @@ async function runEnsure(
   } catch {
     shimReady = false;
   }
+
+  // A FAILED deploy stays retryable: clear the promise cache so the next
+  // explicit ensureTimeShim() call (boot / time-apply — low frequency) tries
+  // again after e.g. a transient fs/WSL hiccup. isShimReady() stays false in
+  // the meantime. A SUCCESS remains permanently cached for the session.
+  if (shimReady !== true) shimReadyPromise = null;
 
   return shimReady!;
 }
