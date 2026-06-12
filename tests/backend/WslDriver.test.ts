@@ -80,6 +80,11 @@ describe("WslDriver", () => {
       // Must reference the ctl path and the target/rate values
       expect(outerCmdline).toContain("123456");
       expect(outerCmdline).toContain("pb-faketime.ctl");
+      // Quote-free inner cmdline: the only quotes are the wrapper's own shQuote
+      // layer ('token' …). An inner quote would show up as the '\'' escape
+      // sequence — exactly what mangled setTzOffset on Windows before v0.0.12.
+      expect(outerCmdline).not.toContain(`'\\''`);
+      expect(outerCmdline).not.toContain('"');
     });
 
     it("does NOT throw on nonzero exit", async () => {
