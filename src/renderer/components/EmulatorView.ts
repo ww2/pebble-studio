@@ -18,6 +18,32 @@ function fmtHM(h: number, m: number, hour24: boolean): string {
 const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
 
 /**
+ * Width of the `.emu-frame` casing border (px). The frame is `box-sizing:
+ * border-box` with a 1px border (app.css `.emu-frame { border: 1px ... }`), so a
+ * model-switch's settled frame size is `bodyWidth + 2*frame-pad + 2*border`.
+ */
+const FRAME_BORDER_PX = 1;
+
+/**
+ * Pure Fit-scale math (extracted so it's unit-testable and timing-independent):
+ * the largest uniform scale that fits a natural-size frame into the available
+ * box, clamped to [0.25, 6]. Returns 0 for non-positive inputs (caller bails).
+ *
+ * Kept side-effect-free and DOM-free on purpose — `applyFitScale` does the
+ * measuring and feeds the numbers here. The clamp ceiling (6) matches the
+ * historical Fit cap.
+ */
+export function fitScale(
+  availW: number,
+  availH: number,
+  naturalW: number,
+  naturalH: number,
+): number {
+  if (availW <= 0 || availH <= 0 || naturalW <= 0 || naturalH <= 0) return 0;
+  return Math.max(0.25, Math.min(availW / naturalW, availH / naturalH, 6));
+}
+
+/**
  * The renderer's StudioApi (declared in main.ts, owned by Wave 2b) doesn't yet
  * list the v0.0.6 boot-progress channel that the preload exposes. Until Wave 2b
  * extends that interface, narrow `window.studio` to the extra method at the call
@@ -358,7 +384,7 @@ export class EmulatorView {
    * large window and shrinks it (keeping the rows on-screen) in a small one. The
    * row heights are included in the budget so the zoom row is never cut off.
    */
-  private applyFitScale(): void {
+  private applyFitScale(naturalOverride?: { w: number; h: number }): void {
     const col = this.el.parentElement; // .stage-col (place-items:center container)
     if (!col) return;
     // If the observer was created before the panel was attached, it may be
@@ -398,16 +424,29 @@ export class EmulatorView {
     const availH = colH - padY - rowsH - gapsH;
     if (availW <= 0 || availH <= 0) return;
 
-    // Natural (unscaled) frame size: clear the transform so offset* reflects the
-    // true size regardless of the previous scale.
-    const prev = this.frame.style.transform;
-    this.frame.style.transform = "";
-    const naturalW = this.frame.offsetWidth;
-    const naturalH = this.frame.offsetHeight;
-    this.frame.style.transform = prev;
-    if (naturalW <= 0 || naturalH <= 0) return; // not measurable yet
-
-    const scale = Math.max(0.25, Math.min(availW / naturalW, availH / naturalH, 6));
+    // Natural (unscaled) frame size. Two sources:
+    //  - naturalOverride: the SETTLED target size, computed from known chrome
+    //    values by applyGeometry. Used on a model switch because the stage/frame
+    //    are mid-morph (a 420ms CSS width/height/padding transition), so reading
+    //    offset* here would return the OLD model's transient size and over-scale
+    //    (worst on aplite→gabbro). Passing the target removes the timing race.
+    //  - otherwise (window-resize via the ResizeObserver, or numeric→Fit): the
+    //    geometry is already settled, so measure the live frame. Clear the
+    //    transform first so offset* reflects the unscaled size, not the prior scale.
+    let naturalW: number;
+    let naturalH: number;
+    if (naturalOverride) {
+      naturalW = naturalOverride.w;
+      naturalH = naturalOverride.h;
+    } else {
+      const prev = this.frame.style.transform;
+      this.frame.style.transform = "";
+      naturalW = this.frame.offsetWidth;
+      naturalH = this.frame.offsetHeight;
+      this.frame.style.transform = prev;
+    }
+    const scale = fitScale(availW, availH, naturalW, naturalH);
+    if (scale <= 0) return; // not measurable yet
     this.setScale(scale);
   }
 
@@ -876,7 +915,22 @@ export class EmulatorView {
     this.frame.classList.remove("emu-frame--switching");
 
     // C3: the natural frame size just changed; re-fit if Fit is the active zoom.
-    if (this.zoom === "fit") this.applyFitScale();
+    // The stage/frame are mid-morph here (CSS animates width/height/padding over
+    // 420ms — see .emu-stage / .emu-frame transitions in app.css), so reading the
+    // frame's live offsetWidth/Height would return the OLD model's transient size
+    // and over-scale (worst aplite→gabbro). Instead pass the SETTLED target size,
+    // computed from the known chrome body + the frame's box-model chrome:
+    //   border-box frame = stage body (bodyWidth/Height) + 2×frame-pad + 2×border
+    // frame-pad is 16px square / 18px round (app.css .emu-frame{--frame-pad}); the
+    // frame has a 1px border. This makes Fit timing-independent on model switches.
+    if (this.zoom === "fit") {
+      const framePad = info.round ? 18 : 16;
+      const chromePx = 2 * framePad + 2 * FRAME_BORDER_PX;
+      this.applyFitScale({
+        w: chrome.bodyWidth + chromePx,
+        h: chrome.bodyHeight + chromePx,
+      });
+    }
   }
 
   /**
