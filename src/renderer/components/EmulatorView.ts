@@ -3,6 +3,7 @@ import { getChrome } from "../chrome/chromeRegistry.js";
 import { getPlatform } from "../../main/backend/emulatorRegistry.js"; // pure module, bundled by Vite
 import { connectVnc, type VncHandle } from "../vncClient.js";
 import { loadBindings, resolveAction, type Bindings } from "../keybindings.js";
+import type { TimeConfig } from "../../main/backend/timeController.js";
 
 const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
 
@@ -41,6 +42,8 @@ export class EmulatorView {
   private readonly screenHost: HTMLElement;
   private readonly buttonsOverlay: HTMLElement;
   private readonly status: HTMLElement;
+  /** Badge surfacing a non-system time config (frozen/accelerated/non-host-tz/custom). */
+  private readonly timeBadge: HTMLElement;
   private readonly caption: HTMLElement;
   private readonly relaunchBtn: HTMLButtonElement;
   private readonly forceCloseBtn: HTMLButtonElement;
@@ -126,7 +129,7 @@ export class EmulatorView {
       </div>
       <div class="emu-caption" id="emu-caption"></div>
       <div class="emu-actions">
-        <button class="emu-action emu-action--filled" id="emu-tap" type="button">Tap</button>
+        <button class="emu-action emu-action--subtle" id="emu-tap" type="button">Tap</button>
         <button class="emu-action emu-action--subtle" id="emu-shake" type="button">Shake</button>
         <div class="emu-actions-sep" aria-hidden="true"></div>
         <button class="emu-action emu-action--subtle" id="emu-relaunch" type="button" title="Stop and reboot the current platform">Relaunch</button>
@@ -156,6 +159,13 @@ export class EmulatorView {
     this.screenHost = this.el.querySelector<HTMLElement>("#emu-screen")!;
     this.buttonsOverlay = this.el.querySelector<HTMLElement>("#emu-buttons")!;
     this.status = this.el.querySelector<HTMLElement>("#emu-status")!;
+    // Non-system-time badge: lives right after the ● Live status in the zoom-row.
+    // Styled by .emu-time-badge (added in a later task); functional/unstyled now.
+    const badge = document.createElement("span");
+    badge.className = "emu-time-badge";
+    badge.hidden = true;
+    this.timeBadge = badge;
+    this.status.insertAdjacentElement("afterend", badge);
     this.caption = this.el.querySelector<HTMLElement>("#emu-caption")!;
     this.relaunchBtn = this.el.querySelector<HTMLButtonElement>("#emu-relaunch")!;
     this.forceCloseBtn = this.el.querySelector<HTMLButtonElement>("#emu-force-close")!;
@@ -440,6 +450,28 @@ export class EmulatorView {
   /** E: remove the launch-failure highlight ring from the Launch button. */
   private clearLaunchAttn(): void {
     this.relaunchBtn.classList.remove("emu-action--attn");
+  }
+
+  /**
+   * Reflect the current time config in the non-system-time badge. Hidden for a
+   * plain System / 1x / host-tz config; otherwise shows a compact summary of
+   * what makes the watch clock diverge from real local time (frozen, accelerated,
+   * a non-home timezone, or a custom anchor). Driven by the
+   * `pebble-studio:time-changed` window event (wired in main.ts).
+   */
+  setTimeBadge(cfg: TimeConfig | null, hostTz: string): void {
+    if (!cfg) { this.timeBadge.hidden = true; return; }
+    const parts: string[] = [];
+    if (cfg.rate === "frozen") parts.push("❄");
+    else if (cfg.rate !== "1x") parts.push(`⏩ ${cfg.rate}`);
+    if (cfg.timezone !== hostTz) {
+      const short = cfg.timezone.split("/").pop()?.replace(/_/g, " ") ?? cfg.timezone;
+      parts.push(`🌐 ${short}`);
+    }
+    if (cfg.source === "custom" && parts.length === 0) parts.push("⏱ custom");
+    if (parts.length === 0) { this.timeBadge.hidden = true; return; }
+    this.timeBadge.textContent = parts.join(" · ");
+    this.timeBadge.hidden = false;
   }
 
   /**
