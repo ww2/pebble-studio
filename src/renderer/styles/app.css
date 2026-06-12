@@ -105,6 +105,32 @@ body {
   flex-direction: column;
 }
 
+/* D (v0.0.6): one-shot entrance — the three workspace columns fade/slide in with
+   a small stagger on first paint so the UI never looks frozen. `app-enter` is
+   added in main.ts and removed on animationend. A trailing shell animation
+   drives that `animationend` so it fires after the last column settles. */
+.app-shell.app-enter .nav-rail-host,
+.app-shell.app-enter .stage-col,
+.app-shell.app-enter .inspector {
+  animation: app-enter-col 320ms var(--ease) both;
+}
+.app-shell.app-enter .nav-rail-host { animation-delay: 40ms; }
+.app-shell.app-enter .stage-col     { animation-delay: 100ms; }
+.app-shell.app-enter .inspector     { animation-delay: 160ms; }
+.app-shell.app-enter { animation: app-enter-shell 1ms linear 480ms both; }
+@keyframes app-enter-col {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes app-enter-shell { to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  /* Honor reduced-motion: no transform/fade, but the shell still settles so the
+     `app-enter` class is dropped (its animationend still fires). */
+  .app-shell.app-enter .nav-rail-host,
+  .app-shell.app-enter .stage-col,
+  .app-shell.app-enter .inspector { animation: none; }
+}
+
 /* ── Command bar ─────────────────────────────────────────────────────────── */
 .cmdbar {
   flex: 0 0 auto;
@@ -909,6 +935,17 @@ body {
 }
 .settings-row-label { color: var(--text); }
 .settings-row-desc { color: var(--text-secondary); margin: 0; }
+/* Keyboard section (I): stacked per-action rows + an active rebind affordance. */
+.settings-key-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.lib-pick-btn--active {
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
 /* Hosts the "Startup watch" dropdown. */
 .settings-default-watch {
   display: flex;

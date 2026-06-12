@@ -13,6 +13,12 @@ const GIF_TRANSPARENT_COLOR = 0xff00ff;
  */
 const GIF_MAX_SECONDS = 15;
 
+/** Pref key: briefly wake the backlight during a capture (default ON when unset). */
+const BACKLIGHT_CAPTURE_KEY = "pebble-studio:backlight-capture";
+
+/** Beat (ms) to let the backlight rise before grabbing an instant screenshot. */
+const BACKLIGHT_RISE_MS = 250;
+
 export class CaptureBar {
   readonly el: HTMLElement;
   private readonly select: HTMLSelectElement;
@@ -28,6 +34,7 @@ export class CaptureBar {
   constructor(
     private readonly getHost: () => HTMLElement | null,
     private readonly isRound: () => boolean = () => false,
+    private readonly getPlatformId: () => string = () => "unknown",
   ) {
     this.el = document.createElement("div");
     this.el.className = "capture-bar";
@@ -100,8 +107,22 @@ export class CaptureBar {
     return parseInt(this.select.value, 10);
   }
 
-  private stamp(): string {
-    return String(Date.now());
+  /** K: true when "backlight during capture" is enabled (default ON when unset). */
+  private backlightDuringCapture(): boolean {
+    return localStorage.getItem(BACKLIGHT_CAPTURE_KEY) !== "false";
+  }
+
+  /**
+   * K: hold/release the capture backlight, swallowing any failure so a backlight
+   * hiccup never breaks the capture itself. No-op when the pref is off.
+   */
+  private async setBacklightHold(on: boolean): Promise<void> {
+    if (!this.backlightDuringCapture()) return;
+    try {
+      await window.studio.backlightCaptureHold(on);
+    } catch (err) {
+      console.warn("[capture] backlightCaptureHold failed (ignored):", err);
+    }
   }
 
   /**
@@ -132,14 +153,26 @@ export class CaptureBar {
     const host = this.getHost();
     if (!host) { this.status.textContent = "No emulator screen"; return; }
     try {
-      const raw = grabUpscaled(host, this.factor());
-      const frame = this.maybeCircularMask(raw);
-      const blob = await rgbaToBlob(frame);
-      const arrayBuffer = await blob.arrayBuffer();
-      const bytes = new Uint8Array(arrayBuffer);
-      const name = `pebble-shot-${this.stamp()}.png`;
-      const saved = await window.studio.saveCapture(name, bytes);
-      this.status.textContent = `Saved: ${saved}`;
+      // K: wake the backlight, give it a beat to rise, then grab — so the shot
+      // isn't dim. try/finally guarantees the hold is always released.
+      await this.setBacklightHold(true);
+      try {
+        if (this.backlightDuringCapture()) {
+          await new Promise((r) => setTimeout(r, BACKLIGHT_RISE_MS));
+        }
+        const raw = grabUpscaled(host, this.factor());
+        const frame = this.maybeCircularMask(raw);
+        const blob = await rgbaToBlob(frame);
+        const arrayBuffer = await blob.arrayBuffer();
+        const bytes = new Uint8Array(arrayBuffer);
+        // G: pebble-shot-<codename>-<n>.png (n = next free integer from main).
+        const base = `pebble-shot-${this.getPlatformId()}`;
+        const name = await window.studio.nextCaptureName(base, "png");
+        const saved = await window.studio.saveCapture(name, bytes);
+        this.status.textContent = `Saved: ${saved}`;
+      } finally {
+        await this.setBacklightHold(false);
+      }
     } catch (err) {
       this.status.textContent = `Screenshot failed: ${String(err)}`;
       console.error("[capture] screenshot error", err);
@@ -171,12 +204,16 @@ export class CaptureBar {
     this.recBtn.textContent = "Stop GIF";
     this.recBtn.classList.add("capture-btn--recording");
 
+    // K: hold the backlight on for the whole recording so frames aren't dim;
+    // released in stopRecord(). Fire-and-forget — a failure must not break record.
+    void this.setBacklightHold(true);
+
     // A preset (5/10/15s) caps the budget at exactly that many seconds so the
     // existing isFull() path auto-stops. Manual uses the full hard cap.
     const preset = this.durationSeconds();
     const maxSeconds = preset > 0 ? preset : GIF_MAX_SECONDS;
     const budget = new FrameBudget({ fps: 15, maxSeconds });
-    const stamp = this.stamp();
+    const platformId = this.getPlatformId();
     const round = this.isRound();
 
     const gifOptions: ConstructorParameters<typeof GIF>[0] = {
@@ -196,12 +233,13 @@ export class CaptureBar {
     const gifRef = this.gif;
 
     gifRef.on("finished", (blob: Blob) => {
-      void blob.arrayBuffer().then((ab) => {
+      void blob.arrayBuffer().then(async (ab) => {
         const bytes = new Uint8Array(ab);
-        const name = `pebble-rec-${stamp}.gif`;
-        return window.studio.saveCapture(name, bytes).then((saved) => {
-          this.status.textContent = `GIF saved: ${saved}`;
-        });
+        // G: pebble-rec-<codename>-<n>.gif (n = next free integer from main).
+        const base = `pebble-rec-${platformId}`;
+        const name = await window.studio.nextCaptureName(base, "gif");
+        const saved = await window.studio.saveCapture(name, bytes);
+        this.status.textContent = `GIF saved: ${saved}`;
       }).catch((err: unknown) => {
         this.status.textContent = `GIF save failed: ${String(err)}`;
         console.error("[capture] gif save error", err);
@@ -257,6 +295,8 @@ export class CaptureBar {
     this.recording = false;
     this.recBtn.textContent = "Record GIF";
     this.recBtn.classList.remove("capture-btn--recording");
+    // K: release the recording's backlight hold (fire-and-forget, never throws).
+    void this.setBacklightHold(false);
     if (this.gif) {
       this.gif.render();
       this.gif = null;

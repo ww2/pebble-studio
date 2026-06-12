@@ -28,6 +28,11 @@ interface StudioApi {
   pathForFile(file: File): string;
   pickPbw(): Promise<string[]>;
   saveCapture(name: string, bytes: Uint8Array): Promise<string>;
+  // v0.0.6 (Wave 1 preload): boot-progress notes, capture naming, backlight.
+  onBootProgress(cb: (msg: string) => void): () => void;
+  nextCaptureName(base: string, ext: string): Promise<string>;
+  backlightAlways(on: boolean): Promise<void>;
+  backlightCaptureHold(on: boolean): Promise<void>;
 }
 
 declare global {
@@ -102,6 +107,7 @@ const library = new AppLibrary(
 const captureBar = new CaptureBar(
   () => document.querySelector<HTMLElement>("#emu-screen"),
   () => getPlatform(switcher.value as PlatformId).round,
+  () => switcher.value, // platform id (codename, e.g. "emery") for capture names
 );
 const settings = new SettingsPane(themeMode, initialPlatform, (id: PlatformId) => selectPlatform(id), {
   initialBootMode: bootMode,
@@ -109,6 +115,8 @@ const settings = new SettingsPane(themeMode, initialPlatform, (id: PlatformId) =
     bootMode = mode;
     localStorage.setItem("pebble-studio:boot-mode", mode);
   },
+  // Diagnostics toggle (J): flip EmulatorView's overlay live when Settings changes.
+  onDiagnosticsChange: (on: boolean) => view.setDiagnostics(on),
 });
 
 // Command bar: version switcher (Fluent combobox) controls the persistent
@@ -157,8 +165,36 @@ const navRail = new NavRail(
 document.getElementById("nav-rail-host")!.appendChild(navRail.el);
 showPane(navRail.value);
 
+// D (v0.0.6): one-shot entrance treatment — the nav rail, stage, and inspector
+// fade/slide in with a small stagger on first paint so the UI never looks frozen.
+// The `app-enter` class drives staggered CSS keyframes (per-column delays);
+// `prefers-reduced-motion` keeps everything instant (see app.css). The class is
+// dropped once the animation finishes so it stays a first-paint-only effect.
+const shell = document.querySelector<HTMLElement>(".app-shell");
+if (shell) {
+  shell.classList.add("app-enter");
+  shell.addEventListener(
+    "animationend",
+    () => shell.classList.remove("app-enter"),
+    { once: true },
+  );
+}
+
 async function init(): Promise<void> {
   const kindEl = document.getElementById("backend-kind")!;
+
+  // J (v0.0.6): restore the diagnostics flag into EmulatorView. Canonical truthy
+  // value is the string "on" (matches EmulatorView's own startup reader).
+  view.setDiagnostics(localStorage.getItem("pebble-studio:diagnostics") === "on");
+
+  // K (v0.0.6): sync the persisted "keep backlight on" flag into main so the
+  // keepalive matches the saved preference (default OFF when unset).
+  const backlightAlways = localStorage.getItem("pebble-studio:backlight-always") === "true";
+  try {
+    await window.studio.backlightAlways(backlightAlways);
+  } catch (err) {
+    console.warn("[main] backlightAlways sync on startup failed (ignored):", err);
+  }
 
   // Sync the persisted capture directory into main once (CaptureBar then saves
   // through it). Unset = main keeps its Downloads default.
