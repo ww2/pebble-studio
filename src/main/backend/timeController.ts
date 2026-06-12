@@ -32,3 +32,119 @@ export function computeTargetEpochSec(st: TimeState, nowMs: number): number {
   const elapsedSec = (nowMs - st.anchorRealMs) / 1000;
   return Math.floor(st.anchorUtcSec + elapsedSec * st.multiplier);
 }
+
+export type Rate = "frozen" | "1x" | "2x" | "4x" | "10x";
+
+export interface TimeConfig {
+  source: TimeSource;
+  rate: Rate;
+  timezone: string;
+  hour24: boolean;
+  customWallMs: number; // when source==="custom": the wall-clock the user entered, as a UTC-naive epoch ms
+}
+
+const RATE_MULT: Record<Rate, number> = { frozen: 0, "1x": 1, "2x": 2, "4x": 4, "10x": 10 };
+
+export const DEFAULT_TIME_CONFIG: TimeConfig = {
+  source: "system", rate: "1x", timezone: "UTC", hour24: true, customWallMs: 0,
+};
+
+/** Pick the host IANA zone; fall back to PST when empty or a bare "UTC". */
+export function detectHostTimezone(get: () => string = () => Intl.DateTimeFormat().resolvedOptions().timeZone): string {
+  const tz = (get() || "").trim();
+  if (!tz || tz === "UTC") return "America/Los_Angeles";
+  return tz;
+}
+
+/** Build the stepping anchor from a config at real time `nowMs`. */
+export function anchorFor(cfg: TimeConfig, nowMs: number): TimeState {
+  const multiplier = RATE_MULT[cfg.rate];
+  let anchorUtcSec: number;
+  if (cfg.source === "system") {
+    anchorUtcSec = Math.floor(nowMs / 1000) + tzOffsetMinutes(cfg.timezone, new Date(nowMs)) * 60;
+  } else {
+    anchorUtcSec = Math.floor(cfg.customWallMs / 1000);
+  }
+  return { source: cfg.source, multiplier, timezone: cfg.timezone, anchorUtcSec, anchorRealMs: nowMs };
+}
+
+/** Watch time differs from plain host system time? (drives the renderer badge.) */
+export function isNonSystemTime(cfg: TimeConfig, hostTz: string): boolean {
+  return cfg.source === "custom" || cfg.rate !== "1x" || cfg.timezone !== hostTz;
+}
+
+interface TimeDriver {
+  setTime(value: string, opts?: { utc?: boolean }): Promise<void>;
+  timeFormat(hour24: boolean): Promise<void>;
+}
+
+export interface TimeController {
+  setConfig(cfg: TimeConfig): Promise<void>;
+  getConfig(): TimeConfig;
+  /** Re-assert current config on the (re)booted emulator. */
+  applyAll(): Promise<void>;
+  stop(): void;
+}
+
+const TICK_MS = 1000;
+const RESYNC_MS = 30_000;
+
+export function makeTimeController(
+  getDriver: () => TimeDriver | null,
+  deps: { now?: () => number } = {},
+): TimeController {
+  const now = deps.now ?? (() => Date.now());
+  let cfg: TimeConfig = { ...DEFAULT_TIME_CONFIG };
+  let state: TimeState = anchorFor(cfg, now());
+  let timer: ReturnType<typeof setInterval> | null = null;
+  let lastSyncMs = 0;
+  let pushing = false;
+
+  async function push(): Promise<void> {
+    if (pushing) return;
+    pushing = true;
+    try {
+      const d = getDriver();
+      if (!d) return;
+      const epoch = computeTargetEpochSec(state, now());
+      await d.setTime(String(epoch), { utc: true });
+    } catch { /* patched CLI may be absent; degrade silently */ }
+    finally { pushing = false; }
+  }
+
+  function syncTimer(): void {
+    // Frozen (mult 0) and acceleration (mult>1) need the ~1s loop. Plain 1x lets
+    // the watch RTC tick on its own; we only resync occasionally for drift.
+    const needsFastLoop = state.multiplier !== 1;
+    if (timer) { clearInterval(timer); timer = null; }
+    if (needsFastLoop) {
+      timer = setInterval(() => void push(), TICK_MS);
+    } else {
+      timer = setInterval(() => {
+        if (now() - lastSyncMs >= RESYNC_MS) { lastSyncMs = now(); void push(); }
+      }, TICK_MS);
+    }
+  }
+
+  return {
+    getConfig: () => ({ ...cfg }),
+    async setConfig(next: TimeConfig): Promise<void> {
+      cfg = { ...next };
+      state = anchorFor(cfg, now());
+      lastSyncMs = now();
+      const d = getDriver();
+      if (d) { try { await d.timeFormat(cfg.hour24); } catch { /* ignore */ } }
+      await push();
+      syncTimer();
+    },
+    async applyAll(): Promise<void> {
+      state = anchorFor(cfg, now());
+      lastSyncMs = now();
+      const d = getDriver();
+      if (d) { try { await d.timeFormat(cfg.hour24); } catch { /* ignore */ } }
+      await push();
+      syncTimer();
+    },
+    stop(): void { if (timer) { clearInterval(timer); timer = null; } },
+  };
+}
