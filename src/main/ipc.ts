@@ -1,10 +1,12 @@
-import { ipcMain, app, dialog } from "electron";
+import { ipcMain, app, dialog, BrowserWindow } from "electron";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { createDriver } from "./backend/createDriver.js";
 import type { BackendDriver } from "./backend/BackendDriver.js";
-import type { BootToken } from "./backend/bootEmulator.js";
+import { makeNativeShell, makeWslShell, type BootToken } from "./backend/bootEmulator.js";
 import type { DriverKind } from "./backend/driverFactory.js";
+import { EMU_INFO_PATH } from "./backend/hostPaths.js";
+import { openClayWindow, parsePhonesimPort } from "./clayWindow.js";
 import { createBacklightController } from "./backend/backlight.js";
 import { makeTimeController, isNonSystemTime, detectHostTimezone, type TimeConfig } from "./backend/timeController.js";
 import type { PlatformId, ButtonId } from "../shared/types.js";
@@ -18,6 +20,13 @@ let driver: BackendDriver | null = null;
  * emulator state file, mirroring how createDriver decides.
  */
 let driverKind: DriverKind | null = null;
+
+/**
+ * The platform booted by the most recent `emu:start`. clay:phonesimPort uses it
+ * to pick the right entry in the emulator state file (which is keyed by
+ * platform, then SDK version).
+ */
+let currentPlatform: PlatformId | null = null;
 
 /**
  * The cancellation token for the current/most-recent boot. `emu:start` creates a
@@ -160,6 +169,7 @@ export function registerIpc(): void {
     return { kind };
   });
   ipcMain.handle("emu:start", async (e, id: PlatformId) => {
+    currentPlatform = id; // remembered for clay:phonesimPort's state-file lookup
     // Fresh token per boot, stored as current so abort/stop can cancel it.
     const token: BootToken = { cancelled: false };
     currentBootToken = token;
@@ -221,6 +231,39 @@ export function registerIpc(): void {
   ipcMain.handle("emu:timelineQuickView", async (_e, on: boolean) => {
     await driver!.timelineQuickView(on);
     reassertTime();
+  });
+
+  // Clay / AppConfig (Task B2). The renderer drives the pypkjs websocket
+  // round-trip (src/shared/clayProtocol.ts); main supplies the port and hosts
+  // the config page in a locked-down child window.
+  ipcMain.handle("clay:phonesimPort", async (): Promise<number | null> => {
+    if (currentPlatform == null) return null; // nothing booted yet
+    // Read the emulator state file through the Shell matching the active driver
+    // kind (same pattern as the backlight controller's monitor-port read), so it
+    // works on a Windows+WSL host where Node can't read the POSIX path directly.
+    const shell = driverKind === "wsl" ? makeWslShell() : makeNativeShell();
+    const { code, stdout } = await shell.run(`cat ${EMU_INFO_PATH} 2>/dev/null`);
+    if (code !== 0 || !stdout.trim()) return null;
+    return parsePhonesimPort(stdout, currentPlatform);
+  });
+  ipcMain.handle("clay:openWindow", async (e, url: string): Promise<string> => {
+    // Defense against arbitrary URL loads: only config-page-shaped URLs.
+    if (
+      typeof url !== "string" ||
+      !(url.startsWith("http://") || url.startsWith("https://") || url.startsWith("data:"))
+    ) {
+      throw new Error(`clay:openWindow: refusing to load non-http(s)/data URL`);
+    }
+    // Resolves with the RAW STILL-PERCENT-ENCODED close fragment ("" = cancel).
+    // It must stay encoded: the renderer forwards it verbatim to pypkjs, and the
+    // watchapp's JS decodeURIComponent()s it itself (see clayWindow.ts).
+    const rawFragment = await new Promise<string>((resolve) => {
+      openClayWindow(url, resolve, BrowserWindow.fromWebContents(e.sender) ?? undefined);
+    });
+    // The config round-trip's websocket connects can clobber a timezone/custom
+    // offset (post_connect re-syncs host time); re-assert it after a real save.
+    if (rawFragment !== "") reassertTime();
+    return rawFragment;
   });
 
   ipcMain.handle("dialog:pickDirectory", async (): Promise<string | null> => {

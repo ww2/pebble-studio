@@ -35,6 +35,10 @@ const studio = {
   getTimeConfig: () => ipcRenderer.invoke("time:get"),
   setTimeConfig: (cfg: unknown) => ipcRenderer.invoke("time:set", cfg),
   timelineQuickView: (on: boolean): Promise<void> => ipcRenderer.invoke("emu:timelineQuickView", on),
+  // Clay / AppConfig (Task B2). clayOpenWindow resolves with the RAW
+  // still-percent-encoded close fragment ("" = cancelled).
+  clayPhonesimPort: (): Promise<number | null> => ipcRenderer.invoke("clay:phonesimPort"),
+  clayOpenWindow: (url: string): Promise<string> => ipcRenderer.invoke("clay:openWindow", url),
   // Background-throttling toggle (Task 7). Pass false to keep full-speed when
   // unfocused (the default); pass true to allow Electron's normal throttling.
   setBackgroundThrottling: (throttle: boolean): Promise<void> =>
