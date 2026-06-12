@@ -79,6 +79,10 @@ export class NativeDriver implements BackendDriver {
     await this.deps.run(c.cmd, c.args, c.env);
   }
 
+  async timelineQuickView(on: boolean): Promise<void> {
+    await this.exec(cli.timelineQuickViewCmd(on));
+  }
+
   private async exec(c: PebbleCommand): Promise<RunResult> {
     const args = withVnc(c.args);
     const result = await this.deps.run(c.cmd, args, c.env);

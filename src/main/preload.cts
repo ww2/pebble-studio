@@ -34,6 +34,7 @@ const studio = {
   // Time control (Task 5).
   getTimeConfig: () => ipcRenderer.invoke("time:get"),
   setTimeConfig: (cfg: unknown) => ipcRenderer.invoke("time:set", cfg),
+  timelineQuickView: (on: boolean): Promise<void> => ipcRenderer.invoke("emu:timelineQuickView", on),
   // Background-throttling toggle (Task 7). Pass false to keep full-speed when
   // unfocused (the default); pass true to allow Electron's normal throttling.
   setBackgroundThrottling: (throttle: boolean): Promise<void> =>

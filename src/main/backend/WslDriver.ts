@@ -112,4 +112,8 @@ export class WslDriver implements BackendDriver {
   async wipe(): Promise<void> {
     return this.inner.wipe();
   }
+
+  async timelineQuickView(on: boolean): Promise<void> {
+    return this.inner.timelineQuickView(on);
+  }
 }

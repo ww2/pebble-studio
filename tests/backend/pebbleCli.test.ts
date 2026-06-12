@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  installCmd, buttonCmd, accelTapCmd, setTimeCmd, timeFormatCmd, btCmd, batteryCmd, screenshotCmd, bootCmd, wipeCmd,
+  installCmd, buttonCmd, accelTapCmd, setTimeCmd, timeFormatCmd, btCmd, batteryCmd, screenshotCmd, bootCmd, wipeCmd, timelineQuickViewCmd,
 } from "../../src/main/backend/pebbleCli.js";
 
 describe("pebbleCli argv builders", () => {
@@ -64,4 +64,9 @@ describe("timeFormatCmd", () => {
   it("builds 12h", () => {
     expect(timeFormatCmd(false).args).toContain("12h");
   });
+});
+
+describe("timelineQuickViewCmd", () => {
+  it("on", () => expect(timelineQuickViewCmd(true).args).toEqual(["emu-set-timeline-quick-view", "--emulator", expect.any(String), "on"]));
+  it("off", () => expect(timelineQuickViewCmd(false).args).toContain("off"));
 });
