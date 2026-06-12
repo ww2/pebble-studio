@@ -74,7 +74,7 @@ export class CaptureBar {
     // Screenshot button
     this.shotBtn = document.createElement("button");
     this.shotBtn.type = "button";
-    this.shotBtn.className = "capture-btn";
+    this.shotBtn.className = "capture-btn capture-btn--neutral";
     this.shotBtn.dataset.act = "screenshot";
     this.shotBtn.textContent = "Screenshot";
     this.shotBtn.addEventListener("click", () => void this.takeScreenshot());
@@ -92,7 +92,7 @@ export class CaptureBar {
     this.lightBtn.type = "button";
     this.lightBtn.className = "capture-btn";
     this.lightBtn.dataset.act = "light";
-    this.lightBtn.textContent = "Light now";
+    this.lightBtn.textContent = "Backlight";
     this.lightBtn.addEventListener("click", () => void window.studio.backlightPulse());
 
     // Status span
