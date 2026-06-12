@@ -1,0 +1,137 @@
+<!doctype html>
+<!--
+  Pebble Studio splash screen. Self-contained (inline CSS, no build step, no
+  external assets) so it can be shown instantly via loadFile before the heavy
+  renderer bundle loads. Copied to dist/main/splash.html by build:main.
+
+  Fluent look mirrors the app: dark #202020 base (matches --bg so there's no
+  white flash), accent #60CDFF brand mark (mirrors .brand-mark), Segoe UI
+  Variable type, and a subtle indeterminate shimmer. Version is injected at
+  runtime via the ?v=<version> query param (app.getVersion()).
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Pebble Studio</title>
+    <style>
+      :root {
+        /* Mirror the dark theme tokens used by the app. */
+        --bg: #202020;
+        --text: rgba(255, 255, 255, 0.89);
+        --text-secondary: rgba(255, 255, 255, 0.6);
+        --accent: #60cdff;
+        --accent-hover: #7ad6ff;
+        --accent-fg: #003e5c;
+      }
+
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+        user-select: none;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+      }
+
+      body {
+        display: grid;
+        place-items: center;
+        background: var(--bg);
+        /* Rounded feel + subtle hairline so the frameless window reads as a card. */
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.07);
+        color: var(--text);
+        font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      .splash {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 16px;
+        padding: 28px;
+      }
+
+      /* App mark "P" badge — mirrors .brand-mark in app.css. */
+      .brand-mark {
+        display: grid;
+        place-items: center;
+        width: 56px;
+        height: 56px;
+        border-radius: 12px;
+        background: linear-gradient(160deg, var(--accent-hover), var(--accent));
+        color: var(--accent-fg);
+        font-weight: 700;
+        font-size: 30px;
+        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
+      }
+
+      .title {
+        font-size: 22px;
+        font-weight: 600;
+        letter-spacing: 0.1px;
+      }
+
+      .version {
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+
+      /* Subtle indeterminate progress shimmer. */
+      .progress {
+        position: relative;
+        margin-top: 6px;
+        width: 200px;
+        height: 3px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.08);
+        overflow: hidden;
+      }
+
+      .progress::after {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        height: 100%;
+        width: 40%;
+        border-radius: 999px;
+        background: linear-gradient(
+          90deg,
+          transparent,
+          var(--accent),
+          transparent
+        );
+        animation: shimmer 1.4s ease-in-out infinite;
+      }
+
+      @keyframes shimmer {
+        0% {
+          transform: translateX(-100%);
+        }
+        100% {
+          transform: translateX(350%);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="splash">
+      <div class="brand-mark" aria-hidden="true">P</div>
+      <div class="title">Pebble Studio</div>
+      <div class="version" id="version"></div>
+      <div class="progress" aria-hidden="true"></div>
+    </div>
+    <script>
+      // Version is passed in via ?v=<version> from main (app.getVersion()).
+      const v = new URLSearchParams(location.search).get("v");
+      if (v) document.getElementById("version").textContent = "v" + v;
+    </script>
+  </body>
+</html>

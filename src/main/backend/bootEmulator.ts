@@ -46,15 +46,37 @@ const EMU_LOG_PATH = "/tmp/pebble-emu.log";
 const VNC_RFB_PORT = 5901;
 const WS_PORT = 6080;
 
+/**
+ * Cancellation token for an in-flight boot. The orchestrator and the poll
+ * helpers check `cancelled` between retries; flipping it true makes an active
+ * wait loop abort (throw `BootAborted`) within ~300ms instead of blocking up to
+ * the full readiness timeout (60s). IPC owns the token and flips it on
+ * abort/stop.
+ */
+export interface BootToken {
+  cancelled: boolean;
+}
+
+/** Thrown by `bootEmulator` (and its wait loops) when the token is cancelled. */
+export class BootAborted extends Error {
+  constructor(message = "boot aborted") {
+    super(message);
+    this.name = "BootAborted";
+  }
+}
+
 export interface SpawnDeps {
   /** Spawn `pebble emu-control --emulator <id> --vnc` detached; resolve once launched. */
   bootControl: (id: PlatformId) => Promise<void>;
   /** Ensure the qemu keymap exists at the pc-bios path the tool's VNC boot uses. */
   ensureKeymap: () => Promise<void>;
-  /** Resolve once a TCP connection to host:port succeeds (or reject on timeout). */
-  waitForPort: (host: string, port: number, timeoutMs: number) => Promise<void>;
-  /** Resolve once /tmp/pb-emulator.json contains a live entry for the platform. */
-  waitForEmuInfo: (id: PlatformId, timeoutMs: number) => Promise<void>;
+  /** Resolve once a TCP connection to host:port succeeds (or reject on timeout).
+   * Honors the optional cancellation token: a cancelled token aborts an active
+   * retry loop promptly with `BootAborted`. */
+  waitForPort: (host: string, port: number, timeoutMs: number, token?: BootToken) => Promise<void>;
+  /** Resolve once /tmp/pb-emulator.json contains a live entry for the platform.
+   * Honors the optional cancellation token (aborts active polling promptly). */
+  waitForEmuInfo: (id: PlatformId, timeoutMs: number, token?: BootToken) => Promise<void>;
   /** Stop any prior emulator + websockify so we boot a clean stack. */
   killAll: () => Promise<void>;
 }
@@ -126,16 +148,24 @@ function shQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-function defaultWaitForPort(host: string, port: number, timeoutMs: number): Promise<void> {
+function defaultWaitForPort(host: string, port: number, timeoutMs: number, token?: BootToken): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
     const attempt = () => {
+      // Bail before opening a fresh socket if the boot was cancelled.
+      if (token?.cancelled) { reject(new BootAborted()); return; }
       const sock = netConnect({ host, port });
       sock.setTimeout(1000);
       const fail = () => {
         sock.destroy();
-        if (Date.now() > deadline) reject(new Error(`timeout waiting for ${host}:${port}`));
-        else setTimeout(attempt, 300);
+        if (token?.cancelled) reject(new BootAborted());
+        else if (Date.now() > deadline) reject(new Error(`timeout waiting for ${host}:${port}`));
+        // Re-check the token between retries so cancellation interrupts the loop
+        // within one poll interval (~300ms) rather than at the full timeout.
+        else setTimeout(() => {
+          if (token?.cancelled) reject(new BootAborted());
+          else attempt();
+        }, 300);
       };
       sock.once("connect", () => { sock.destroy(); resolve(); });
       sock.once("error", fail);
@@ -151,9 +181,10 @@ function defaultWaitForPort(host: string, port: number, timeoutMs: number): Prom
  * the WSL filesystem and Node (running on Windows) cannot read that POSIX path.
  */
 function makeWaitForEmuInfo(shell: Shell) {
-  return async function waitForEmuInfo(id: PlatformId, timeoutMs: number): Promise<void> {
+  return async function waitForEmuInfo(id: PlatformId, timeoutMs: number, token?: BootToken): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
+      if (token?.cancelled) throw new BootAborted();
       const { code, stdout } = await shell.run(`cat ${EMU_INFO_PATH} 2>/dev/null`);
       if (code === 0 && stdout.trim()) {
         try {
@@ -169,7 +200,10 @@ function makeWaitForEmuInfo(shell: Shell) {
         }
       }
       if (Date.now() > deadline) throw new Error(`timeout waiting for emulator info for ${id}`);
+      // Re-check the token after the poll delay so an in-flight cancel aborts the
+      // loop within ~300ms rather than waiting out the full timeout.
       await new Promise((r) => setTimeout(r, 300));
+      if (token?.cancelled) throw new BootAborted();
     }
   };
 }
@@ -249,19 +283,24 @@ const defaultDeps: SpawnDeps = makeNativeBootDeps();
 export async function bootEmulator(
   platformId: PlatformId,
   deps: Partial<SpawnDeps> = {},
+  token?: BootToken,
 ): Promise<VncEndpoint> {
   const d: SpawnDeps = { ...defaultDeps, ...deps };
 
+  // Throw promptly if cancellation already happened (e.g. force-close fired
+  // before/right after start). Each wait step below also rechecks the token.
+  if (token?.cancelled) throw new BootAborted();
   // 1. Tear down any prior emulator so we own a clean stack.
   await d.killAll();
   // 2. Make the tool's VNC keymap path valid.
   await d.ensureKeymap();
   // 3. Boot the full stack (qemu + pypkjs + websockify) under the pebble tool.
   await d.bootControl(platformId);
-  // 4. Wait for readiness: state file, raw RFB, and the websocket proxy.
-  await d.waitForEmuInfo(platformId, 60_000);
-  await d.waitForPort("localhost", VNC_RFB_PORT, 60_000);
-  await d.waitForPort("localhost", WS_PORT, 60_000);
+  // 4. Wait for readiness: state file, raw RFB, and the websocket proxy. The
+  //    token threads into each wait so a cancel interrupts the active loop.
+  await d.waitForEmuInfo(platformId, 60_000, token);
+  await d.waitForPort("localhost", VNC_RFB_PORT, 60_000, token);
+  await d.waitForPort("localhost", WS_PORT, 60_000, token);
 
   return { host: "localhost", port: WS_PORT, wsPath: "/" };
 }

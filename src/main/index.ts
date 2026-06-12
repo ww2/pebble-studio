@@ -12,11 +12,41 @@ declare const __dirname: string;
 // the app actually starts. Harmless on platforms where the sandbox works.
 app.commandLine.appendSwitch("no-sandbox");
 
+// Show a frameless splash window immediately so the first visible window isn't
+// a blank frame while the (heavier) renderer bundle loads. Closed once the main
+// window fires `did-finish-load`. The version is injected via a query param so
+// the static splash.html needs no build-time substitution.
+function createSplashWindow(): BrowserWindow {
+  const splash = new BrowserWindow({
+    width: 420,
+    height: 260,
+    frame: false,
+    show: true,
+    resizable: false,
+    maximizable: false,
+    center: true,
+    backgroundColor: "#202020",
+    // Frameless + matching dark base => no white flash before paint.
+    transparent: false,
+  });
+  splash.setMenu(null);
+  // dist/main/index.cjs -> dist/main/splash.html (copied by build:main).
+  void splash.loadFile(join(__dirname, "splash.html"), {
+    query: { v: app.getVersion() },
+  });
+  return splash;
+}
+
 function createWindow(): void {
+  const splash = createSplashWindow();
+
   const win = new BrowserWindow({
     title: "Pebble Studio",
     width: 1100,
     height: 760,
+    // Hidden until the renderer has finished loading; we then swap from the
+    // splash to this fully-painted window in one step.
+    show: false,
     backgroundColor: "#202020",
     webPreferences: {
       // Emitted by the esbuild bundle alongside index.cjs.
@@ -25,6 +55,13 @@ function createWindow(): void {
       nodeIntegration: false,
       sandbox: false,
     },
+  });
+
+  // Swap splash -> main once the renderer is ready. Guard against the splash
+  // already being destroyed (e.g. closed by the user) before calling into it.
+  win.webContents.once("did-finish-load", () => {
+    if (!splash.isDestroyed()) splash.close();
+    if (!win.isDestroyed()) win.show();
   });
 
   // Forward renderer console output to the terminal (useful for headless dev).

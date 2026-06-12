@@ -29,7 +29,7 @@ vi.mock("node:child_process", () => ({
 }));
 
 // Import AFTER the mock is registered (vi.mock is hoisted, so this is fine).
-const { bootEmulator, makeWslBootDeps, makeNativeBootDeps } = await import(
+const { bootEmulator, BootAborted, makeWslBootDeps, makeNativeBootDeps } = await import(
   "../../src/main/backend/bootEmulator.js"
 );
 
@@ -99,5 +99,58 @@ describe("bootEmulator WSL shell construction", () => {
       "killAll", "ensureKeymap", "bootControl", "waitForEmuInfo", "waitForPort", "waitForPort",
     ]);
     expect(endpoint).toEqual({ host: "localhost", port: 6080, wsPath: "/" });
+  });
+});
+
+describe("bootEmulator cancellation", () => {
+  /**
+   * A waitForEmuInfo that polls a token like the real one: it loops with a short
+   * delay and throws BootAborted as soon as the token flips. We assert the boot
+   * rejects PROMPTLY (after a few polls), not after the full 60s timeout.
+   */
+  function makeTokenAwareWait(intervalMs = 50) {
+    return async (_id: string, _timeoutMs: number, token?: { cancelled: boolean }) => {
+      for (;;) {
+        if (token?.cancelled) throw new BootAborted();
+        await new Promise((r) => setTimeout(r, intervalMs));
+      }
+    };
+  }
+
+  it("rejects with BootAborted promptly when the token flips mid-wait", async () => {
+    const token = { cancelled: false };
+    // Flip the token shortly after the boot enters its (never-resolving) wait.
+    setTimeout(() => { token.cancelled = true; }, 120);
+
+    const start = Date.now();
+    await expect(
+      bootEmulator("basalt", {
+        killAll: async () => {},
+        ensureKeymap: async () => {},
+        bootControl: async () => {},
+        // This wait never succeeds on its own; only the token can end it.
+        waitForEmuInfo: makeTokenAwareWait(),
+        waitForPort: makeTokenAwareWait(),
+      }, token),
+    ).rejects.toBeInstanceOf(BootAborted);
+    const elapsed = Date.now() - start;
+    // Promptly: well under the real 60s readiness timeout (and the per-call ~300ms
+    // poll cadence). A generous ceiling keeps this robust on slow CI.
+    expect(elapsed).toBeLessThan(2000);
+  });
+
+  it("throws BootAborted immediately if the token is already cancelled at entry", async () => {
+    const killAll = vi.fn(async () => {});
+    await expect(
+      bootEmulator("basalt", {
+        killAll,
+        ensureKeymap: async () => {},
+        bootControl: async () => {},
+        waitForEmuInfo: async () => {},
+        waitForPort: async () => {},
+      }, { cancelled: true }),
+    ).rejects.toBeInstanceOf(BootAborted);
+    // Bails before doing any teardown work.
+    expect(killAll).not.toHaveBeenCalled();
   });
 });

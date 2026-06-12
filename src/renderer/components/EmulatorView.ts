@@ -6,8 +6,10 @@ import { connectVnc, type VncHandle } from "../vncClient.js";
 type ZoomLevel = "1" | "1.5" | "2" | "3" | "fit";
 const ZOOM_KEY = "pebble-studio:emu-zoom";
 
-type CaseColor = "black" | "white";
-const CASE_KEY = "pebble-studio:round-case";
+type BezelColor = "black" | "white";
+const SCREEN_BEZEL_KEY = "pebble-studio:screen-bezel";
+/** Concrete --screen-bezel-color values for the round-only black/white toggle. */
+const BEZEL_COLORS: Record<BezelColor, string> = { black: "#0a0a0a", white: "#f5f5f5" };
 
 /**
  * Emulator panel: a watch "stage" hosting the live noVNC display, an overlay of
@@ -26,27 +28,41 @@ export class EmulatorView {
   private readonly caption: HTMLElement;
   private readonly relaunchBtn: HTMLButtonElement;
   private readonly forceCloseBtn: HTMLButtonElement;
+  private readonly tapBtn: HTMLButtonElement;
+  private readonly shakeBtn: HTMLButtonElement;
   private readonly zoomSelect: HTMLSelectElement;
   private readonly frameWrapper: HTMLElement;
   private readonly frame: HTMLElement;
   private readonly stage: HTMLElement;
   private readonly switchOverlay: HTMLElement;
-  private readonly caseToggle: HTMLElement;
+  private readonly bezelToggle: HTMLElement;
+  /** The four persistent button nubs, created once so model-switch morphs animate. */
+  private readonly buttonEls: HTMLButtonElement[] = [];
   /** Current zoom level; "fit" engages the ResizeObserver-driven auto-fit. */
   private zoom: ZoomLevel = "1";
   /** Observer used only while zoom === "fit"; disconnected otherwise. */
   private fitObserver: ResizeObserver | null = null;
-  /** Selected round-bezel casing color (B5); persisted, applied to round models. */
-  private caseColor: CaseColor = "black";
-  /** True while the current platform is round (gates the bezel toggle + case color). */
+  /** Selected screen-bezel color (B5); persisted, applied to round models. */
+  private bezelColor: BezelColor = "black";
+  /** True while the current platform is round (gates the bezel toggle + bezel color). */
   private isRound = false;
   private vnc: VncHandle | null = null;
   /** The platform currently running (or last attempted). null = nothing booted yet. */
   private currentPlatform: PlatformId | null = null;
-  /** True while a boot or stop operation is in progress. */
-  private busy = false;
-  /** True once the emulator has been started at least once (stop() is safe to call). */
-  private started = false;
+  /**
+   * Lifecycle state machine (v0.0.5). `stopped` = chrome idle, Launch shown;
+   * `booting` = a start() is in flight; `live` = VNC connected; `stopping` =
+   * a stop/abort is in flight. Drives button labels/enablement and gates IPC.
+   */
+  private state: "stopped" | "booting" | "live" | "stopping" = "stopped";
+  /**
+   * Monotonic boot generation. Each boot captures the current gen; force-close
+   * (and each new boot) increments it. A boot's start() goes `live` ONLY if its
+   * gen is still current when it resolves — otherwise it bails silently. This is
+   * what lets force-close take effect immediately even though a backend start()
+   * promise may still be settling.
+   */
+  private bootGen = 0;
 
   constructor() {
     this.el = document.createElement("div");
@@ -78,11 +94,11 @@ export class EmulatorView {
           <button class="emu-zoom-opt" data-zoom="3" type="button">3×</button>
           <button class="emu-zoom-opt" data-zoom="fit" type="button">Fit</button>
         </div>
-        <div class="emu-case-toggle" id="emu-case-toggle" hidden>
-          <span class="emu-case-label">Bezel</span>
-          <div class="emu-case-segmented" id="emu-case-seg" role="group" aria-label="Round bezel color">
-            <button class="emu-case-opt" data-case="black" type="button">Black</button>
-            <button class="emu-case-opt" data-case="white" type="button">White</button>
+        <div class="emu-bezel-toggle" id="emu-bezel-toggle" hidden>
+          <span class="emu-bezel-label">Bezel</span>
+          <div class="emu-bezel-segmented" id="emu-bezel-seg" role="group" aria-label="Screen bezel color">
+            <button class="emu-bezel-opt" data-bezel="black" type="button">Black</button>
+            <button class="emu-bezel-opt" data-bezel="white" type="button">White</button>
           </div>
         </div>
         <span class="emu-status" id="emu-status"></span>
@@ -101,19 +117,34 @@ export class EmulatorView {
     this.frame = this.el.querySelector<HTMLElement>(".emu-frame")!;
     this.stage = this.el.querySelector<HTMLElement>("#emu-stage")!;
     this.switchOverlay = this.el.querySelector<HTMLElement>("#emu-switch-overlay")!;
-    this.caseToggle = this.el.querySelector<HTMLElement>("#emu-case-toggle")!;
+    this.bezelToggle = this.el.querySelector<HTMLElement>("#emu-bezel-toggle")!;
 
-    // Tap / Shake
+    // Create the four physical button nubs ONCE. They persist across model
+    // switches; applyGeometry only toggles the square/round classes so CSS can
+    // animate their positions (morph). Order matters only for DOM stacking.
+    this.createButtons();
+
+    // Tap / Shake — no-op unless the emulator is live (don't fire IPC at a dead one).
     const tapBtn = this.el.querySelector<HTMLButtonElement>("#emu-tap")!;
     const shakeBtn = this.el.querySelector<HTMLButtonElement>("#emu-shake")!;
-    tapBtn.addEventListener("click", () => void window.studio.accelTap());
+    this.tapBtn = tapBtn;
+    this.shakeBtn = shakeBtn;
+    tapBtn.addEventListener("click", () => {
+      if (this.state !== "live") return;
+      void window.studio.accelTap();
+    });
     shakeBtn.addEventListener("click", () => {
+      if (this.state !== "live") return;
       void window.studio.accelTap();
       setTimeout(() => void window.studio.accelTap(), 120);
     });
 
-    // Lifecycle buttons
-    this.relaunchBtn.addEventListener("click", () => void this.relaunch());
+    // Lifecycle buttons. The single Launch/Relaunch button routes to relaunch()
+    // when live and launch() otherwise.
+    this.relaunchBtn.addEventListener("click", () => {
+      if (this.state === "live") void this.relaunch();
+      else void this.launch();
+    });
     this.forceCloseBtn.addEventListener("click", () => void this.forceClose());
 
     // Zoom segmented control
@@ -125,19 +156,19 @@ export class EmulatorView {
       if (z) this.applyZoom(z);
     });
 
-    // B5: round-bezel color toggle (shown only for round models).
-    const caseSeg = this.el.querySelector<HTMLElement>("#emu-case-seg")!;
-    caseSeg.addEventListener("click", (e) => {
-      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(".emu-case-opt");
+    // B5: screen-bezel color toggle (shown only for round models).
+    const bezelSeg = this.el.querySelector<HTMLElement>("#emu-bezel-seg")!;
+    bezelSeg.addEventListener("click", (e) => {
+      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(".emu-bezel-opt");
       if (!btn) return;
-      const c = btn.dataset.case as CaseColor | undefined;
-      if (c) this.applyCaseColor(c);
+      const c = btn.dataset.bezel as BezelColor | undefined;
+      if (c) this.applyScreenBezelColor(c);
     });
 
     // Restore saved bezel color (default black) before applying any platform.
-    const savedCase = localStorage.getItem(CASE_KEY);
-    this.caseColor = savedCase === "white" ? "white" : "black";
-    this.applyCaseColor(this.caseColor);
+    const savedBezel = localStorage.getItem(SCREEN_BEZEL_KEY);
+    this.bezelColor = savedBezel === "white" ? "white" : "black";
+    this.applyScreenBezelColor(this.bezelColor);
 
     // Restore saved zoom
     const savedZoom = this.normalizeZoom(localStorage.getItem(ZOOM_KEY));
@@ -182,22 +213,42 @@ export class EmulatorView {
   }
 
   /**
-   * C3: compute the scale that makes the watch fill the available container while
-   * keeping all UI visible, then apply it. Guards against a zero-size container
-   * (skips until measurable) and an unmeasured frame.
+   * C3 (v0.0.5 — real fit): scale the watch to fill the stage column. The old
+   * version measured `frameWrapper.clientWidth`, but the wrapper shrinks to the
+   * frame (avail ≈ natural → scale ≈ 1, no effect). Instead we measure the PANEL
+   * (`this.el`) and subtract the non-stage rows (caption + actions + zoom) plus
+   * the wrapper's vertical margins to get the height available for the watch,
+   * then take the min of width/height fit so it stays fully visible.
    */
   private applyFitScale(): void {
-    const avail = this.frameWrapper.clientWidth;
-    if (avail <= 0) return; // not laid out yet — ResizeObserver will retry
-    // Natural (unscaled) frame width. Read offsetWidth with transform cleared so
-    // the measurement reflects the true size regardless of the previous scale.
+    const availW = this.el.clientWidth;
+    if (availW <= 0) return; // panel not laid out yet — observer will retry
+
+    // Available height = panel height minus every sibling row of the wrapper and
+    // the wrapper's own vertical margins. Summing actual row heights keeps this
+    // correct regardless of how the rows wrap.
+    let usedH = 0;
+    for (const child of Array.from(this.el.children) as HTMLElement[]) {
+      if (child === this.frameWrapper) continue;
+      usedH += child.offsetHeight;
+      const cs = getComputedStyle(child);
+      usedH += parseFloat(cs.marginTop) + parseFloat(cs.marginBottom);
+    }
+    const wrapCs = getComputedStyle(this.frameWrapper);
+    usedH += parseFloat(wrapCs.marginTop) + parseFloat(wrapCs.marginBottom);
+    const availH = this.el.clientHeight - usedH;
+    if (availH <= 0) return;
+
+    // Natural (unscaled) frame size: clear the transform so offset* reflects the
+    // true size regardless of the previous scale.
     const prev = this.frame.style.transform;
     this.frame.style.transform = "";
-    const natural = this.frame.offsetWidth;
+    const naturalW = this.frame.offsetWidth;
+    const naturalH = this.frame.offsetHeight;
     this.frame.style.transform = prev;
-    if (natural <= 0) return; // not measurable yet
-    // Fill width but never upscale past a comfortable cap so it stays crisp.
-    const scale = Math.max(0.25, Math.min(avail / natural, 3));
+    if (naturalW <= 0 || naturalH <= 0) return; // not measurable yet
+
+    const scale = Math.max(0.25, Math.min(availW / naturalW, availH / naturalH, 4));
     this.setScale(scale);
   }
 
@@ -207,7 +258,8 @@ export class EmulatorView {
     this.fitObserver = new ResizeObserver(() => {
       if (this.zoom === "fit") this.applyFitScale();
     });
-    this.fitObserver.observe(this.frameWrapper);
+    // Observe the PANEL (not the inner wrapper) so it re-fits on window resize.
+    this.fitObserver.observe(this.el);
   }
 
   /** Disconnect/ignore the fit observer when a non-fit zoom is selected. */
@@ -219,71 +271,168 @@ export class EmulatorView {
   }
 
   /**
-   * B5: apply the round-bezel casing color. Drives the `--case-color` CSS var via
-   * a class on `.emu-frame`; persisted so it survives relaunch and re-applies when
-   * switching back to a round model. Only visually active for round frames.
+   * B5 (v0.0.5): apply the SCREEN-bezel color (the dark area inside the stage,
+   * between the live screen and the stage edge) by setting `--screen-bezel-color`
+   * on `.emu-stage`. Persisted so it survives relaunch and re-applies when
+   * switching back to a round model. Only exposed/meaningful for round frames.
    */
-  private applyCaseColor(c: CaseColor): void {
-    this.caseColor = c;
-    this.frame.classList.toggle("emu-frame--case-white", c === "white");
-    const seg = this.el.querySelector<HTMLElement>("#emu-case-seg")!;
-    seg.querySelectorAll<HTMLButtonElement>(".emu-case-opt").forEach((btn) => {
-      btn.classList.toggle("emu-case-opt--active", btn.dataset.case === c);
-      btn.setAttribute("aria-pressed", String(btn.dataset.case === c));
+  private applyScreenBezelColor(c: BezelColor): void {
+    this.bezelColor = c;
+    this.stage.style.setProperty("--screen-bezel-color", BEZEL_COLORS[c]);
+    const seg = this.el.querySelector<HTMLElement>("#emu-bezel-seg")!;
+    seg.querySelectorAll<HTMLButtonElement>(".emu-bezel-opt").forEach((btn) => {
+      btn.classList.toggle("emu-bezel-opt--active", btn.dataset.bezel === c);
+      btn.setAttribute("aria-pressed", String(btn.dataset.bezel === c));
     });
-    localStorage.setItem(CASE_KEY, c);
+    localStorage.setItem(SCREEN_BEZEL_KEY, c);
   }
 
-  /** Update the enabled/disabled state of lifecycle buttons. */
+  /**
+   * Reflect the lifecycle state on the buttons:
+   *  - Launch/Relaunch: label is "Relaunch" when live, "Launch" otherwise;
+   *    enabled iff (stopped && a platform is selected) || live — disabled while
+   *    booting/stopping so it can't be spammed.
+   *  - Force-close: enabled while booting or live (something to cancel).
+   *  - Tap/Shake + the four nubs: disabled unless live (no IPC at a dead emu).
+   */
   private updateLifecycleButtons(): void {
-    const canAct = this.started && !this.busy;
-    this.relaunchBtn.disabled = !canAct;
-    this.forceCloseBtn.disabled = !canAct;
+    const s = this.state;
+    this.relaunchBtn.textContent = s === "live" ? "Relaunch" : "Launch";
+    this.relaunchBtn.disabled = !((s === "stopped" && this.currentPlatform) || s === "live");
+    this.forceCloseBtn.disabled = !(s === "booting" || s === "live");
+
+    const liveActions = s === "live";
+    this.tapBtn.disabled = !liveActions;
+    this.shakeBtn.disabled = !liveActions;
+    for (const el of this.buttonEls) el.disabled = !liveActions;
   }
 
-  /** Relaunch: stop the current emulator then boot the same platform. */
+  /**
+   * Morph to a new platform's chrome WITHOUT booting. Used by manual mode (both
+   * startup and model switches): apply the new geometry, leave the emulator
+   * stopped, and show "Launch". Any live VNC is torn down first.
+   */
+  loadChrome(platformId: PlatformId): void {
+    // A new boot generation invalidates any in-flight boot from a prior model.
+    this.bootGen++;
+    this.currentPlatform = platformId;
+    this.disconnectVnc();
+    this.beginSwitch();
+    this.applyGeometry(platformId);
+    this.state = "stopped";
+    this.status.textContent = "Ready";
+    this.status.classList.remove("emu-status--live");
+    this.updateLifecycleButtons();
+  }
+
+  /**
+   * Boot a platform: capture a fresh boot generation, morph to its geometry, and
+   * start the backend. When start() resolves, connect VNC and go `live` ONLY if
+   * this boot's gen is still current — otherwise a force-close (or a newer boot)
+   * superseded us, so bail silently without touching state. Assumes any previous
+   * emulator is already stopped (the caller handles that).
+   */
+  private async boot(platformId: PlatformId): Promise<void> {
+    const info = getPlatform(platformId);
+    const gen = ++this.bootGen;
+
+    this.state = "booting";
+    this.currentPlatform = platformId;
+    this.disconnectVnc();
+    this.beginSwitch();
+    this.applyGeometry(platformId);
+    this.status.textContent = `Booting ${info.label}…`;
+    this.status.classList.remove("emu-status--live");
+    this.updateLifecycleButtons();
+
+    let ep;
+    try {
+      ep = await window.studio.start(platformId);
+    } catch (err) {
+      // start() failed or was aborted. Only react if we're still the current
+      // boot; otherwise a force-close/newer boot owns the state now.
+      if (gen !== this.bootGen) return;
+      this.state = "stopped";
+      this.status.textContent = `Failed to start ${info.label}`;
+      this.status.classList.remove("emu-status--live");
+      console.error("[emu] start failed", err);
+      this.updateLifecycleButtons();
+      return;
+    }
+
+    // Superseded while start() was settling (force-close or another boot) — bail
+    // silently; the owner of the new gen already drives the UI.
+    if (gen !== this.bootGen) return;
+
+    this.state = "live";
+    this.status.textContent = "● Live";
+    this.status.classList.add("emu-status--live");
+    this.vnc = connectVnc(this.screenHost, ep as { host: string; port: number; wsPath: string }, info.touch);
+    this.updateLifecycleButtons();
+
+    // Re-install library apps after boot so a platform switch picks them up.
+    try {
+      await window.studio.libInstallAll();
+    } catch (err) {
+      console.error("[emu] libInstallAll failed", err);
+    }
+  }
+
+  /**
+   * Launch: boot the currently-selected platform. Only valid from `stopped` with
+   * a platform selected; ignored otherwise (spam/re-entrancy guard).
+   */
+  async launch(): Promise<void> {
+    if (this.state !== "stopped" || !this.currentPlatform) return;
+    await this.boot(this.currentPlatform);
+  }
+
+  /** Relaunch: stop the current emulator then boot the same platform. Only when live. */
   async relaunch(): Promise<void> {
-    if (this.busy || !this.started || !this.currentPlatform) return;
+    if (this.state !== "live" || !this.currentPlatform) return;
     const id = this.currentPlatform;
-    this.busy = true;
+    this.state = "stopping";
+    this.disconnectVnc();
+    this.status.textContent = "Stopping…";
+    this.status.classList.remove("emu-status--live");
     this.updateLifecycleButtons();
     try {
-      this.disconnectVnc();
-      this.status.textContent = "Stopping…";
-      this.status.classList.remove("emu-status--live");
-      try {
-        await window.studio.stop();
-      } catch (err) {
-        console.warn("[emu] stop() during relaunch failed (ignored):", err);
-      }
-      await this.bootPlatform(id);
-    } finally {
-      this.busy = false;
-      this.updateLifecycleButtons();
+      await window.studio.stop();
+    } catch (err) {
+      console.warn("[emu] stop() during relaunch failed (ignored):", err);
     }
+    await this.boot(id);
   }
 
-  /** Force-close: stop the emulator and show an idle state. */
+  /**
+   * Force-close: the override. Allowed from booting/live/stopping (no-op when
+   * already stopped). Increments bootGen so any in-flight boot bails when its
+   * start() finally settles, then aborts + stops the backend (ignoring errors)
+   * and returns to a stopped idle state. Works even mid-boot/mid-relaunch — it
+   * is the interrupt that reaps hung processes.
+   */
   async forceClose(): Promise<void> {
-    if (this.busy || !this.started) return;
-    this.busy = true;
+    if (this.state === "stopped") return;
+    this.bootGen++; // invalidate any in-flight boot
+    this.state = "stopping";
+    this.status.textContent = "Stopping…";
+    this.status.classList.remove("emu-status--live");
     this.updateLifecycleButtons();
     try {
-      this.disconnectVnc();
-      this.status.textContent = "Stopping…";
-      this.status.classList.remove("emu-status--live");
-      try {
-        await window.studio.stop();
-      } catch (err) {
-        console.warn("[emu] stop() during force-close failed (ignored):", err);
-      }
-      this.started = false;
-      this.status.textContent = "Stopped";
-      this.screenHost.innerHTML = "";
-    } finally {
-      this.busy = false;
-      this.updateLifecycleButtons();
+      await window.studio.abort();
+    } catch (err) {
+      console.warn("[emu] abort() during force-close failed (ignored):", err);
     }
+    try {
+      await window.studio.stop();
+    } catch (err) {
+      console.warn("[emu] stop() during force-close failed (ignored):", err);
+    }
+    this.disconnectVnc();
+    this.state = "stopped";
+    this.status.textContent = "Stopped";
+    this.status.classList.remove("emu-status--live");
+    this.updateLifecycleButtons();
   }
 
   /** Disconnect VNC without stopping the backend. */
@@ -296,22 +445,18 @@ export class EmulatorView {
   }
 
   /**
-   * A4 — Enter the "switching" state: collapse old geometry to a neutral frame and
-   * show the "Switching…" placeholder. The button overlay is hidden via the
-   * `--switching` class (CSS) and the stage is shrunk to a neutral size so no old
-   * geometry remains visible. The new shape/size/buttons are applied in
-   * applyGeometry() once the target platform's geometry is known.
+   * v0.0.5 morph — Enter the "switching" state WITHOUT collapsing to a neutral
+   * box: the old frame/stage/buttons stay in place and CSS transitions animate
+   * them to the new geometry once applyGeometry() runs. We only blank the live
+   * screen (it's torn down / re-booting anyway) so old + new pixels never overlap;
+   * the shape/size/button morph itself is the transition. The four button nubs
+   * are persistent (never rebuilt), so toggling their classes in applyGeometry
+   * slides them to their new positions.
    */
   private beginSwitch(): void {
     this.frame.classList.add("emu-frame--switching");
-    // Drop the old shape so the placeholder reads as a neutral rounded rect.
-    this.frame.classList.remove("emu-frame--round");
     this.caption.textContent = "";
-    // Neutralize the stage so the old watch's dimensions don't linger behind the
-    // placeholder; the real size is restored in applyGeometry().
-    this.stage.style.width = "180px";
-    this.stage.style.height = "180px";
-    this.screenHost.classList.remove("emu-screen--round");
+    this.screenHost.innerHTML = "";
   }
 
   /**
@@ -354,12 +499,15 @@ export class EmulatorView {
     }
     this.screenHost.classList.toggle("emu-screen--round", info.round);
 
-    this.renderButtons(info.round);
+    // Morph: toggle the round class on the PERSISTENT button overlay so the four
+    // nubs animate (via CSS transitions) from their old positions to the new ones
+    // rather than being rebuilt. (renderButtons is not called per-switch anymore.)
+    this.buttonsOverlay.classList.toggle("emu-buttons--round", info.round);
 
     // B5: bezel-color toggle is only meaningful for round models; re-apply the
     // persisted color when switching to a round watch, hide the control otherwise.
-    this.caseToggle.hidden = !info.round;
-    if (info.round) this.applyCaseColor(this.caseColor);
+    this.bezelToggle.hidden = !info.round;
+    if (info.round) this.applyScreenBezelColor(this.bezelColor);
 
     // Reveal new frame + buttons + screen together.
     this.frame.classList.remove("emu-frame--switching");
@@ -368,102 +516,55 @@ export class EmulatorView {
     if (this.zoom === "fit") this.applyFitScale();
   }
 
-  async show(platformId: PlatformId): Promise<void> {
-    const info = getPlatform(platformId);
-
-    // A4 — Gate ALL new geometry behind a clean transition so old and new never
-    // co-render. Immediately blank the stage, hide the button overlay, and show a
-    // neutral "Switching…" placeholder. The new frame shape, caption, stage size,
-    // and buttons are deferred to bootPlatform() once the new geometry is known.
-    this.beginSwitch();
-
-    this.status.textContent = `Booting ${info.label}…`;
-    this.status.classList.remove("emu-status--live");
-
-    // D1 — Fully stop the current emulator before switching to a new platform.
-    this.disconnectVnc();
-    if (this.started) {
-      try {
-        await window.studio.stop();
-      } catch (err) {
-        // Nothing was running yet, or stop failed — don't block the boot.
-        console.warn("[emu] stop() before platform switch failed (ignored):", err);
-      }
-    }
-
-    this.currentPlatform = platformId;
-    this.busy = true;
-    this.updateLifecycleButtons();
-
-    try {
-      await this.bootPlatform(platformId);
-    } finally {
-      this.busy = false;
-      this.updateLifecycleButtons();
-    }
-  }
-
-  /** Internal: size the stage and start the emulator. Assumes VNC is already disconnected. */
-  private async bootPlatform(platformId: PlatformId): Promise<void> {
-    const info = getPlatform(platformId);
-
-    this.status.textContent = `Booting ${info.label}…`;
-    this.status.classList.remove("emu-status--live");
-
-    // A4 — apply the new watch's frame shape, caption, stage size, button overlay,
-    // and bezel color as one grouped mutation, then reveal everything together.
-    this.applyGeometry(platformId);
-
-    let ep;
-    try {
-      ep = await window.studio.start(platformId);
-      this.started = true;
-      this.currentPlatform = platformId;
-    } catch (err) {
-      this.status.textContent = `Failed to start ${info.label}`;
-      console.error("[emu] start failed", err);
+  /**
+   * Switch to a platform's chrome. With `opts.boot` (auto mode) stop any current
+   * emulator then boot the new one; without it (manual mode) just morph to the
+   * new chrome idle, leaving "Launch" for the user. This is the single entry
+   * point used by startup and model switches.
+   */
+  async show(platformId: PlatformId, opts: { boot: boolean }): Promise<void> {
+    if (!opts.boot) {
+      this.loadChrome(platformId);
       return;
     }
-
-    this.status.textContent = "● Live";
-    this.status.classList.add("emu-status--live");
-    this.vnc = connectVnc(this.screenHost, ep as { host: string; port: number; wsPath: string }, info.touch);
-
-    // Re-install library apps after boot so a platform switch picks them up.
-    try {
-      await window.studio.libInstallAll();
-    } catch (err) {
-      console.error("[emu] libInstallAll failed", err);
+    // Auto: tear down any current emulator (force-close also invalidates any
+    // in-flight boot via bootGen) before booting the new chrome.
+    if (this.state !== "stopped") {
+      await this.forceClose();
     }
+    await this.boot(platformId);
   }
 
   /**
    * Reconnect VNC to the already-running emulator after a wipe+reboot triggered
-   * externally (e.g. "Clear emulator"). Unlike `show()` / `bootPlatform()`, this
+   * externally (e.g. "Clear emulator"). Unlike `show()` / `boot()`, this
    * does NOT call `start()` (the emulator is already booted) and does NOT call
    * `libInstallAll()` (the whole point of Clear is to leave it empty).
    */
   async reconnectAfterClear(platformId: PlatformId): Promise<void> {
-    if (!this.started || !this.currentPlatform) return;
+    if (this.state !== "live" || !this.currentPlatform) return;
     const info = getPlatform(platformId);
     this.disconnectVnc();
+    this.state = "live";
     this.status.textContent = "● Live";
     this.status.classList.add("emu-status--live");
     // The IPC handler already rebooted — re-use the same VNC endpoint.
     const ep = { host: "localhost", port: 6080, wsPath: "/" };
     this.vnc = connectVnc(this.screenHost, ep, info.touch);
+    this.updateLifecycleButtons();
   }
 
   /**
-   * Render the four physical buttons as nubs tucked into the frame edge. Placement
-   * is driven purely by CSS classes keyed on side + shape (not registry pixel
-   * coords), so the buttons hug the (square or round) frame edge and — on round
-   * devices — angle radially toward the center. The registry geometry is still
-   * used for hit-testing in tests; here we only need the button ids/order.
+   * Create the four physical buttons ONCE (constructor). Placement is driven by
+   * CSS classes keyed on side + shape (not registry pixel coords): the buttons
+   * hug the (square or round) frame edge and — on round devices — angle radially
+   * toward the center. Keeping them persistent (vs. rebuilding innerHTML on every
+   * model switch) lets CSS transitions animate them into place during a morph.
+   * applyGeometry toggles `.emu-buttons--round` on the overlay to switch shape.
    */
-  private renderButtons(round: boolean): void {
+  private createButtons(): void {
     this.buttonsOverlay.innerHTML = "";
-    this.buttonsOverlay.classList.toggle("emu-buttons--round", round);
+    this.buttonEls.length = 0;
     const ids: ButtonId[] = ["back", "up", "select", "down"];
     for (const id of ids) {
       const el = document.createElement("button");
@@ -473,6 +574,7 @@ export class EmulatorView {
       el.title = id;
       el.addEventListener("click", () => void window.studio.button(id));
       this.buttonsOverlay.appendChild(el);
+      this.buttonEls.push(el);
     }
   }
 }

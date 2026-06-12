@@ -19,14 +19,22 @@ function rectChrome(screen: Rect, bodyW: number, bodyH: number): Chrome {
   };
 }
 
+// B3 (v0.0.5): the SCREEN bezel — the dark margin between the live screen and
+// the body edge — is shrunk to ~40% of its v0.0.4 size so the screen fills more
+// of the watch face. (The CASE rim is restored separately in app.css.) Margins
+// below were cut to ~40% of the old values per platform:
+//   basalt-class  L24/T30/R32/B42 → L10/T12/R13/B17  (body 200×240 → 167×197)
+//   emery         L30/T30/R38/B42 → L12/T12/R15/B17  (body 268×300 → 227×257)
+//   chalk (round) centered gap 34 → 14               (body 248 → 208)
+//   gabbro(round) centered gap 34 → 14               (body 328 → 288)
 const CHROMES: Record<PlatformId, Chrome> = {
-  aplite:  rectChrome({ x: 24, y: 30, width: 144, height: 168 }, 200, 240),
-  basalt:  rectChrome({ x: 24, y: 30, width: 144, height: 168 }, 200, 240),
-  diorite: rectChrome({ x: 24, y: 30, width: 144, height: 168 }, 200, 240),
-  flint:   rectChrome({ x: 24, y: 30, width: 144, height: 168 }, 200, 240),
-  chalk:   rectChrome({ x: 30, y: 30, width: 180, height: 180 }, 248, 248),
-  emery:   rectChrome({ x: 30, y: 30, width: 200, height: 228 }, 268, 300),
-  gabbro:  rectChrome({ x: 30, y: 30, width: 260, height: 260 }, 328, 328),
+  aplite:  rectChrome({ x: 10, y: 12, width: 144, height: 168 }, 167, 197),
+  basalt:  rectChrome({ x: 10, y: 12, width: 144, height: 168 }, 167, 197),
+  diorite: rectChrome({ x: 10, y: 12, width: 144, height: 168 }, 167, 197),
+  flint:   rectChrome({ x: 10, y: 12, width: 144, height: 168 }, 167, 197),
+  chalk:   rectChrome({ x: 14, y: 14, width: 180, height: 180 }, 208, 208),
+  emery:   rectChrome({ x: 12, y: 12, width: 200, height: 228 }, 227, 257),
+  gabbro:  rectChrome({ x: 14, y: 14, width: 260, height: 260 }, 288, 288),
 };
 
 export function getChrome(id: PlatformId): Chrome { return CHROMES[id]; }

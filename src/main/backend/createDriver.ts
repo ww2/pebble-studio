@@ -61,8 +61,9 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
     : new WslDriver({
         run: spawnRunner,
         // On a Windows host the emulator lifecycle must run inside WSL via
-        // wsl.exe, not as Node-spawned Linux binaries on the Windows host.
-        boot: (id) => bootEmulator(id, makeWslBootDeps()),
+        // wsl.exe, not as Node-spawned Linux binaries on the Windows host. The
+        // token threads through so a force-close aborts the in-WSL boot.
+        boot: (id, token) => bootEmulator(id, makeWslBootDeps(), token),
         stop: () => stopEmulator({ killAll: makeWslBootDeps().killAll }),
       });
   return { driver, kind };
