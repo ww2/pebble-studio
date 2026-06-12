@@ -144,6 +144,12 @@ body {
   background: var(--acrylic);
   -webkit-backdrop-filter: blur(30px) saturate(160%);
   backdrop-filter: blur(30px) saturate(160%);
+  /* `backdrop-filter` makes this a stacking context; without an explicit z-index
+     it sits at `auto` and the later-painted `.workspace` (and its Settings
+     toggles) render ON TOP of the model dropdown popup. Lift the whole command
+     bar above the workspace so the popup (z-index:50 inside here) wins. */
+  position: relative;
+  z-index: 100;
 }
 
 .cmdbar-brand {
@@ -667,8 +673,13 @@ body {
 }
 
 /* F (v0.0.6): the "● Live" status reads as a clearly green pill — the dot + text
-   share the green --success token, weight bumped so it doesn't look dim. */
-.emu-status--live {
+   share the green --success token, weight bumped so it doesn't look dim.
+   NOTE: the selector is doubled (`.emu-status.emu-status--live`) on purpose — the
+   base `.emu-status` rule is defined LATER in this file, so with equal specificity
+   it would otherwise win the cascade and force the live text back to tertiary grey
+   (the long-standing "Live never turns green" bug). The extra class bumps
+   specificity so green wins regardless of source order. */
+.emu-status.emu-status--live {
   color: var(--success);
   font-weight: 700;
   letter-spacing: 0.3px;
@@ -993,6 +1004,19 @@ body {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent);
+}
+/* Disabled custom-time controls (date/time/rate/tz when Time source = System).
+   `appearance:none` strips the native disabled dimming, so grey them explicitly. */
+.settings-watch-select:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background-color: var(--control-press);
+}
+.settings-watch-select:disabled:hover { border-color: var(--border); }
+/* The "Run custom time" button greys out alongside its controls. */
+.lib-pick-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .settings-time-status { font-size: var(--type-caption); margin-top: 6px; }

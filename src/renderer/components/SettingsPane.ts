@@ -48,6 +48,12 @@ const COMMON_ZONES = [
   "Asia/Tokyo", "Australia/Sydney", "Pacific/Auckland",
 ];
 
+/** First common zone that isn't the host — the default landing zone when entering
+ * Timezone mode, so the mode is immediately meaningful (not just "host again"). */
+function firstNonHostZone(hostTz: string): string {
+  return COMMON_ZONES.find((z) => z !== hostTz) ?? "UTC";
+}
+
 /** Compose date (YYYY-MM-DD) + time (HH:MM) into a UTC-naive epoch ms (Date.UTC,
  * no host offset) — matches timeController's custom anchor contract. */
 function customWallMs(dateStr: string, timeStr: string): number {
@@ -301,7 +307,13 @@ export class SettingsPane {
     sourceLabel.textContent = "Time source";
     this.sourceSelect = document.createElement("select");
     this.sourceSelect.className = "settings-watch-select";
-    for (const [value, text] of [["system", "System"], ["custom", "Custom"]]) {
+    // Three mutually-exclusive intents: live host time, a fixed custom date/time,
+    // or live time in another timezone. Each greys out whatever it doesn't use.
+    for (const [value, text] of [
+      ["system", "System"],
+      ["custom", "Custom date & time"],
+      ["zone", "Timezone"],
+    ]) {
       const opt = document.createElement("option");
       opt.value = value;
       opt.textContent = text;
@@ -403,7 +415,11 @@ export class SettingsPane {
 
     // ── Apply model: edits only mark dirty; watch changes on explicit apply. ──
     this.sourceSelect.addEventListener("change", () => {
-      if (this.sourceSelect.value === "custom") {
+      const mode = this.sourceSelect.value;
+      if (mode === "custom") {
+        // Fixed instant in the host zone: prefill now, default Frozen. Custom is
+        // host-local, so the timezone control stays on "System" (and greyed).
+        // Explicit apply via "Run custom time" — don't push on select.
         const { date, time: t } = nowDateTimeLocal();
         this.dateInput.value = date;
         this.timeInput.value = t;
@@ -411,13 +427,29 @@ export class SettingsPane {
         localStorage.setItem(TIME_CUSTOM_TIME_KEY, t);
         this.rateSelect.value = "frozen";
         localStorage.setItem(TIME_RATE_KEY, "frozen");
-        // Move tz off the synthetic "System" option to a real zone.
-        if (this.tzSelect.value === TZ_SYSTEM) {
-          this.tzSelect.value = localStorage.getItem(TIME_TZ_KEY) ?? hostTz;
-        }
+        this.tzSelect.value = TZ_SYSTEM;
         localStorage.setItem(TIME_SOURCE_KEY, "custom");
         this.timeDirty = true;
         this.syncTimeEnabled();
+        this.renderTimeStatus();
+      } else if (mode === "zone") {
+        // Live time elsewhere: custom date/time make no sense here, so reset them
+        // (they're greyed). Pick a real zone (default the first common zone that
+        // isn't the host) and apply immediately — this mode is live, not staged.
+        const { date, time: t } = nowDateTimeLocal();
+        this.dateInput.value = date;
+        this.timeInput.value = t;
+        this.rateSelect.value = "1x";
+        if (this.tzSelect.value === TZ_SYSTEM) {
+          const stored = localStorage.getItem(TIME_TZ_KEY);
+          this.tzSelect.value =
+            stored && stored !== TZ_SYSTEM && stored !== hostTz ? stored : firstNonHostZone(hostTz);
+        }
+        localStorage.setItem(TIME_SOURCE_KEY, "zone");
+        localStorage.setItem(TIME_TZ_KEY, this.tzSelect.value);
+        this.timeDirty = false;
+        this.syncTimeEnabled();
+        this.applyZone();
         this.renderTimeStatus();
       } else {
         this.selectSystem();
@@ -442,7 +474,17 @@ export class SettingsPane {
     });
     this.tzSelect.addEventListener("change", () => {
       localStorage.setItem(TIME_TZ_KEY, this.tzSelect.value);
-      markDirty();
+      // The timezone control is only enabled in Timezone mode, where a change
+      // applies live. Selecting the synthetic "System" zone returns to System.
+      if (this.sourceSelect.value === "zone") {
+        if (this.tzSelect.value === TZ_SYSTEM) {
+          this.sourceSelect.value = "system";
+          this.selectSystem();
+        } else {
+          this.applyZone();
+          this.renderTimeStatus();
+        }
+      }
     });
     this.runBtn.addEventListener("click", () => this.applyCustom());
     this.resetBtn.addEventListener("click", () => {
@@ -609,20 +651,15 @@ export class SettingsPane {
       this.timeInput.value = localStorage.getItem(TIME_CUSTOM_TIME_KEY) ?? stored.time;
       this.rateSelect.value = localStorage.getItem(TIME_RATE_KEY) ?? "1x";
       this.hour24 = localStorage.getItem(TIME_HOUR24_KEY) === "true";
-      const isCustom = this.sourceSelect.value === "custom";
-      // System mode shows the synthetic "System" option; custom shows the real zone.
-      this.tzSelect.value = isCustom
-        ? (localStorage.getItem(TIME_TZ_KEY) ?? hostTz)
-        : TZ_SYSTEM;
+      // Time source always starts at System on launch — a persisted Custom time
+      // (often a frozen, now-stale timestamp) shouldn't silently drive the watch
+      // across restarts. The custom field values above stay populated so switching
+      // to Custom restores the last-used date/time/rate/timezone.
+      this.sourceSelect.value = "system";
+      localStorage.setItem(TIME_SOURCE_KEY, "system");
+      this.tzSelect.value = TZ_SYSTEM;
       this.syncTimeEnabled();
-      if (isCustom) {
-        this.timeDirty = false;
-        const cfg = this.buildCustomConfig();
-        void window.studio.setTimeConfig(cfg).catch(() => {});
-        window.dispatchEvent(new CustomEvent("pebble-studio:time-changed", { detail: cfg }));
-      } else {
-        this.applySystem();
-      }
+      this.applySystem();
       this.renderTimeStatus();
     }
 
@@ -637,30 +674,63 @@ export class SettingsPane {
     return this.hour24;
   }
 
-  /** Enable/disable the custom-time controls based on the source dropdown. */
+  /**
+   * Enable/disable + show/hide controls for the active Time source mode, so the
+   * UI only ever exposes inputs that make sense:
+   *  - System: everything greyed; no buttons (auto-applies).
+   *  - Custom: date/time/rate enabled, timezone greyed (host-local); Run + Reset.
+   *  - Timezone: timezone enabled, date/time/rate greyed; "Reset to host zone".
+   */
   private syncTimeEnabled(): void {
-    const custom = this.sourceSelect.value === "custom";
+    const mode = this.sourceSelect.value;
+    const custom = mode === "custom";
+    const zone = mode === "zone";
     this.dateInput.disabled = !custom;
     this.timeInput.disabled = !custom;
     this.rateSelect.disabled = !custom;
-    this.tzSelect.disabled = !custom;
+    this.tzSelect.disabled = !zone;
     this.runBtn.disabled = !custom;
+    // Contextual buttons: Run only in Custom; the reset button is shown in both
+    // Custom and Timezone with a mode-appropriate label; hidden in System.
+    this.runBtn.hidden = !custom;
+    this.resetBtn.hidden = !(custom || zone);
+    this.resetBtn.textContent = zone ? "Reset to host zone" : "Reset to system";
+  }
+
+  /** Push a config to the emulator and notify the badge. Single apply path. */
+  private applyConfig(cfg: TimeConfig): void {
+    void window.studio.setTimeConfig(cfg).catch(() => {});
+    window.dispatchEvent(new CustomEvent("pebble-studio:time-changed", { detail: cfg }));
+    this.timeDirty = false;
   }
 
   /** Apply System time (1× host clock) — called from source→system & Reset. */
   private applySystem(): void {
-    const cfg: TimeConfig = {
+    localStorage.setItem(TIME_SOURCE_KEY, "system");
+    this.applyConfig({
       ...DEFAULT_TIME_CONFIG,
       source: "system",
       rate: "1x",
       timezone: detectHostTimezone(),
       hour24: this.read24h(),
       customWallMs: 0,
-    };
-    localStorage.setItem(TIME_SOURCE_KEY, "system");
-    void window.studio.setTimeConfig(cfg).catch(() => {});
-    window.dispatchEvent(new CustomEvent("pebble-studio:time-changed", { detail: cfg }));
-    this.timeDirty = false;
+    });
+  }
+
+  /** Apply Timezone view (live time in the selected zone) — source→zone & tz change. */
+  private applyZone(): void {
+    const timezone = this.tzSelect.value === TZ_SYSTEM ? detectHostTimezone() : this.tzSelect.value;
+    localStorage.setItem(TIME_SOURCE_KEY, "zone");
+    // Encoded as system-source with a chosen zone; the timeController offset math
+    // renders live wall-clock in `timezone` (see anchorFor's firmware contract).
+    this.applyConfig({
+      ...DEFAULT_TIME_CONFIG,
+      source: "system",
+      rate: "1x",
+      timezone,
+      hour24: this.read24h(),
+      customWallMs: 0,
+    });
   }
 
   /** Switch the tz control back to "System", apply system, resync UI. */
@@ -671,16 +741,14 @@ export class SettingsPane {
     this.renderTimeStatus();
   }
 
-  /** Build the custom TimeConfig from the current control values. */
+  /** Build the custom TimeConfig from the current control values. Custom is always
+   * host-local (the timezone control is greyed in Custom mode). */
   private buildCustomConfig(): TimeConfig {
-    const timezone = this.tzSelect.value === TZ_SYSTEM
-      ? detectHostTimezone()
-      : this.tzSelect.value;
     return {
       ...DEFAULT_TIME_CONFIG,
       source: "custom",
       rate: this.rateSelect.value as Rate,
-      timezone,
+      timezone: detectHostTimezone(),
       hour24: this.read24h(),
       customWallMs: customWallMs(this.dateInput.value, this.timeInput.value),
     };
@@ -691,19 +759,25 @@ export class SettingsPane {
     localStorage.setItem(TIME_CUSTOM_DATE_KEY, this.dateInput.value);
     localStorage.setItem(TIME_CUSTOM_TIME_KEY, this.timeInput.value);
     localStorage.setItem(TIME_RATE_KEY, this.rateSelect.value);
-    localStorage.setItem(TIME_TZ_KEY, this.tzSelect.value);
     localStorage.setItem(TIME_SOURCE_KEY, "custom");
-    const cfg = this.buildCustomConfig();
-    void window.studio.setTimeConfig(cfg).catch(() => {});
-    window.dispatchEvent(new CustomEvent("pebble-studio:time-changed", { detail: cfg }));
-    this.timeDirty = false;
+    this.applyConfig(this.buildCustomConfig());
     this.renderTimeStatus();
   }
 
   /** Update the status line under the Run/Reset buttons. */
   private renderTimeStatus(): void {
     const el = this.timeStatusEl;
-    if (this.sourceSelect.value !== "custom") {
+    const mode = this.sourceSelect.value;
+    if (mode === "zone") {
+      // Live time in the chosen zone — no staging, so always "running".
+      const zone = this.tzSelect.value === TZ_SYSTEM ? detectHostTimezone() : this.tzSelect.value;
+      const city = zone.split("/").pop()?.replace(/_/g, " ") ?? zone;
+      el.textContent = `● Viewing live time in ${city}`;
+      el.classList.add("settings-time-status--running");
+      el.classList.remove("settings-time-status--edited");
+      return;
+    }
+    if (mode !== "custom") {
       el.textContent = "";
       el.classList.remove("settings-time-status--edited", "settings-time-status--running");
       return;

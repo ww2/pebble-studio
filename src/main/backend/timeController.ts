@@ -56,14 +56,35 @@ export function detectHostTimezone(get: () => string = () => Intl.DateTimeFormat
   return tz;
 }
 
-/** Build the stepping anchor from a config at real time `nowMs`. */
-export function anchorFor(cfg: TimeConfig, nowMs: number): TimeState {
+/**
+ * Build the stepping anchor from a config at real time `nowMs`.
+ *
+ * Firmware offset contract: in practice the emulator firmware renders the pushed
+ * epoch through the HOST's local UTC offset — it does NOT treat `--utc` as
+ * offset 0 (that assumption put the watch a full host-offset off, e.g. −5h).
+ * So we compute the wall-clock we want *displayed* and subtract the host offset
+ * once; the firmware adds it back, landing on the intended time. Consequences:
+ *   - System mode (cfg.timezone === host): nets out to plain true UTC.
+ *   - Timezone mode (cfg.timezone === some zone Z): shifts by (Z − host).
+ *   - Custom mode: the entered host-local wall-clock, minus the host offset.
+ * `hostTz` is injectable so the math is deterministic under test.
+ */
+export function anchorFor(
+  cfg: TimeConfig,
+  nowMs: number,
+  hostTz: string = detectHostTimezone(),
+): TimeState {
   const multiplier = RATE_MULT[cfg.rate];
+  const at = new Date(nowMs);
+  const hostOffsetSec = tzOffsetMinutes(hostTz, at) * 60;
   let anchorUtcSec: number;
   if (cfg.source === "system") {
-    anchorUtcSec = Math.floor(nowMs / 1000) + tzOffsetMinutes(cfg.timezone, new Date(nowMs)) * 60;
+    // Desired display = live wall-clock in cfg.timezone (host for System mode, a
+    // chosen zone for Timezone mode). Minus the host offset the firmware re-adds.
+    anchorUtcSec = Math.floor(nowMs / 1000) + tzOffsetMinutes(cfg.timezone, at) * 60 - hostOffsetSec;
   } else {
-    anchorUtcSec = Math.floor(cfg.customWallMs / 1000);
+    // Desired display = the entered host-local wall-clock. Minus the host offset.
+    anchorUtcSec = Math.floor(cfg.customWallMs / 1000) - hostOffsetSec;
   }
   return { source: cfg.source, multiplier, timezone: cfg.timezone, anchorUtcSec, anchorRealMs: nowMs };
 }
@@ -91,11 +112,12 @@ const RESYNC_MS = 30_000;
 
 export function makeTimeController(
   getDriver: () => TimeDriver | null,
-  deps: { now?: () => number } = {},
+  deps: { now?: () => number; hostTz?: () => string } = {},
 ): TimeController {
   const now = deps.now ?? (() => Date.now());
+  const hostTz = deps.hostTz ?? (() => detectHostTimezone());
   let cfg: TimeConfig = { ...DEFAULT_TIME_CONFIG };
-  let state: TimeState = anchorFor(cfg, now());
+  let state: TimeState = anchorFor(cfg, now(), hostTz());
   let timer: ReturnType<typeof setInterval> | null = null;
   let lastSyncMs = 0;
   let pushing = false;
@@ -130,7 +152,7 @@ export function makeTimeController(
     getConfig: () => ({ ...cfg }),
     async setConfig(next: TimeConfig): Promise<void> {
       cfg = { ...next };
-      state = anchorFor(cfg, now());
+      state = anchorFor(cfg, now(), hostTz());
       lastSyncMs = now();
       const d = getDriver();
       if (d) { try { await d.timeFormat(cfg.hour24); } catch { /* ignore */ } }
@@ -138,7 +160,7 @@ export function makeTimeController(
       syncTimer();
     },
     async applyAll(): Promise<void> {
-      state = anchorFor(cfg, now());
+      state = anchorFor(cfg, now(), hostTz());
       lastSyncMs = now();
       const d = getDriver();
       if (d) { try { await d.timeFormat(cfg.hour24); } catch { /* ignore */ } }
