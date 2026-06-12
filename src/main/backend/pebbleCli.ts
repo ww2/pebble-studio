@@ -43,12 +43,25 @@ export function buttonCmd(button: ButtonId, action: ButtonAction): PebbleCommand
 export function accelTapCmd(): PebbleCommand { return base("emu-tap"); }
 
 /**
- * Sets emulator time.
- * Real CLI: pebble emu-set-time <time>
+ * Sets emulator time. With utc=true appends --utc so the firmware applies the
+ * value as UTC (utc_offset=0) — making the *displayed* time exactly the epoch
+ * interpreted as UTC, independent of the host timezone. We always pass epoch
+ * seconds + utc=true so timezone display is deterministic (see timeController).
+ * Real CLI: pebble emu-set-time <time> [--utc]
  *   where <time> is HH:MM:SS (today, local) or Unix UTC seconds.
  *   ISO 8601 strings are NOT accepted.
  */
-export function setTimeCmd(time: string): PebbleCommand { return base("emu-set-time", time); }
+export function setTimeCmd(time: string, utc = false): PebbleCommand {
+  return base("emu-set-time", ...(utc ? [time, "--utc"] : [time]));
+}
+
+/**
+ * Sets the 12h/24h clock style (what clock_is_24h_style() reads).
+ * Real CLI: pebble emu-time-format --format {12h|24h}
+ */
+export function timeFormatCmd(hour24: boolean): PebbleCommand {
+  return base("emu-time-format", "--format", hour24 ? "24h" : "12h");
+}
 
 /**
  * Toggles Bluetooth connection state.

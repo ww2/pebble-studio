@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  installCmd, buttonCmd, accelTapCmd, setTimeCmd, btCmd, batteryCmd, screenshotCmd, bootCmd, wipeCmd,
+  installCmd, buttonCmd, accelTapCmd, setTimeCmd, timeFormatCmd, btCmd, batteryCmd, screenshotCmd, bootCmd, wipeCmd,
 } from "../../src/main/backend/pebbleCli.js";
 
 describe("pebbleCli argv builders", () => {
@@ -45,5 +45,23 @@ describe("pebbleCli argv builders", () => {
     expect(c.args).toEqual(["wipe"]);
     // Confirm no --emulator flag is present (would be a CLI error)
     expect(c.args).not.toContain("--emulator");
+  });
+});
+
+describe("setTimeCmd --utc", () => {
+  it("omits --utc by default", () => {
+    expect(setTimeCmd("1700000000").args).toEqual(["emu-set-time", "--emulator", expect.any(String), "1700000000"]);
+  });
+  it("appends --utc when requested", () => {
+    expect(setTimeCmd("1700000000", true).args).toContain("--utc");
+  });
+});
+
+describe("timeFormatCmd", () => {
+  it("builds 24h", () => {
+    expect(timeFormatCmd(true).args).toEqual(["emu-time-format", "--emulator", expect.any(String), "--format", "24h"]);
+  });
+  it("builds 12h", () => {
+    expect(timeFormatCmd(false).args).toContain("12h");
   });
 });
