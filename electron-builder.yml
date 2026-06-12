@@ -6,6 +6,10 @@ files:
   - dist/**/*
   - package.json
 asar: true
+extraResources:
+  - from: vendor/timeshim
+    to: timeshim
+    filter: ["timeshim.c", "timeshim-x86_64.so"]
 win:
   target:
     - dir

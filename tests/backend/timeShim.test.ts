@@ -1,0 +1,203 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import {
+  chunkB64, deployFileCmds, wrapperScript, selfTestCmd, compileShimCmd,
+  setFakeTimeCmd, parseSelfTest, STUDIO_DIR, CTL_PATH,
+  isShimReady, _resetShimState, ensureTimeShim,
+} from "../../src/main/backend/timeShim.js";
+
+const noQuotes = (s: string) => { expect(s).not.toMatch(/['"]/); };
+
+describe("timeShim command builders", () => {
+  it("chunks base64 into ≤4000-char shell-safe pieces", () => {
+    const b64 = "A".repeat(9001);
+    const chunks = chunkB64(b64);
+    expect(chunks.join("")).toBe(b64);
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(4000);
+  });
+
+  it("deployFileCmds emits quote-free append commands ending in decode", () => {
+    const cmds = deployFileCmds("timeshim.so", Buffer.from("hello world"));
+    for (const c of cmds) noQuotes(c);
+    expect(cmds[0]).toContain(`mkdir -p ${STUDIO_DIR}`);
+    expect(cmds[cmds.length - 1]).toContain("base64 -d");
+  });
+
+  it("wrapper script execs the current-symlink qemu and exports the control file", () => {
+    const w = wrapperScript();
+    expect(w).toContain("SDKs/current/toolchain/bin/qemu-pebble");
+    expect(w).toContain("PEBBLE_FAKETIME_FILE=");
+    expect(w).toMatch(/exec .*qemu-pebble \"\$@\"/);   // quotes OK INSIDE content (it's base64-deployed)
+  });
+
+  it("selfTestCmd + compileShimCmd + setFakeTimeCmd are quote-free", () => {
+    noQuotes(selfTestCmd());
+    noQuotes(compileShimCmd());
+    noQuotes(setFakeTimeCmd(1577836800, 0).args[1]);
+    noQuotes(setFakeTimeCmd(null, 10).args[1]);
+  });
+
+  it("setFakeTimeCmd formats target and rate", () => {
+    expect(setFakeTimeCmd(1577836800, 2).args[1]).toContain(`echo 1577836800 2 > ${CTL_PATH}`);
+    expect(setFakeTimeCmd(null, 1).args[1]).toContain(`echo - 1 > ${CTL_PATH}`);
+  });
+
+  it("parseSelfTest accepts ±120s around the expected faked epoch", () => {
+    const now = 1_700_000_000;
+    expect(parseSelfTest(String(now + 86400), now)).toBe(true);
+    expect(parseSelfTest(String(now), now)).toBe(false);
+    expect(parseSelfTest("garbage", now)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ensureTimeShim integration paths (fake runner, no real filesystem access)
+// ---------------------------------------------------------------------------
+
+/** Fake runner factory: returns a runner that records cmdlines and plays back
+ * canned { code, stdout, stderr } responses in order (last one repeats). */
+function makeRunner(
+  responses: Array<{ code: number; stdout: string; stderr: string }>,
+): { run: (cmd: string) => Promise<{ code: number; stdout: string; stderr: string }>; calls: string[] } {
+  const calls: string[] = [];
+  let idx = 0;
+  const run = async (cmd: string) => {
+    calls.push(cmd);
+    const r = responses[Math.min(idx, responses.length - 1)];
+    idx++;
+    return r;
+  };
+  return { run, calls };
+}
+
+const fakeResources = async () => ({
+  so: Buffer.from("fake-so-bytes"),
+  src: Buffer.from("fake-src-bytes"),
+});
+
+const fakeNow = () => 1_700_000_000 * 1000; // ms → / 1000 = nowSec
+
+describe("ensureTimeShim", () => {
+  beforeEach(() => _resetShimState());
+
+  it("success path: deploys so/src/wrapper then self-tests → isShimReady true", async () => {
+    const now = fakeNow() / 1000;
+    const selfTestOutput = String(now + 86400);
+    // All deploy commands succeed; self-test returns the faked epoch
+    const { run, calls } = makeRunner([
+      { code: 0, stdout: "", stderr: "" },         // deploy commands (repeat)
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: selfTestOutput, stderr: "" }, // selfTest
+    ]);
+    const result = await ensureTimeShim(run, { resources: fakeResources, now: () => fakeNow() });
+    expect(result).toBe(true);
+    expect(isShimReady()).toBe(true);
+    // Verify deploy commands were issued before self-test: so, src, wrapper must all appear
+    const allCmds = calls.join("\n");
+    expect(allCmds).toContain("timeshim.so");
+    expect(allCmds).toContain("timeshim.c");
+    expect(allCmds).toContain("qemu-pebble");
+    // Last command is the self-test
+    expect(calls[calls.length - 1]).toContain("date +%s");
+  });
+
+  it("first self-test fails → compileShimCmd issued → second self-test succeeds → true", async () => {
+    const now = fakeNow() / 1000;
+    const selfTestOutput = String(now + 86400);
+    // We need to supply enough responses: many deploy no-ops then a failing selfTest,
+    // a compile no-op, then a passing selfTest. Track self-test call count separately
+    // so we can distinguish the first from the second.
+    let selfTestCount = 0;
+    const calls: string[] = [];
+    const run = async (cmd: string) => {
+      calls.push(cmd);
+      if (cmd.includes("date +%s")) {
+        selfTestCount++;
+        if (selfTestCount === 1) {
+          // first self-test call: fail (simulates pre-built .so glibc mismatch)
+          return { code: 1, stdout: "bad", stderr: "error" };
+        }
+        // second self-test call (after recompile): succeed
+        return { code: 0, stdout: selfTestOutput, stderr: "" };
+      }
+      // all other commands (deploy, compile): succeed silently
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const result = await ensureTimeShim(run, { resources: fakeResources, now: () => fakeNow() });
+    expect(result).toBe(true);
+    expect(isShimReady()).toBe(true);
+    // compileShimCmd should have been called between the two self-tests
+    const selfTestIdxs = calls.map((c, i) => (c.includes("date +%s") ? i : -1)).filter(i => i >= 0);
+    expect(selfTestIdxs.length).toBe(2);
+    const compiledBetween = calls
+      .slice(selfTestIdxs[0] + 1, selfTestIdxs[1])
+      .some(c => c.includes("timeshim.so") && (c.includes("cc ") || c.includes("gcc ")));
+    expect(compiledBetween).toBe(true);
+  });
+
+  it("all-fail path: returns false, isShimReady false, no throw", async () => {
+    const { run } = makeRunner([{ code: 1, stdout: "bad", stderr: "err" }]);
+    let threw = false;
+    let result = false;
+    try {
+      result = await ensureTimeShim(run, { resources: fakeResources, now: () => fakeNow() });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(false);
+    expect(result).toBe(false);
+    expect(isShimReady()).toBe(false);
+  });
+
+  it("resources-throw: returns false, no throw", async () => {
+    const badResources = async (): Promise<{ so: Buffer; src: Buffer }> => {
+      throw new Error("disk read failure");
+    };
+    const { run, calls } = makeRunner([{ code: 0, stdout: "", stderr: "" }]);
+    let threw = false;
+    let result = false;
+    try {
+      result = await ensureTimeShim(run, { resources: badResources, now: () => fakeNow() });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(false);
+    expect(result).toBe(false);
+    expect(isShimReady()).toBe(false);
+    // No deploy commands should have been issued
+    expect(calls.length).toBe(0);
+  });
+
+  it("second call returns cached result without re-running the runner", async () => {
+    const now = fakeNow() / 1000;
+    const selfTestOutput = String(now + 86400);
+    const { run, calls } = makeRunner([
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: "", stderr: "" },
+      { code: 0, stdout: selfTestOutput, stderr: "" },
+    ]);
+    await ensureTimeShim(run, { resources: fakeResources, now: () => fakeNow() });
+    const callsAfterFirst = calls.length;
+    // Second call — should be a cache hit
+    await ensureTimeShim(run, { resources: fakeResources, now: () => fakeNow() });
+    expect(calls.length).toBe(callsAfterFirst); // no new calls
+    expect(isShimReady()).toBe(true);
+  });
+});
