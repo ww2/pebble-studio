@@ -1,33 +1,33 @@
 export type TimeSource = "system" | "custom";
 export type Rate = "frozen" | "1x" | "2x" | "4x" | "10x";
 
-/** Virtual-clock multiplier per rate. 0 = frozen, 1 = real-time, N = N× faster. */
+/** Fake-clock multiplier per rate. 0 = frozen, 1 = real-time, N = N× faster. */
 export const RATE_MULT: Record<Rate, number> = { frozen: 0, "1x": 1, "2x": 2, "4x": 4, "10x": 10 };
 
 /**
- * EMULATOR TIME CONTRACT (verified empirically against qemu-pebble + pebble-tool
- * v5.0.37 / SDK 4.9.169 — see memory `pebble-emu-time-mechanism`):
+ * EMULATOR TIME CONTRACT — v0.0.13 control-file model (spec:
+ * docs/superpowers/specs/2026-06-12-pebble-studio-v0.0.13-time-clay-port-design.md §A2;
+ * background: memory `pebble-emu-time-mechanism`):
  *
- *   - The qemu RTC is slaved to the HOST wall-clock UTC. A pushed absolute time is
- *     IGNORED — both SetUTC.unix_time AND SetLocaltime are no-ops (the clock stays
- *     at host UTC, ticking 1×). We can NOT set absolute time.
- *   - The firmware DOES honor `utc_offset` (Int16 minutes): displayed local =
- *     host_UTC + utc_offset. (Verified: +540 → Tokyo, −240 → New York.)
- *   - pypkjs (the phone bridge we push through) serves ONE client at a time, so a
- *     PERSISTENT pusher would starve the app's button/screenshot commands. We
- *     therefore push via SHORT-LIVED connections (driver.setTzOffset), and only
- *     when the integer offset actually changes — leaving the bridge free between.
- *
- * The single lever is `utc_offset`. We model a virtual clock V(t)=base+rate·(t−anchor)
- * and, on a 1 s main-process timer, push offset=round((V−host_UTC)/60) whenever that
- * minute value changes. Consequences:
- *   - System   → constant host offset (no timer churn).
- *   - Timezone → constant zone offset.
- *   - Custom 1× → constant (entered − now); shows the entered time, drifts at 1×.
- *   - Custom Frozen → offset decrements ~1/min so the displayed minute holds.
- *   - Custom 2×/4×/10× → offset grows so the display fast-forwards.
- * Minute granularity means SECONDS always come from the host (can't be frozen), and
- * |offset| ≤ 32767 min caps absolute displacement at ~±22.7 days. Resets on reboot.
+ *   - The qemu firmware clock is continuously re-jammed from the qemu PROCESS's
+ *     CLOCK_REALTIME. An LD_PRELOAD shim (timeShim.ts) fakes that clock, driven
+ *     by a control file `<target_unix|-> <rate>` re-read on mtime change. This
+ *     is the PRIMARY lever: true absolute date, real frozen seconds, exact rates,
+ *     via driver.setFakeTime(targetUnix|null, rate).
+ *   - `utc_offset` (Int16 minutes, raw SetUTC via driver.setTzOffset) remains
+ *     only for TIMEZONE DISPLAY: displayed local = fake_UTC + utc_offset. Every
+ *     `pebble` command's connect re-pushes the HOST's current offset
+ *     (post_connect clobber), so:
+ *       · System   → host offset; control file `- 1` (shim is a no-op).
+ *       · Timezone → chosen zone's offset; clobbers healed by reassert().
+ *       · Custom   → we keep utc_offset AT THE HOST OFFSET and bake the entered
+ *         wall-clock into the control-file target instead — the clobber's
+ *         host-offset re-push is then a no-op (immune by construction); no
+ *         reassert, no pusher timer.
+ *   - LEGACY FALLBACK (shim failed to deploy/self-test): the pre-v0.0.13
+ *     virtual-clock path — a 1 s timer pushing time-varying utc_offset values.
+ *     Minute granularity (seconds can't freeze), |offset| ≤ 32767 min caps the
+ *     displacement at ~±22.7 days, and resets on reboot.
  */
 export interface TimeConfig {
   source: TimeSource;
@@ -74,31 +74,24 @@ function clampOffset(min: number): number {
 }
 
 /**
- * The `utc_offset` (minutes) to display the configured time at real instant `nowMs`.
- * For non-1× custom rates this is time-varying (the virtual clock); for everything
- * else it is constant. `anchorMs` is the real time the config was applied (so the
- * virtual clock advances from there). `hostTz` is injectable for tests.
+ * The CONSTANT `utc_offset` (minutes) for a config. System/Timezone: the
+ * configured zone's offset. Custom: the HOST zone's offset — the entered time
+ * lives in the control-file target instead, so post_connect's host-offset
+ * re-push is a no-op (clobber-immune by construction).
  */
 export function offsetMinutesFor(
   cfg: TimeConfig,
   nowMs: number,
   hostTz: string = detectHostTimezone(),
-  anchorMs: number = nowMs,
 ): number {
-  void hostTz; // System & Timezone both encode the desired zone in cfg.timezone.
-  if (cfg.source === "custom") {
-    // virtual(now) = entered + rate·(elapsed since apply); display = host_UTC + offset,
-    // host_UTC = now, so offset = virtual − now.
-    const mult = RATE_MULT[cfg.rate];
-    const virtualMs = cfg.customWallMs + mult * (nowMs - anchorMs);
-    return clampOffset((virtualMs - nowMs) / 60000);
-  }
-  return clampOffset(tzOffsetMinutes(cfg.timezone, new Date(nowMs)));
+  return clampOffset(tzOffsetMinutes(cfg.source === "custom" ? hostTz : cfg.timezone, new Date(nowMs)));
 }
 
-/** Does this config use a time-varying offset (needs the 1 s pusher)? */
-export function isVirtualClock(cfg: TimeConfig): boolean {
-  return cfg.source === "custom" && RATE_MULT[cfg.rate] !== 1;
+/** Control-file target for the entered wall-clock: interpret the UTC-naive
+ * customWallMs in the host zone AT THE CURRENT INSTANT (not the entered date's
+ * DST regime) so displayed = entered even across DST boundaries. */
+export function fakeTargetUnix(customWallMs: number, hostTz: string, nowMs: number): number {
+  return Math.trunc(customWallMs / 1000) - tzOffsetMinutes(hostTz, new Date(nowMs)) * 60;
 }
 
 /** Watch time differs from plain host system time? (drives the renderer badge.) */
@@ -110,6 +103,10 @@ interface TimeDriver {
   /** Push a UTC offset (minutes) via a short-lived raw SetUTC. `tzName` (IANA
    * zone) becomes the SetUTC tz_name; omitted/absent for custom-anchor mode. */
   setTzOffset(offsetMin: number, tzName?: string): Promise<void>;
+  /** Write the time-shim control file: `<targetUnix|-> <rate>`. */
+  setFakeTime(targetUnix: number | null, rate: number): Promise<void>;
+  /** Deploy + self-test the LD_PRELOAD time shim (cached after first success). */
+  ensureTimeShim(): Promise<boolean>;
   timeFormat(hour24: boolean): Promise<void>;
 }
 
@@ -119,12 +116,16 @@ export interface TimeController {
   /** Re-assert current config on the (re)booted emulator. */
   applyAll(): Promise<void>;
   /** Force-push the current offset after a command that may have reset it (every
-   * pebble command re-syncs host time on connect). Heals the clobber immediately. */
+   * pebble command re-syncs the HOST offset on connect). Only matters for
+   * Timezone mode and the legacy custom fallback — shim-backed custom keeps the
+   * offset at the host offset, so the clobber is already a no-op. */
   reassert(): Promise<void>;
+  /** Time-shim readiness as last reported by ensureTimeShim() (false until checked). */
+  getStatus(): { shim: boolean };
   stop(): void;
 }
 
-/** How often the virtual-clock pusher recomputes (it only sends on minute change). */
+/** How often the legacy virtual-clock pusher recomputes (it only sends on minute change). */
 const VCLOCK_TICK_MS = 1000;
 
 export function makeTimeController(
@@ -134,25 +135,40 @@ export function makeTimeController(
   const now = deps.now ?? (() => Date.now());
   const hostTz = deps.hostTz ?? (() => detectHostTimezone());
   let cfg: TimeConfig = { ...DEFAULT_TIME_CONFIG };
-  let anchorMs = now();           // real time the current cfg was applied
+  let shimReady = false;     // last ensureTimeShim() result (false until first check)
+  let legacyActive = false;  // custom mode is running on the legacy fallback
+
+  // -------------------------------------------------------------------------
+  // LEGACY FALLBACK — pre-v0.0.13 virtual-clock machinery, kept VERBATIM for
+  // systems where the shim can't deploy (glibc mismatch, no compiler, …).
+  // Models V(t) = entered + rate·(t − anchor) and pushes utc_offset =
+  // round((V − now)/60) on a 1 s timer whenever the minute value changes.
+  // Limits: minute granularity (seconds always tick from the host), ±22.7 days.
+  // -------------------------------------------------------------------------
+  let anchorMs = now();                  // real time the current cfg was applied
   let lastPushed: number | null = null;  // last offset minutes actually sent
   let timer: ReturnType<typeof setInterval> | null = null;
   let pushing = false;
 
-  /** Send the offset for instant `t` if it differs from the last sent value. */
-  async function push(force: boolean): Promise<void> {
+  /** Legacy custom: time-varying offset so the display tracks the virtual clock. */
+  function legacyOffsetMinutesFor(c: TimeConfig, nowMs: number, anchor: number): number {
+    const mult = RATE_MULT[c.rate];
+    const virtualMs = c.customWallMs + mult * (nowMs - anchor);
+    return clampOffset((virtualMs - nowMs) / 60000);
+  }
+
+  /** Legacy custom: send the current virtual-clock offset if its minute changed. */
+  async function legacyPush(force: boolean): Promise<void> {
     if (pushing) return;
     pushing = true;
     try {
       const d = getDriver();
       if (!d) return;
-      const off = offsetMinutesFor(cfg, now(), hostTz(), anchorMs);
+      const off = legacyOffsetMinutesFor(cfg, now(), anchorMs);
       if (!force && off === lastPushed) return; // no minute change → leave bridge free
-      // For System/Timezone the offset IS a real zone → send its IANA name as
-      // tz_name so the watch shows a meaningful zone. Custom is a bare offset
-      // anchor (no real zone) → let the helper synthesize "UTC±h".
-      const tzName = cfg.source === "custom" ? undefined : cfg.timezone;
-      await d.setTzOffset(off, tzName);
+      // Custom is a bare offset anchor (no real zone) → no tz_name; the raw
+      // SetUTC helper synthesizes "UTC±h".
+      await d.setTzOffset(off);
       lastPushed = off;
     } catch { /* tool/emulator may be absent; degrade silently */ }
     finally { pushing = false; }
@@ -162,21 +178,52 @@ export function makeTimeController(
     if (timer) { clearInterval(timer); timer = null; }
   }
 
-  function syncTimer(): void {
+  /** The 1 s pusher runs ONLY in legacy custom mode with a non-1× rate
+   * (1× is a constant offset; shim-backed modes never need a timer). */
+  function syncLegacyTimer(): void {
     clearTimer();
-    // Only a virtual clock needs periodic re-pushing (offset changes over time).
-    // Static modes hold a constant offset; clobbers are healed by reassert().
-    if (isVirtualClock(cfg)) timer = setInterval(() => void push(false), VCLOCK_TICK_MS);
+    if (legacyActive && RATE_MULT[cfg.rate] !== 1) {
+      timer = setInterval(() => void legacyPush(false), VCLOCK_TICK_MS);
+    }
   }
+  // ----------------------------- end legacy ---------------------------------
 
-  /** Apply the current cfg: set the 12/24h format and push the initial offset. */
+  /** Apply the current cfg: 12/24h format, the constant utc_offset, then the
+   * shim control file (or the legacy fallback when the shim is unavailable). */
   async function apply(): Promise<void> {
-    anchorMs = now();
-    lastPushed = null;
+    clearTimer();
+    legacyActive = false;
     const d = getDriver();
-    if (d) { try { await d.timeFormat(cfg.hour24); } catch { /* ignore */ } }
-    await push(true);
-    syncTimer();
+    if (!d) return;
+
+    try { await d.timeFormat(cfg.hour24); } catch { /* ignore */ }
+
+    // Constant offset for ALL modes — boot needs it (firmware may default to
+    // offset 0). Custom keeps the HOST offset (clobber-immune, see contract).
+    const tzName = cfg.source === "custom" ? hostTz() : cfg.timezone;
+    try { await d.setTzOffset(offsetMinutesFor(cfg, now(), hostTz()), tzName); } catch { /* ignore */ }
+
+    try { shimReady = await d.ensureTimeShim(); } catch { shimReady = false; }
+
+    if (cfg.source === "custom") {
+      if (shimReady) {
+        try {
+          await d.setFakeTime(fakeTargetUnix(cfg.customWallMs, hostTz(), now()), RATE_MULT[cfg.rate]);
+        } catch { /* ignore */ }
+      } else {
+        // Legacy fallback: virtual clock via utc_offset.
+        legacyActive = true;
+        anchorMs = now();
+        lastPushed = null;
+        await legacyPush(true);
+        syncLegacyTimer();
+      }
+    } else if (shimReady) {
+      // System & Timezone: return the fake clock to real time. The shim has no
+      // reset; jumping to now at 1× IS the reset (sub-second skew acceptable).
+      try { await d.setFakeTime(Math.trunc(now() / 1000), 1); } catch { /* ignore */ }
+    }
+    // System/Timezone with no shim: nothing to undo — skip silently.
   }
 
   return {
@@ -189,8 +236,20 @@ export function makeTimeController(
       await apply();
     },
     async reassert(): Promise<void> {
-      await push(true);
+      // Heal the post_connect host-offset clobber only where it matters:
+      if (cfg.source === "system" && cfg.timezone !== hostTz()) {
+        // Timezone mode — re-push the chosen zone's offset.
+        const d = getDriver();
+        if (!d) return;
+        try { await d.setTzOffset(offsetMinutesFor(cfg, now(), hostTz()), cfg.timezone); } catch { /* ignore */ }
+      } else if (cfg.source === "custom" && legacyActive) {
+        // Legacy custom — re-push the virtual-clock offset.
+        await legacyPush(true);
+      }
+      // Shim-backed custom: NO-OP (offset is the host offset — exactly what
+      // post_connect pushes). Plain system mode (host zone): NO-OP.
     },
+    getStatus: () => ({ shim: shimReady }),
     stop(): void { clearTimer(); },
   };
 }
