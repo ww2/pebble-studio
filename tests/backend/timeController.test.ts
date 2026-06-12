@@ -163,6 +163,14 @@ describe("makeTimeController — shim-backed (primary path)", () => {
     tc.stop();
   });
 
+  it("getStatus().checked is false until the first real probe (regression: no false 'unavailable' at launch)", async () => {
+    const tc = makeTimeController(() => fakeDriver({ shim: false }), deps);
+    expect(tc.getStatus()).toEqual({ shim: false, checked: false });
+    await tc.applyAll();
+    expect(tc.getStatus()).toEqual({ shim: false, checked: true });
+    tc.stop();
+  });
+
   it("getStatus().shim reflects the last ensureTimeShim result", async () => {
     const ok = fakeDriver({ shim: true });
     const tc1 = makeTimeController(() => ok, deps);
