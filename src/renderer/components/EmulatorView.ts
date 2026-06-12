@@ -5,7 +5,43 @@ import { connectVnc, type VncHandle } from "../vncClient.js";
 import { loadBindings, resolveAction, type Bindings } from "../keybindings.js";
 import type { TimeConfig } from "../../main/backend/timeController.js";
 
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+/** Format hours/minutes as 12h "h:mm AM/PM" (default) or 24h "HH:MM". */
+function fmtHM(h: number, m: number, hour24: boolean): string {
+  const mm = String(m).padStart(2, "0");
+  if (hour24) return `${String(h).padStart(2, "0")}:${mm}`;
+  const ap = h < 12 ? "AM" : "PM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${mm} ${ap}`;
+}
+
 const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
+
+/**
+ * Width of the `.emu-frame` casing border (px). The frame is `box-sizing:
+ * border-box` with a 1px border (app.css `.emu-frame { border: 1px ... }`), so a
+ * model-switch's settled frame size is `bodyWidth + 2*frame-pad + 2*border`.
+ */
+const FRAME_BORDER_PX = 1;
+
+/**
+ * Pure Fit-scale math (extracted so it's unit-testable and timing-independent):
+ * the largest uniform scale that fits a natural-size frame into the available
+ * box, clamped to [0.25, 6]. Returns 0 for non-positive inputs (caller bails).
+ *
+ * Kept side-effect-free and DOM-free on purpose — `applyFitScale` does the
+ * measuring and feeds the numbers here. The clamp ceiling (6) matches the
+ * historical Fit cap.
+ */
+export function fitScale(
+  availW: number,
+  availH: number,
+  naturalW: number,
+  naturalH: number,
+): number {
+  if (availW <= 0 || availH <= 0 || naturalW <= 0 || naturalH <= 0) return 0;
+  return Math.max(0.25, Math.min(availW / naturalW, availH / naturalH, 6));
+}
 
 /**
  * The renderer's StudioApi (declared in main.ts, owned by Wave 2b) doesn't yet
@@ -49,6 +85,8 @@ export class EmulatorView {
   private readonly forceCloseBtn: HTMLButtonElement;
   private readonly tapBtn: HTMLButtonElement;
   private readonly shakeBtn: HTMLButtonElement;
+  private readonly timelineBtn: HTMLButtonElement;
+  private timelinePeek = false;
   private readonly zoomSelect: HTMLSelectElement;
   private readonly frameWrapper: HTMLElement;
   private readonly frame: HTMLElement;
@@ -114,6 +152,13 @@ export class EmulatorView {
   /** Tiny offscreen 2D context used to read a sample region of the noVNC canvas. */
   private fpsSampleCtx: CanvasRenderingContext2D | null = null;
 
+  /** Last time config received via setTimeBadge; null = hidden. */
+  private timeCfg: TimeConfig | null = null;
+  /** Interval id for the live-clock ticker in the time badge. */
+  private badgeTimer: ReturnType<typeof setInterval> | null = null;
+  /** Host timezone string last passed to setTimeBadge (used by the ticker). */
+  private hostTz = "";
+
   constructor() {
     this.el = document.createElement("div");
     this.el.className = "emu-panel";
@@ -131,6 +176,7 @@ export class EmulatorView {
       <div class="emu-actions">
         <button class="emu-action emu-action--subtle" id="emu-tap" type="button">Tap</button>
         <button class="emu-action emu-action--subtle" id="emu-shake" type="button">Shake</button>
+        <button class="emu-action emu-action--subtle" id="emu-timeline" type="button" title="Toggle timeline quick view (peek)">Timeline</button>
         <div class="emu-actions-sep" aria-hidden="true"></div>
         <button class="emu-action emu-action--subtle" id="emu-relaunch" type="button" title="Stop and reboot the current platform">Relaunch</button>
         <button class="emu-action emu-action--subtle emu-action--danger" id="emu-force-close" type="button" title="Force-close the emulator">Force-close</button>
@@ -188,6 +234,7 @@ export class EmulatorView {
     const shakeBtn = this.el.querySelector<HTMLButtonElement>("#emu-shake")!;
     this.tapBtn = tapBtn;
     this.shakeBtn = shakeBtn;
+    this.timelineBtn = this.el.querySelector<HTMLButtonElement>("#emu-timeline")!;
     tapBtn.addEventListener("click", () => {
       if (this.state !== "live") return;
       void window.studio.accelTap();
@@ -196,6 +243,12 @@ export class EmulatorView {
       if (this.state !== "live") return;
       void window.studio.accelTap();
       setTimeout(() => void window.studio.accelTap(), 120);
+    });
+    this.timelineBtn.addEventListener("click", () => {
+      if (this.state !== "live") return;
+      this.timelinePeek = !this.timelinePeek;
+      this.timelineBtn.classList.toggle("emu-action--on", this.timelinePeek);
+      void window.studio.timelineQuickView(this.timelinePeek).catch(() => {});
     });
 
     // Lifecycle buttons. The single Launch/Relaunch button routes to relaunch()
@@ -331,7 +384,7 @@ export class EmulatorView {
    * large window and shrinks it (keeping the rows on-screen) in a small one. The
    * row heights are included in the budget so the zoom row is never cut off.
    */
-  private applyFitScale(): void {
+  private applyFitScale(naturalOverride?: { w: number; h: number }): void {
     const col = this.el.parentElement; // .stage-col (place-items:center container)
     if (!col) return;
     // If the observer was created before the panel was attached, it may be
@@ -371,16 +424,29 @@ export class EmulatorView {
     const availH = colH - padY - rowsH - gapsH;
     if (availW <= 0 || availH <= 0) return;
 
-    // Natural (unscaled) frame size: clear the transform so offset* reflects the
-    // true size regardless of the previous scale.
-    const prev = this.frame.style.transform;
-    this.frame.style.transform = "";
-    const naturalW = this.frame.offsetWidth;
-    const naturalH = this.frame.offsetHeight;
-    this.frame.style.transform = prev;
-    if (naturalW <= 0 || naturalH <= 0) return; // not measurable yet
-
-    const scale = Math.max(0.25, Math.min(availW / naturalW, availH / naturalH, 6));
+    // Natural (unscaled) frame size. Two sources:
+    //  - naturalOverride: the SETTLED target size, computed from known chrome
+    //    values by applyGeometry. Used on a model switch because the stage/frame
+    //    are mid-morph (a 420ms CSS width/height/padding transition), so reading
+    //    offset* here would return the OLD model's transient size and over-scale
+    //    (worst on aplite→gabbro). Passing the target removes the timing race.
+    //  - otherwise (window-resize via the ResizeObserver, or numeric→Fit): the
+    //    geometry is already settled, so measure the live frame. Clear the
+    //    transform first so offset* reflects the unscaled size, not the prior scale.
+    let naturalW: number;
+    let naturalH: number;
+    if (naturalOverride) {
+      naturalW = naturalOverride.w;
+      naturalH = naturalOverride.h;
+    } else {
+      const prev = this.frame.style.transform;
+      this.frame.style.transform = "";
+      naturalW = this.frame.offsetWidth;
+      naturalH = this.frame.offsetHeight;
+      this.frame.style.transform = prev;
+    }
+    const scale = fitScale(availW, availH, naturalW, naturalH);
+    if (scale <= 0) return; // not measurable yet
     this.setScale(scale);
   }
 
@@ -441,6 +507,7 @@ export class EmulatorView {
     const liveActions = s === "live";
     this.tapBtn.disabled = !liveActions;
     this.shakeBtn.disabled = !liveActions;
+    this.timelineBtn.disabled = !liveActions;
     for (const el of this.buttonEls) el.disabled = !liveActions;
 
     // J-runtime: the FPS sampler only runs while diagnostics on AND live.
@@ -452,26 +519,64 @@ export class EmulatorView {
     this.relaunchBtn.classList.remove("emu-action--attn");
   }
 
+  /** Reset the timeline quick-view toggle to off (called on any teardown from live). */
+  private resetTimelinePeek(): void {
+    this.timelinePeek = false;
+    this.timelineBtn.classList.remove("emu-action--on");
+  }
+
   /**
    * Reflect the current time config in the non-system-time badge. Hidden for a
-   * plain System / 1x / host-tz config; otherwise shows a compact summary of
-   * what makes the watch clock diverge from real local time (frozen, accelerated,
-   * a non-home timezone, or a custom anchor). Driven by the
+   * plain System / 1x / host-tz config; otherwise shows the custom date+time (for
+   * a custom anchor) or a compact summary of divergence (frozen/accelerated/non-home-tz)
+   * plus a live system-clock readout updated every 10 s. Driven by the
    * `pebble-studio:time-changed` window event (wired in main.ts).
    */
   setTimeBadge(cfg: TimeConfig | null, hostTz: string): void {
-    if (!cfg) { this.timeBadge.hidden = true; return; }
-    const parts: string[] = [];
-    if (cfg.rate === "frozen") parts.push("❄");
-    else if (cfg.rate !== "1x") parts.push(`⏩ ${cfg.rate}`);
-    if (cfg.timezone !== hostTz) {
-      const short = cfg.timezone.split("/").pop()?.replace(/_/g, " ") ?? cfg.timezone;
-      parts.push(`🌐 ${short}`);
+    this.timeCfg = cfg;
+    this.hostTz = hostTz;
+    this.renderTimeBadge();
+    // Safety guard: a time-config change (system or custom) must never disturb
+    // the live indicator. Re-assert the green "● Live" status/class iff live, so
+    // the requirement holds even if some other path were to perturb it. Only the
+    // separate badge element should reflect time config — never `this.status`.
+    if (this.state === "live") {
+      this.status.textContent = "● Live";
+      this.status.classList.add("emu-status--live");
     }
-    if (cfg.source === "custom" && parts.length === 0) parts.push("⏱ custom");
-    if (parts.length === 0) { this.timeBadge.hidden = true; return; }
+  }
+
+  private renderTimeBadge(): void {
+    const cfg = this.timeCfg;
+    if (!cfg) { this.hideTimeBadge(); return; }
+    const parts: string[] = [];
+    if (cfg.source === "custom") {
+      const d = new Date(cfg.customWallMs); // UTC-naive → read via getUTC*
+      const label = `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()} ${d.getUTCFullYear()} ` +
+        fmtHM(d.getUTCHours(), d.getUTCMinutes(), cfg.hour24);
+      const icon = cfg.rate === "frozen" ? "❄" : cfg.rate !== "1x" ? `⏩ ${cfg.rate}` : "🕒";
+      parts.push(`${icon} ${label}`);
+    } else if (cfg.rate !== "1x" || cfg.timezone !== this.hostTz) {
+      if (cfg.rate === "frozen") parts.push("❄");
+      else if (cfg.rate !== "1x") parts.push(`⏩ ${cfg.rate}`);
+      if (cfg.timezone !== this.hostTz) parts.push(`🌐 ${cfg.timezone.split("/").pop()?.replace(/_/g, " ") ?? cfg.timezone}`);
+    }
+    if (parts.length === 0) { this.hideTimeBadge(); return; }
+    const now = new Date();
+    parts.push(`sys ${fmtHM(now.getHours(), now.getMinutes(), cfg.hour24)}`);
     this.timeBadge.textContent = parts.join(" · ");
     this.timeBadge.hidden = false;
+    this.startBadgeTicker();
+  }
+
+  private startBadgeTicker(): void {
+    if (this.badgeTimer) return;
+    this.badgeTimer = setInterval(() => this.renderTimeBadge(), 10_000);
+  }
+
+  private hideTimeBadge(): void {
+    if (this.badgeTimer) { clearInterval(this.badgeTimer); this.badgeTimer = null; }
+    this.timeBadge.hidden = true;
   }
 
   /**
@@ -674,6 +779,7 @@ export class EmulatorView {
   async relaunch(): Promise<void> {
     if (this.state !== "live" || !this.currentPlatform) return;
     const id = this.currentPlatform;
+    this.resetTimelinePeek();
     this.state = "stopping";
     this.disconnectVnc();
     this.status.textContent = "Stopping…";
@@ -696,6 +802,7 @@ export class EmulatorView {
    */
   async forceClose(): Promise<void> {
     if (this.state === "stopped") return;
+    this.resetTimelinePeek();
     this.bootGen++; // invalidate any in-flight boot
     this.state = "stopping";
     this.status.textContent = "Stopping…";
@@ -808,7 +915,22 @@ export class EmulatorView {
     this.frame.classList.remove("emu-frame--switching");
 
     // C3: the natural frame size just changed; re-fit if Fit is the active zoom.
-    if (this.zoom === "fit") this.applyFitScale();
+    // The stage/frame are mid-morph here (CSS animates width/height/padding over
+    // 420ms — see .emu-stage / .emu-frame transitions in app.css), so reading the
+    // frame's live offsetWidth/Height would return the OLD model's transient size
+    // and over-scale (worst aplite→gabbro). Instead pass the SETTLED target size,
+    // computed from the known chrome body + the frame's box-model chrome:
+    //   border-box frame = stage body (bodyWidth/Height) + 2×frame-pad + 2×border
+    // frame-pad is 16px square / 18px round (app.css .emu-frame{--frame-pad}); the
+    // frame has a 1px border. This makes Fit timing-independent on model switches.
+    if (this.zoom === "fit") {
+      const framePad = info.round ? 18 : 16;
+      const chromePx = 2 * framePad + 2 * FRAME_BORDER_PX;
+      this.applyFitScale({
+        w: chrome.bodyWidth + chromePx,
+        h: chrome.bodyHeight + chromePx,
+      });
+    }
   }
 
   /**

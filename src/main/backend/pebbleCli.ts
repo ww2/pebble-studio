@@ -63,6 +63,12 @@ export function timeFormatCmd(hour24: boolean): PebbleCommand {
   return base("emu-time-format", "--format", hour24 ? "24h" : "12h");
 }
 
+/** Toggle the timeline quick-view (peek) on the watchface. Real CLI:
+ * pebble emu-set-timeline-quick-view {on|off} */
+export function timelineQuickViewCmd(on: boolean): PebbleCommand {
+  return base("emu-set-timeline-quick-view", on ? "on" : "off");
+}
+
 /**
  * Toggles Bluetooth connection state.
  * Real CLI: pebble emu-bt-connection --connected {yes,no}

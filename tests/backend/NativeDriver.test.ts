@@ -63,4 +63,13 @@ describe("NativeDriver", () => {
     expect(calls[0].args).toEqual(["wipe"]);
     expect(calls[0].args).not.toContain("--emulator");
   });
+
+  it("timelineQuickView routes on through the runner", async () => {
+    const calls: string[][] = [];
+    const run = async (_c: string, args: string[]) => { calls.push(args); return { code: 0, stdout: "", stderr: "" }; };
+    const d = new NativeDriver({ run });
+    d.setPlatform("basalt");
+    await d.timelineQuickView(true);
+    expect(calls[0]).toEqual(expect.arrayContaining(["emu-set-timeline-quick-view", "on"]));
+  });
 });

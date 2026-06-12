@@ -189,6 +189,7 @@ export function registerIpc(): void {
   ipcMain.handle("emu:button", async (_e, id: ButtonId) => driver!.button(id, "press"));
   ipcMain.handle("emu:accelTap", async () => driver!.accelTap());
   ipcMain.handle("emu:screenshot", async (_e, out: string) => driver!.screenshot(out));
+  ipcMain.handle("emu:timelineQuickView", async (_e, on: boolean) => driver!.timelineQuickView(on));
 
   ipcMain.handle("dialog:pickDirectory", async (): Promise<string | null> => {
     const result = await dialog.showOpenDialog({

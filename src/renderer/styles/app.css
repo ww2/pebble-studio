@@ -679,6 +679,7 @@ body {
   color: var(--text-secondary);
   font-weight: 600;
   letter-spacing: 0.2px;
+  padding-top: 16px;
   padding-bottom: 12px;
 }
 
@@ -842,6 +843,7 @@ body {
 .emu-action--subtle:hover { background: var(--control-hover); border-color: var(--border-strong); }
 .emu-action--subtle:active { background: var(--control-press); transform: translateY(1px); }
 .emu-action:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent); }
+.emu-action--on { background: color-mix(in srgb, var(--accent) 22%, var(--control)); border-color: var(--accent); color: var(--text); }
 
 /* E (v0.0.6): launch-failure highlight. A pulsing danger glow ring drawn on the
    Launch/Relaunch button to draw the eye after a failed start. Added in
@@ -992,6 +994,10 @@ body {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent);
 }
+
+.settings-time-status { font-size: var(--type-caption); margin-top: 6px; }
+.settings-time-status--running { color: var(--success); font-weight: 600; }
+.settings-time-status--edited { color: var(--text-secondary); }
 
 /* ── App library ─────────────────────────────────────────────────────────── */
 .lib-panel {
@@ -1195,6 +1201,8 @@ body {
   border-bottom-color: var(--control-bottom);
 }
 .capture-btn--rec:hover { background: var(--control-hover); }
+.capture-btn--neutral { background: var(--control); color: var(--text); border-color: var(--border); }
+.capture-btn--neutral:hover { background: var(--control-hover); }
 .capture-btn--recording {
   background: var(--danger);
   color: #fff;

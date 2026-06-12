@@ -23,4 +23,5 @@ export interface BackendDriver {
   /** Wipe all emulator data for the current SDK version. The emulator cannot
    * survive a wipe; caller must reboot afterward. */
   wipe(): Promise<void>;
+  timelineQuickView(on: boolean): Promise<void>;
 }

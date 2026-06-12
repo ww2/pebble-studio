@@ -40,6 +40,8 @@ interface StudioApi {
   getTimeConfig(): Promise<unknown>;
   setTimeConfig(cfg: unknown): Promise<unknown>;
   setBackgroundThrottling(throttle: boolean): Promise<void>;
+  // v0.0.8: timeline quick-view (Task 1).
+  timelineQuickView(on: boolean): Promise<void>;
 }
 
 declare global {

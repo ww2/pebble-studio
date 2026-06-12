@@ -46,7 +46,7 @@ export interface TimeConfig {
 const RATE_MULT: Record<Rate, number> = { frozen: 0, "1x": 1, "2x": 2, "4x": 4, "10x": 10 };
 
 export const DEFAULT_TIME_CONFIG: TimeConfig = {
-  source: "system", rate: "1x", timezone: "UTC", hour24: true, customWallMs: 0,
+  source: "system", rate: "1x", timezone: "UTC", hour24: false, customWallMs: 0,
 };
 
 /** Pick the host IANA zone; fall back to PST when empty or a bare "UTC". */
