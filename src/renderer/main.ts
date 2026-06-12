@@ -35,6 +35,10 @@ interface StudioApi {
   backlightCaptureHold(on: boolean): Promise<void>;
   backlightMethod(m: string): Promise<void>;
   backlightPulse(): Promise<void>;
+  // v0.0.7: time control (Task 5) and background-throttling toggle (Task 7).
+  getTimeConfig(): Promise<unknown>;
+  setTimeConfig(cfg: unknown): Promise<unknown>;
+  setBackgroundThrottling(throttle: boolean): Promise<void>;
 }
 
 declare global {
