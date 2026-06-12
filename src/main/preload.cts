@@ -28,6 +28,9 @@ const studio = {
     ipcRenderer.invoke("emu:backlightAlways", on),
   backlightCaptureHold: (on: boolean): Promise<void> =>
     ipcRenderer.invoke("emu:backlightCaptureHold", on),
+  // Time control (Task 5).
+  getTimeConfig: () => ipcRenderer.invoke("time:get"),
+  setTimeConfig: (cfg: unknown) => ipcRenderer.invoke("time:set", cfg),
   // Subscribe to boot-progress notes (Task J). Returns a disposer that removes
   // the listener.
   onBootProgress: (cb: (msg: string) => void): (() => void) => {

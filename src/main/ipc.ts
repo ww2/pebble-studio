@@ -6,6 +6,7 @@ import type { BackendDriver } from "./backend/BackendDriver.js";
 import type { BootToken } from "./backend/bootEmulator.js";
 import type { DriverKind } from "./backend/driverFactory.js";
 import { createBacklightController } from "./backend/backlight.js";
+import { makeTimeController, type TimeConfig } from "./backend/timeController.js";
 import type { PlatformId, ButtonId } from "../shared/types.js";
 import { LibraryStore } from "./library.js";
 
@@ -90,6 +91,9 @@ export function registerIpc(): void {
   // on a Windows+WSL host too.
   const backlight = createBacklightController(() => driverKind);
 
+  // Time controller (Task 5). Uses a getter so it always references the current driver.
+  const time = makeTimeController(() => driver);
+
   ipcMain.handle("lib:add", async (_e, pbwPath: string) => { library.add(pbwPath); return library.list(); });
   ipcMain.handle("lib:list", async () => library.list());
   ipcMain.handle("lib:remove", async (_e, p: string) => { library.remove(p); return library.list(); });
@@ -135,7 +139,9 @@ export function registerIpc(): void {
     currentBootToken = token;
     // Forward each boot step to the renderer (diagnostic boot notes, Task J).
     const onStep = (msg: string): void => { e.sender.send("emu:boot-progress", msg); };
-    return driver!.start(id, token, onStep);
+    const ep = await driver!.start(id, token, onStep);
+    void time.applyAll(); // re-assert time settings on the fresh emulator (fire-and-forget)
+    return ep;
   });
   ipcMain.handle("emu:abort", async () => {
     // Cancel any in-flight boot so its wait loops bail promptly. No-op (no throw)
@@ -143,8 +149,9 @@ export function registerIpc(): void {
     if (currentBootToken) currentBootToken.cancelled = true;
   });
   ipcMain.handle("emu:stop", async () => {
-    // Stop the backlight keepalive first so we don't tap a dead emulator.
+    // Stop the backlight keepalive and time controller first so we don't tap a dead emulator.
     backlight.stop();
+    time.stop();
     // Cancel the in-flight boot BEFORE teardown so a mid-boot wait aborts and the
     // killAll sweep reliably reaps qemu/websockify/emu-control/pypkjs.
     if (currentBootToken) currentBootToken.cancelled = true;
@@ -157,6 +164,10 @@ export function registerIpc(): void {
   // either is set and stops when both clear (or on emu:stop above).
   ipcMain.handle("emu:backlightAlways", async (_e, on: boolean) => { backlight.setAlways(on); });
   ipcMain.handle("emu:backlightCaptureHold", async (_e, on: boolean) => { backlight.setCaptureHold(on); });
+
+  // Time control (Task 5): get/set persisted time config and re-apply on boot.
+  ipcMain.handle("time:get", async () => time.getConfig());
+  ipcMain.handle("time:set", async (_e, cfg: TimeConfig) => { await time.setConfig(cfg); });
   ipcMain.handle("emu:install", async (_e, pbwPath: string) => {
     await driver!.install(pbwPath);
     loaded.add(pbwPath);
