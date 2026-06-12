@@ -37,6 +37,24 @@ vi.mock("node:child_process", () => ({
   },
 }));
 
+// Mock node:net so the verify-dead gate's REAL RFB port probe (defaultPortFree →
+// net.connect to 127.0.0.1:5901) never touches a real socket in unit tests. A
+// connection that errors == "port free", so the killAll construction tests below
+// resolve deterministically even if an actual emulator happens to be running on
+// 5901 during the test run (otherwise those tests would block to the gate's 5s
+// timeout). Tests that need port behavior inject their own portFree/waitForPort.
+vi.mock("node:net", () => ({
+  connect: () => {
+    const sock = new EventEmitter() as EventEmitter & {
+      setTimeout: () => void; destroy: () => void;
+    };
+    sock.setTimeout = () => {};
+    sock.destroy = () => {};
+    queueMicrotask(() => sock.emit("error", new Error("ECONNREFUSED (mocked)")));
+    return sock;
+  },
+}));
+
 // Import AFTER the mock is registered (vi.mock is hoisted, so this is fine).
 const { bootEmulator, BootAborted, makeWslBootDeps, makeNativeBootDeps, waitUntilDead } = await import(
   "../../src/main/backend/bootEmulator.js"
