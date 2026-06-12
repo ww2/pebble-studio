@@ -4,7 +4,8 @@ import { getChrome, hitTestButton } from "../../src/renderer/chrome/chromeRegist
 describe("chromeRegistry", () => {
   it("provides screen offset + button regions for basalt", () => {
     const c = getChrome("basalt");
-    expect(c.screen).toEqual({ x: 24, y: 30, width: 144, height: 168 });
+    // v0.0.5: screen bezel shrunk ~60% (offsets x24→10, y30→12).
+    expect(c.screen).toEqual({ x: 10, y: 12, width: 144, height: 168 });
     expect(c.buttons.map((b) => b.id).sort()).toEqual(["back", "down", "select", "up"]);
   });
 
@@ -20,6 +21,6 @@ describe("chromeRegistry", () => {
   });
 
   it("uses the correct 260x260 screen for gabbro", () => {
-    expect(getChrome("gabbro").screen).toEqual({ x: 30, y: 30, width: 260, height: 260 });
+    expect(getChrome("gabbro").screen).toEqual({ x: 14, y: 14, width: 260, height: 260 });
   });
 });

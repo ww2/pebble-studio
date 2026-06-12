@@ -6,8 +6,10 @@ import { connectVnc, type VncHandle } from "../vncClient.js";
 type ZoomLevel = "1" | "1.5" | "2" | "3" | "fit";
 const ZOOM_KEY = "pebble-studio:emu-zoom";
 
-type CaseColor = "black" | "white";
-const CASE_KEY = "pebble-studio:round-case";
+type BezelColor = "black" | "white";
+const SCREEN_BEZEL_KEY = "pebble-studio:screen-bezel";
+/** Concrete --screen-bezel-color values for the round-only black/white toggle. */
+const BEZEL_COLORS: Record<BezelColor, string> = { black: "#0a0a0a", white: "#f5f5f5" };
 
 /**
  * Emulator panel: a watch "stage" hosting the live noVNC display, an overlay of
@@ -31,14 +33,16 @@ export class EmulatorView {
   private readonly frame: HTMLElement;
   private readonly stage: HTMLElement;
   private readonly switchOverlay: HTMLElement;
-  private readonly caseToggle: HTMLElement;
+  private readonly bezelToggle: HTMLElement;
+  /** The four persistent button nubs, created once so model-switch morphs animate. */
+  private readonly buttonEls: HTMLButtonElement[] = [];
   /** Current zoom level; "fit" engages the ResizeObserver-driven auto-fit. */
   private zoom: ZoomLevel = "1";
   /** Observer used only while zoom === "fit"; disconnected otherwise. */
   private fitObserver: ResizeObserver | null = null;
-  /** Selected round-bezel casing color (B5); persisted, applied to round models. */
-  private caseColor: CaseColor = "black";
-  /** True while the current platform is round (gates the bezel toggle + case color). */
+  /** Selected screen-bezel color (B5); persisted, applied to round models. */
+  private bezelColor: BezelColor = "black";
+  /** True while the current platform is round (gates the bezel toggle + bezel color). */
   private isRound = false;
   private vnc: VncHandle | null = null;
   /** The platform currently running (or last attempted). null = nothing booted yet. */
@@ -78,11 +82,11 @@ export class EmulatorView {
           <button class="emu-zoom-opt" data-zoom="3" type="button">3×</button>
           <button class="emu-zoom-opt" data-zoom="fit" type="button">Fit</button>
         </div>
-        <div class="emu-case-toggle" id="emu-case-toggle" hidden>
-          <span class="emu-case-label">Bezel</span>
-          <div class="emu-case-segmented" id="emu-case-seg" role="group" aria-label="Round bezel color">
-            <button class="emu-case-opt" data-case="black" type="button">Black</button>
-            <button class="emu-case-opt" data-case="white" type="button">White</button>
+        <div class="emu-bezel-toggle" id="emu-bezel-toggle" hidden>
+          <span class="emu-bezel-label">Bezel</span>
+          <div class="emu-bezel-segmented" id="emu-bezel-seg" role="group" aria-label="Screen bezel color">
+            <button class="emu-bezel-opt" data-bezel="black" type="button">Black</button>
+            <button class="emu-bezel-opt" data-bezel="white" type="button">White</button>
           </div>
         </div>
         <span class="emu-status" id="emu-status"></span>
@@ -101,7 +105,12 @@ export class EmulatorView {
     this.frame = this.el.querySelector<HTMLElement>(".emu-frame")!;
     this.stage = this.el.querySelector<HTMLElement>("#emu-stage")!;
     this.switchOverlay = this.el.querySelector<HTMLElement>("#emu-switch-overlay")!;
-    this.caseToggle = this.el.querySelector<HTMLElement>("#emu-case-toggle")!;
+    this.bezelToggle = this.el.querySelector<HTMLElement>("#emu-bezel-toggle")!;
+
+    // Create the four physical button nubs ONCE. They persist across model
+    // switches; applyGeometry only toggles the square/round classes so CSS can
+    // animate their positions (morph). Order matters only for DOM stacking.
+    this.createButtons();
 
     // Tap / Shake
     const tapBtn = this.el.querySelector<HTMLButtonElement>("#emu-tap")!;
@@ -125,19 +134,19 @@ export class EmulatorView {
       if (z) this.applyZoom(z);
     });
 
-    // B5: round-bezel color toggle (shown only for round models).
-    const caseSeg = this.el.querySelector<HTMLElement>("#emu-case-seg")!;
-    caseSeg.addEventListener("click", (e) => {
-      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(".emu-case-opt");
+    // B5: screen-bezel color toggle (shown only for round models).
+    const bezelSeg = this.el.querySelector<HTMLElement>("#emu-bezel-seg")!;
+    bezelSeg.addEventListener("click", (e) => {
+      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(".emu-bezel-opt");
       if (!btn) return;
-      const c = btn.dataset.case as CaseColor | undefined;
-      if (c) this.applyCaseColor(c);
+      const c = btn.dataset.bezel as BezelColor | undefined;
+      if (c) this.applyScreenBezelColor(c);
     });
 
     // Restore saved bezel color (default black) before applying any platform.
-    const savedCase = localStorage.getItem(CASE_KEY);
-    this.caseColor = savedCase === "white" ? "white" : "black";
-    this.applyCaseColor(this.caseColor);
+    const savedBezel = localStorage.getItem(SCREEN_BEZEL_KEY);
+    this.bezelColor = savedBezel === "white" ? "white" : "black";
+    this.applyScreenBezelColor(this.bezelColor);
 
     // Restore saved zoom
     const savedZoom = this.normalizeZoom(localStorage.getItem(ZOOM_KEY));
@@ -182,22 +191,42 @@ export class EmulatorView {
   }
 
   /**
-   * C3: compute the scale that makes the watch fill the available container while
-   * keeping all UI visible, then apply it. Guards against a zero-size container
-   * (skips until measurable) and an unmeasured frame.
+   * C3 (v0.0.5 — real fit): scale the watch to fill the stage column. The old
+   * version measured `frameWrapper.clientWidth`, but the wrapper shrinks to the
+   * frame (avail ≈ natural → scale ≈ 1, no effect). Instead we measure the PANEL
+   * (`this.el`) and subtract the non-stage rows (caption + actions + zoom) plus
+   * the wrapper's vertical margins to get the height available for the watch,
+   * then take the min of width/height fit so it stays fully visible.
    */
   private applyFitScale(): void {
-    const avail = this.frameWrapper.clientWidth;
-    if (avail <= 0) return; // not laid out yet — ResizeObserver will retry
-    // Natural (unscaled) frame width. Read offsetWidth with transform cleared so
-    // the measurement reflects the true size regardless of the previous scale.
+    const availW = this.el.clientWidth;
+    if (availW <= 0) return; // panel not laid out yet — observer will retry
+
+    // Available height = panel height minus every sibling row of the wrapper and
+    // the wrapper's own vertical margins. Summing actual row heights keeps this
+    // correct regardless of how the rows wrap.
+    let usedH = 0;
+    for (const child of Array.from(this.el.children) as HTMLElement[]) {
+      if (child === this.frameWrapper) continue;
+      usedH += child.offsetHeight;
+      const cs = getComputedStyle(child);
+      usedH += parseFloat(cs.marginTop) + parseFloat(cs.marginBottom);
+    }
+    const wrapCs = getComputedStyle(this.frameWrapper);
+    usedH += parseFloat(wrapCs.marginTop) + parseFloat(wrapCs.marginBottom);
+    const availH = this.el.clientHeight - usedH;
+    if (availH <= 0) return;
+
+    // Natural (unscaled) frame size: clear the transform so offset* reflects the
+    // true size regardless of the previous scale.
     const prev = this.frame.style.transform;
     this.frame.style.transform = "";
-    const natural = this.frame.offsetWidth;
+    const naturalW = this.frame.offsetWidth;
+    const naturalH = this.frame.offsetHeight;
     this.frame.style.transform = prev;
-    if (natural <= 0) return; // not measurable yet
-    // Fill width but never upscale past a comfortable cap so it stays crisp.
-    const scale = Math.max(0.25, Math.min(avail / natural, 3));
+    if (naturalW <= 0 || naturalH <= 0) return; // not measurable yet
+
+    const scale = Math.max(0.25, Math.min(availW / naturalW, availH / naturalH, 4));
     this.setScale(scale);
   }
 
@@ -207,7 +236,8 @@ export class EmulatorView {
     this.fitObserver = new ResizeObserver(() => {
       if (this.zoom === "fit") this.applyFitScale();
     });
-    this.fitObserver.observe(this.frameWrapper);
+    // Observe the PANEL (not the inner wrapper) so it re-fits on window resize.
+    this.fitObserver.observe(this.el);
   }
 
   /** Disconnect/ignore the fit observer when a non-fit zoom is selected. */
@@ -219,19 +249,20 @@ export class EmulatorView {
   }
 
   /**
-   * B5: apply the round-bezel casing color. Drives the `--case-color` CSS var via
-   * a class on `.emu-frame`; persisted so it survives relaunch and re-applies when
-   * switching back to a round model. Only visually active for round frames.
+   * B5 (v0.0.5): apply the SCREEN-bezel color (the dark area inside the stage,
+   * between the live screen and the stage edge) by setting `--screen-bezel-color`
+   * on `.emu-stage`. Persisted so it survives relaunch and re-applies when
+   * switching back to a round model. Only exposed/meaningful for round frames.
    */
-  private applyCaseColor(c: CaseColor): void {
-    this.caseColor = c;
-    this.frame.classList.toggle("emu-frame--case-white", c === "white");
-    const seg = this.el.querySelector<HTMLElement>("#emu-case-seg")!;
-    seg.querySelectorAll<HTMLButtonElement>(".emu-case-opt").forEach((btn) => {
-      btn.classList.toggle("emu-case-opt--active", btn.dataset.case === c);
-      btn.setAttribute("aria-pressed", String(btn.dataset.case === c));
+  private applyScreenBezelColor(c: BezelColor): void {
+    this.bezelColor = c;
+    this.stage.style.setProperty("--screen-bezel-color", BEZEL_COLORS[c]);
+    const seg = this.el.querySelector<HTMLElement>("#emu-bezel-seg")!;
+    seg.querySelectorAll<HTMLButtonElement>(".emu-bezel-opt").forEach((btn) => {
+      btn.classList.toggle("emu-bezel-opt--active", btn.dataset.bezel === c);
+      btn.setAttribute("aria-pressed", String(btn.dataset.bezel === c));
     });
-    localStorage.setItem(CASE_KEY, c);
+    localStorage.setItem(SCREEN_BEZEL_KEY, c);
   }
 
   /** Update the enabled/disabled state of lifecycle buttons. */
@@ -296,22 +327,18 @@ export class EmulatorView {
   }
 
   /**
-   * A4 — Enter the "switching" state: collapse old geometry to a neutral frame and
-   * show the "Switching…" placeholder. The button overlay is hidden via the
-   * `--switching` class (CSS) and the stage is shrunk to a neutral size so no old
-   * geometry remains visible. The new shape/size/buttons are applied in
-   * applyGeometry() once the target platform's geometry is known.
+   * v0.0.5 morph — Enter the "switching" state WITHOUT collapsing to a neutral
+   * box: the old frame/stage/buttons stay in place and CSS transitions animate
+   * them to the new geometry once applyGeometry() runs. We only blank the live
+   * screen (it's torn down / re-booting anyway) so old + new pixels never overlap;
+   * the shape/size/button morph itself is the transition. The four button nubs
+   * are persistent (never rebuilt), so toggling their classes in applyGeometry
+   * slides them to their new positions.
    */
   private beginSwitch(): void {
     this.frame.classList.add("emu-frame--switching");
-    // Drop the old shape so the placeholder reads as a neutral rounded rect.
-    this.frame.classList.remove("emu-frame--round");
     this.caption.textContent = "";
-    // Neutralize the stage so the old watch's dimensions don't linger behind the
-    // placeholder; the real size is restored in applyGeometry().
-    this.stage.style.width = "180px";
-    this.stage.style.height = "180px";
-    this.screenHost.classList.remove("emu-screen--round");
+    this.screenHost.innerHTML = "";
   }
 
   /**
@@ -354,12 +381,15 @@ export class EmulatorView {
     }
     this.screenHost.classList.toggle("emu-screen--round", info.round);
 
-    this.renderButtons(info.round);
+    // Morph: toggle the round class on the PERSISTENT button overlay so the four
+    // nubs animate (via CSS transitions) from their old positions to the new ones
+    // rather than being rebuilt. (renderButtons is not called per-switch anymore.)
+    this.buttonsOverlay.classList.toggle("emu-buttons--round", info.round);
 
     // B5: bezel-color toggle is only meaningful for round models; re-apply the
     // persisted color when switching to a round watch, hide the control otherwise.
-    this.caseToggle.hidden = !info.round;
-    if (info.round) this.applyCaseColor(this.caseColor);
+    this.bezelToggle.hidden = !info.round;
+    if (info.round) this.applyScreenBezelColor(this.bezelColor);
 
     // Reveal new frame + buttons + screen together.
     this.frame.classList.remove("emu-frame--switching");
@@ -455,15 +485,16 @@ export class EmulatorView {
   }
 
   /**
-   * Render the four physical buttons as nubs tucked into the frame edge. Placement
-   * is driven purely by CSS classes keyed on side + shape (not registry pixel
-   * coords), so the buttons hug the (square or round) frame edge and — on round
-   * devices — angle radially toward the center. The registry geometry is still
-   * used for hit-testing in tests; here we only need the button ids/order.
+   * Create the four physical buttons ONCE (constructor). Placement is driven by
+   * CSS classes keyed on side + shape (not registry pixel coords): the buttons
+   * hug the (square or round) frame edge and — on round devices — angle radially
+   * toward the center. Keeping them persistent (vs. rebuilding innerHTML on every
+   * model switch) lets CSS transitions animate them into place during a morph.
+   * applyGeometry toggles `.emu-buttons--round` on the overlay to switch shape.
    */
-  private renderButtons(round: boolean): void {
+  private createButtons(): void {
     this.buttonsOverlay.innerHTML = "";
-    this.buttonsOverlay.classList.toggle("emu-buttons--round", round);
+    this.buttonEls.length = 0;
     const ids: ButtonId[] = ["back", "up", "select", "down"];
     for (const id of ids) {
       const el = document.createElement("button");
@@ -473,6 +504,7 @@ export class EmulatorView {
       el.title = id;
       el.addEventListener("click", () => void window.studio.button(id));
       this.buttonsOverlay.appendChild(el);
+      this.buttonEls.push(el);
     }
   }
 }

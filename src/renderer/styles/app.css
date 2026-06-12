@@ -399,29 +399,25 @@ body {
    tucked against the frame edge and partly hidden under a rim pseudo-element so
    they read as nubs built into the casing. */
 .emu-frame {
-  /* B3: bezel reduced ~60% (16 → 6 square / 18 → 7 round); the rim ::after keys
-     off --frame-pad so it tracks automatically. Tuck offsets and border-radius
-     below were re-tuned proportionally for the thinner bezel. */
-  --frame-pad: 6px;
-  /* B5: casing color. Default black; the round bezel toggle overrides this to a
-     light value. The casing background + rim ::after gradient both key off it so
-     a tasteful shading is kept for either color. */
+  /* B3 (v0.0.5): the CASE rim is restored to its original (pre-v0.0.4) thickness
+     so the casing reads as a full bezel again — the v0.0.4 6/7px reduction was a
+     mistake. The thin-bezel work now happens on the SCREEN bezel (chromeRegistry
+     margins), not the case. The rim ::after keys off --frame-pad automatically. */
+  --frame-pad: 16px;
+  /* Casing color is fixed black/charcoal — the black/white toggle now drives the
+     SCREEN bezel (--screen-bezel-color on .emu-stage), not the casing. */
   --case-color: #1a1c1f;
   --case-hi: rgba(255, 255, 255, 0.06);
   position: relative;
   padding: var(--frame-pad);
-  border-radius: 14px;
+  border-radius: 22px;
   background: linear-gradient(155deg, color-mix(in srgb, var(--case-color) 100%, white 6%), var(--case-color));
   border: 1px solid var(--border);
   box-shadow: var(--device-shadow), inset 0 1px 0 var(--case-hi);
+  /* Morph: animate the casing shape (square ↔ circle) when switching models. */
+  transition: border-radius 420ms var(--ease), padding 420ms var(--ease);
 }
-.emu-frame--round { --frame-pad: 7px; border-radius: 50%; }
-
-/* B5: light ("white") casing variant for round models. */
-.emu-frame--case-white {
-  --case-color: #e9eaec;
-  --case-hi: rgba(255, 255, 255, 0.7);
-}
+.emu-frame--round { --frame-pad: 18px; border-radius: 50%; }
 
 /* Frame rim: a copy of the casing edge drawn ABOVE the buttons so each nub's
    inner half is concealed under the casing (tucked-in illusion). It's a thick
@@ -453,9 +449,19 @@ body {
 .emu-stage {
   position: relative;
   z-index: 1;
-  background: #0a0a0a;
+  /* B5 (v0.0.5): the SCREEN bezel color (the dark area between the live screen
+     and the stage edge). Driven by the round-only black/white toggle; default
+     black. JS sets --screen-bezel-color on this element. */
+  --screen-bezel-color: #0a0a0a;
+  background: var(--screen-bezel-color);
   border-radius: 8px;
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.6);
+  /* Morph: animate size + shape when switching watch models. */
+  transition:
+    width 420ms var(--ease),
+    height 420ms var(--ease),
+    border-radius 420ms var(--ease),
+    background-color var(--dur) var(--ease);
 }
 .emu-frame--round .emu-stage { border-radius: 50%; }
 
@@ -465,6 +471,13 @@ body {
   background: #000;
 }
 .emu-screen--round { border-radius: 50%; }
+
+/* Cursor over emulator (v0.0.5): noVNC hides the local pointer over its canvas;
+   force a visible cursor back on the screen host + injected canvas. */
+.emu-screen,
+.emu-screen canvas {
+  cursor: default !important;
+}
 
 /* A4: neutral "Switching…" placeholder shown over the stage while the old watch
    tears down and before the new geometry is applied, so old + new never overlap.
@@ -483,9 +496,10 @@ body {
   font-weight: 600;
   letter-spacing: 0.2px;
 }
-.emu-frame--switching .emu-switch-overlay { display: flex; }
-/* While switching, hide the button overlay so old buttons don't linger. */
-.emu-frame--switching .emu-buttons { display: none; }
+/* v0.0.5 morph: keep the button overlay VISIBLE during a switch so the four
+   persistent nubs animate to their new positions instead of disappearing. The
+   "Switching…" overlay is also no longer shown — the square↔circle frame morph
+   and stage resize ARE the transition (the blank screen reads fine). */
 
 /* noVNC injects a canvas; let it fill the host and stay crisp when zoomed. */
 .emu-screen canvas {
@@ -516,7 +530,18 @@ body {
   cursor: pointer;
   padding: 0;
   font-size: 0;
-  transition: filter var(--dur) var(--ease), transform var(--dur) var(--ease);
+  /* Morph: when a model switch toggles the square/round classes, the position
+     props (left/right/top/bottom) + transform + height animate to the new spot
+     so the four persistent nubs slide into place instead of snapping. */
+  transition:
+    filter var(--dur) var(--ease),
+    transform 420ms var(--ease),
+    left 420ms var(--ease),
+    right 420ms var(--ease),
+    top 420ms var(--ease),
+    bottom 420ms var(--ease),
+    height 420ms var(--ease),
+    border-radius 420ms var(--ease);
 }
 .emu-hit:hover { filter: brightness(1.18); }
 .emu-hit:active { filter: brightness(0.85); }
@@ -534,28 +559,28 @@ body {
 /* Left side: most of the nub sits just left of (outside) the casing edge.
    B1: Back aligns vertically with Up (top: 24%, no centering); height 34px. */
 .emu-hit--back {
-  left: -11px;
+  left: -13px;
   top: 24%;
   height: 34px;
   border-radius: 3px 0 0 3px;
 }
 /* Right side: most of the nub sits just right of (outside) the casing edge. */
 .emu-hit--up {
-  right: -11px;
+  right: -13px;
   top: 24%;
   height: 34px;
   border-radius: 0 3px 3px 0;
 }
 /* B1: all four square buttons unified to 34px (Select was 40px). */
 .emu-hit--select {
-  right: -11px;
+  right: -13px;
   top: 50%;
   height: 34px;
   transform: translateY(-50%);
   border-radius: 0 3px 3px 0;
 }
 .emu-hit--down {
-  right: -11px;
+  right: -13px;
   bottom: 24%;
   height: 34px;
   border-radius: 0 3px 3px 0;
@@ -566,39 +591,42 @@ body {
    down-toward-center, Down tilts up-toward-center, Select stays horizontal, and
    Back sits on the left edge pointing toward center. Back height == Select. */
 .emu-buttons--round .emu-hit--back {
-  left: -11px;
+  left: -13px;
   top: 50%;
   height: 40px;
   transform: translateY(-50%);
   border-radius: 3px 0 0 3px;
 }
 .emu-buttons--round .emu-hit--select {
-  right: -11px;
+  right: -13px;
   top: 50%;
   height: 40px;
   transform: translateY(-50%);
   border-radius: 0 3px 3px 0;
 }
-/* Up/Down rotate toward the circle center. Positioned on the upper/lower-right
-   arc; the rotation tilts them radially (down-toward-center / up-toward-center).
-   B2: height 32 → 40 to match Select; arc position re-tuned (right/top/bottom)
-   so the taller nubs still sit on the rim. */
+/* Up/Down on the upper/lower-right arc. v0.0.5: re-oriented so the nub's LONG
+   edge (its tall flat face) points toward the center — consistent with how Back
+   and Select read — by keeping the rectangle tangent to the rim (the long axis
+   follows the arc). They're also tucked BEHIND the bezel rim with a negative
+   offset (like the other nubs) so the rim conceals their inner half, instead of
+   floating in front at right:1px. ~40° tilt sits them on the ~1-2 / 4-5 o'clock
+   arc; tuned by eye — nudge the offset/tilt/arc % if a screenshot looks off. */
 .emu-buttons--round .emu-hit--up {
-  right: 1px;
-  top: 21%;
+  right: -9px;
+  top: 19%;
   height: 40px;
-  transform: rotate(52deg);
+  transform: rotate(-40deg);
   transform-origin: center;
-  border-radius: 3px;
+  border-radius: 0 3px 3px 0;
 }
 .emu-buttons--round .emu-hit--down {
-  right: 1px;
-  bottom: 21%;
+  right: -9px;
+  bottom: 19%;
   top: auto;
   height: 40px;
-  transform: rotate(-52deg);
+  transform: rotate(40deg);
   transform-origin: center;
-  border-radius: 3px;
+  border-radius: 0 3px 3px 0;
 }
 
 /* ── Zoom wrapper: reserves layout space so scaled frame doesn't overlap ─── */
@@ -701,15 +729,16 @@ body {
 }
 .emu-zoom-opt--active:hover { background: var(--accent-hover); }
 
-/* B5: round-bezel black/white toggle. Reuses the segmented-control look; shown
-   only for round models (toggled via hidden attribute from EmulatorView). */
-.emu-case-toggle {
+/* B5 (v0.0.5): SCREEN-bezel black/white toggle (controls --screen-bezel-color on
+   the stage, NOT the casing). Reuses the segmented-control look; shown only for
+   round models (toggled via hidden attribute from EmulatorView). */
+.emu-bezel-toggle {
   display: inline-flex;
   align-items: center;
   gap: 10px;
 }
-.emu-case-toggle[hidden] { display: none; }
-.emu-case-label {
+.emu-bezel-toggle[hidden] { display: none; }
+.emu-bezel-label {
   font-size: var(--type-caption);
   color: var(--text-tertiary);
   font-weight: 600;
@@ -717,13 +746,13 @@ body {
   letter-spacing: 0.4px;
   white-space: nowrap;
 }
-.emu-case-segmented {
+.emu-bezel-segmented {
   display: inline-flex;
   border: 1px solid var(--border);
   border-radius: var(--radius-control);
   overflow: hidden;
 }
-.emu-case-opt {
+.emu-bezel-opt {
   background: var(--control);
   color: var(--text-secondary);
   border: none;
@@ -736,15 +765,15 @@ body {
   line-height: 1;
   white-space: nowrap;
 }
-.emu-case-opt:last-child { border-right: none; }
-.emu-case-opt:hover { background: var(--control-hover); color: var(--text); }
-.emu-case-opt:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent); }
-.emu-case-opt--active {
+.emu-bezel-opt:last-child { border-right: none; }
+.emu-bezel-opt:hover { background: var(--control-hover); color: var(--text); }
+.emu-bezel-opt:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent); }
+.emu-bezel-opt--active {
   background: var(--accent);
   color: var(--accent-fg);
   font-weight: 600;
 }
-.emu-case-opt--active:hover { background: var(--accent-hover); }
+.emu-bezel-opt--active:hover { background: var(--accent-hover); }
 
 /* Material-ish buttons: filled accent (primary) + subtle (secondary). */
 .emu-action {
