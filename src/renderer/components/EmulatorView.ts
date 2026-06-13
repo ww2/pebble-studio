@@ -51,6 +51,7 @@ export function fitScale(
  */
 interface BootProgressApi {
   onBootProgress(cb: (msg: string) => void): () => void;
+  onBridgeDead(cb: (reason: string) => void): () => void;
 }
 function studioBootProgress(): BootProgressApi {
   return window.studio as unknown as BootProgressApi;
@@ -113,7 +114,7 @@ export class EmulatorView {
    * `booting` = a start() is in flight; `live` = VNC connected; `stopping` =
    * a stop/abort is in flight. Drives button labels/enablement and gates IPC.
    */
-  private state: "stopped" | "booting" | "live" | "stopping" = "stopped";
+  private state: "stopped" | "booting" | "live" | "stopping" | "unresponsive" = "stopped";
   /**
    * Monotonic boot generation. Each boot captures the current gen; force-close
    * (and each new boot) increments it. A boot's start() goes `live` ONLY if its
@@ -138,6 +139,8 @@ export class EmulatorView {
   private readonly diagLine: HTMLElement;
   /** Disposer for the boot-progress subscription (active for diagnostics). */
   private bootProgressDispose: (() => void) | null = null;
+  /** Disposer for the bridge-dead subscription (always active). */
+  private bridgeDeadDispose: (() => void) | null = null;
   /** Latest boot-progress note (shown in the diag line when diagnostics on). */
   private lastBootNote = "";
   /** rAF id for the FPS sampler; non-null only while diagnostics on + live. */
@@ -256,7 +259,7 @@ export class EmulatorView {
     // Lifecycle buttons. The single Launch/Relaunch button routes to relaunch()
     // when live and launch() otherwise.
     this.relaunchBtn.addEventListener("click", () => {
-      if (this.state === "live") void this.relaunch();
+      if (this.state === "live" || this.state === "unresponsive") void this.relaunch();
       else void this.launch();
     });
     this.forceCloseBtn.addEventListener("click", () => void this.forceClose());
@@ -297,6 +300,19 @@ export class EmulatorView {
     // change event so the Settings toggle (Wave 2b) reflects live.
     window.addEventListener("pebble-studio:diagnostics-changed", this.onDiagnosticsChanged);
     this.setDiagnostics(localStorage.getItem(DIAGNOSTICS_KEY) === "on");
+
+    // H4: subscribe to bridge-dead notifications from the main-process health
+    // monitor. Only transition when live — ignore if already stopping/booting.
+    this.bridgeDeadDispose = studioBootProgress().onBridgeDead((reason) => {
+      if (this.state !== "live") return;
+      console.warn("[emu] bridge-dead received (reason:", reason, ") — entering unresponsive");
+      this.state = "unresponsive";
+      this.disconnectVnc();
+      this.status.textContent = "⚠ Emulator stopped responding — Relaunch";
+      this.status.classList.remove("emu-status--live");
+      this.status.classList.add("emu-status--dead");
+      this.updateLifecycleButtons();
+    });
 
     // Start disabled until something is running
     this.updateLifecycleButtons();
@@ -502,9 +518,18 @@ export class EmulatorView {
    */
   private updateLifecycleButtons(): void {
     const s = this.state;
-    this.relaunchBtn.textContent = s === "live" ? "Relaunch" : "Launch";
-    this.relaunchBtn.disabled = !((s === "stopped" && this.currentPlatform) || s === "live");
-    this.forceCloseBtn.disabled = !(s === "booting" || s === "live");
+    // "Relaunch" label for live or unresponsive; "Launch" otherwise.
+    this.relaunchBtn.textContent = (s === "live" || s === "unresponsive") ? "Relaunch" : "Launch";
+    this.relaunchBtn.disabled = !((s === "stopped" && this.currentPlatform) || s === "live" || s === "unresponsive");
+    // Force-close enabled while booting, live, or unresponsive (something to kill).
+    this.forceCloseBtn.disabled = !(s === "booting" || s === "live" || s === "unresponsive");
+
+    // Attention highlight on Relaunch only in unresponsive; clear for all other states.
+    if (s === "unresponsive") {
+      this.relaunchBtn.classList.add("emu-action--attn");
+    } else {
+      this.relaunchBtn.classList.remove("emu-action--attn");
+    }
 
     const liveActions = s === "live";
     this.tapBtn.disabled = !liveActions;
@@ -544,6 +569,7 @@ export class EmulatorView {
     // separate badge element should reflect time config — never `this.status`.
     if (this.state === "live") {
       this.status.textContent = "● Live";
+      this.status.classList.remove("emu-status--dead");
       this.status.classList.add("emu-status--live");
     }
   }
@@ -708,6 +734,7 @@ export class EmulatorView {
     this.state = "stopped";
     this.status.textContent = "Ready";
     this.status.classList.remove("emu-status--live");
+    this.status.classList.remove("emu-status--dead");
     this.updateLifecycleButtons();
   }
 
@@ -730,6 +757,7 @@ export class EmulatorView {
     this.applyGeometry(platformId);
     this.status.textContent = `Booting ${info.label}…`;
     this.status.classList.remove("emu-status--live");
+    this.status.classList.remove("emu-status--dead");
     this.updateLifecycleButtons();
 
     let ep;
@@ -742,6 +770,7 @@ export class EmulatorView {
       this.state = "stopped";
       this.status.textContent = `Failed to start ${info.label}`;
       this.status.classList.remove("emu-status--live");
+      this.status.classList.remove("emu-status--dead");
       // E: draw the eye to the Launch button with an accent/danger glow ring.
       this.relaunchBtn.classList.add("emu-action--attn");
       console.error("[emu] start failed", err);
@@ -756,6 +785,7 @@ export class EmulatorView {
     this.state = "live";
     this.clearLaunchAttn(); // E: success clears the failure highlight
     this.status.textContent = "● Live";
+    this.status.classList.remove("emu-status--dead");
     this.status.classList.add("emu-status--live");
     this.vnc = connectVnc(this.screenHost, ep as { host: string; port: number; wsPath: string }, info.touch);
     this.updateLifecycleButtons();
@@ -786,15 +816,16 @@ export class EmulatorView {
     await this.boot(this.currentPlatform);
   }
 
-  /** Relaunch: stop the current emulator then boot the same platform. Only when live. */
+  /** Relaunch: stop the current emulator then boot the same platform. Only when live or unresponsive. */
   async relaunch(): Promise<void> {
-    if (this.state !== "live" || !this.currentPlatform) return;
+    if ((this.state !== "live" && this.state !== "unresponsive") || !this.currentPlatform) return;
     const id = this.currentPlatform;
     this.resetTimelinePeek();
     this.state = "stopping";
     this.disconnectVnc();
     this.status.textContent = "Stopping…";
     this.status.classList.remove("emu-status--live");
+    this.status.classList.remove("emu-status--dead");
     this.updateLifecycleButtons();
     try {
       await window.studio.stop();
@@ -818,6 +849,7 @@ export class EmulatorView {
     this.state = "stopping";
     this.status.textContent = "Stopping…";
     this.status.classList.remove("emu-status--live");
+    this.status.classList.remove("emu-status--dead");
     this.updateLifecycleButtons();
     try {
       await window.studio.abort();
@@ -833,6 +865,7 @@ export class EmulatorView {
     this.state = "stopped";
     this.status.textContent = "Stopped";
     this.status.classList.remove("emu-status--live");
+    this.status.classList.remove("emu-status--dead");
     this.updateLifecycleButtons();
   }
 
@@ -1023,6 +1056,7 @@ export class EmulatorView {
     this.disconnectVnc();
     this.state = "live";
     this.status.textContent = "● Live";
+    this.status.classList.remove("emu-status--dead");
     this.status.classList.add("emu-status--live");
     // The IPC handler already rebooted — re-use the same VNC endpoint.
     const ep = { host: "localhost", port: 6080, wsPath: "/" };

@@ -685,6 +685,14 @@ body {
   letter-spacing: 0.3px;
 }
 
+/* H4 (v0.0.13): amber warning status for the "unresponsive" lifecycle state.
+   Selector doubled for the same specificity reason as --live above. */
+.emu-status.emu-status--dead {
+  color: #ca5010;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+
 .emu-caption {
   font-size: var(--type-body);
   color: var(--text-secondary);

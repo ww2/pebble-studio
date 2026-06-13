@@ -31,6 +31,8 @@ interface StudioApi {
   saveCapture(name: string, bytes: Uint8Array): Promise<string>;
   // v0.0.6 (Wave 1 preload): boot-progress notes, capture naming, backlight.
   onBootProgress(cb: (msg: string) => void): () => void;
+  // v0.0.13 (Task H4): bridge-dead notifications from the health monitor.
+  onBridgeDead(cb: (reason: string) => void): () => void;
   nextCaptureName(base: string, ext: string): Promise<string>;
   backlightAlways(on: boolean): Promise<void>;
   backlightCaptureHold(on: boolean): Promise<void>;
