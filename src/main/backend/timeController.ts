@@ -32,7 +32,7 @@ export const RATE_MULT: Record<Rate, number> = { frozen: 0, "1x": 1, "2x": 2, "4
 export interface TimeConfig {
   source: TimeSource;
   rate: Rate;
-  timezone: string;     // IANA name. System: the host zone. Timezone mode: a chosen zone.
+  timezone: string;     // IANA name — always the host zone now (the user-facing timezone picker was removed); used by offsetMinutesFor for the host offset.
   hour24: boolean;
   customWallMs: number; // custom mode: the entered wall-clock as a UTC-naive epoch ms (Date.UTC).
 }
@@ -94,9 +94,13 @@ export function fakeTargetUnix(customWallMs: number, hostTz: string, nowMs: numb
   return Math.trunc(customWallMs / 1000) - tzOffsetMinutes(hostTz, new Date(nowMs)) * 60;
 }
 
-/** Watch time differs from plain host system time? (drives the renderer badge.) */
-export function isNonSystemTime(cfg: TimeConfig, hostTz: string): boolean {
-  return cfg.source === "custom" || cfg.rate !== "1x" || cfg.timezone !== hostTz;
+/** Watch time differs from plain host system time? (drives the renderer badge.)
+ * The `hostTz` param is retained for signature compatibility with callers but is
+ * no longer consulted — the user-facing Timezone mode was removed, so the only
+ * non-system states are a custom anchor or a non-1× rate. */
+export function isNonSystemTime(cfg: TimeConfig, _hostTz: string): boolean {
+  void _hostTz;
+  return cfg.source === "custom" || cfg.rate !== "1x";
 }
 
 interface TimeDriver {
@@ -263,15 +267,11 @@ export function makeTimeController(
       await apply();
     },
     async reassert(): Promise<void> {
-      // Heal the post_connect host-offset clobber only where it matters:
-      // Timezone mode is system-source with a non-host zone.
-      const isTimezoneMode = cfg.source === "system" && cfg.timezone !== hostTz();
-      if (isTimezoneMode) {
-        // Timezone mode — re-push the chosen zone's offset.
-        const d = getDriver();
-        if (!d) return;
-        try { await d.setTzOffset(offsetMinutesFor(cfg, now(), hostTz()), cfg.timezone); } catch { /* ignore */ }
-      } else if (cfg.source === "custom" && legacyActive) {
+      // Heal the post_connect host-offset clobber only where it matters: the
+      // legacy custom fallback, whose time-varying utc_offset IS the mechanism.
+      // (The user-facing Timezone mode was removed, so the offset is always the
+      // host offset — exactly what post_connect re-pushes.)
+      if (cfg.source === "custom" && legacyActive) {
         // Legacy custom — re-push the virtual-clock offset.
         await legacyPush(true);
       }

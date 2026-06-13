@@ -29,7 +29,7 @@ describe("detectHostTimezone", () => {
 describe("offsetMinutesFor (constant per config)", () => {
   const t0 = WINTER.getTime();
 
-  it("System → host offset; Timezone → the chosen zone's offset", () => {
+  it("computes the offset for any IANA zone (used for the host offset)", () => {
     expect(offsetMinutesFor(cfg({ source: "system", timezone: HOST }), t0, HOST)).toBe(-480);
     expect(offsetMinutesFor(cfg({ source: "system", timezone: "Asia/Tokyo" }), t0, HOST)).toBe(540);
   });
@@ -59,10 +59,9 @@ describe("DEFAULT_TIME_CONFIG", () => {
 });
 
 describe("isNonSystemTime", () => {
-  it("flags custom source, non-1× rate, or a non-host zone", () => {
+  it("flags custom source or a non-1× rate; plain host system time is not flagged", () => {
     expect(isNonSystemTime(cfg({ source: "custom" }), HOST)).toBe(true);
     expect(isNonSystemTime(cfg({ source: "system", rate: "10x", timezone: HOST }), HOST)).toBe(true);
-    expect(isNonSystemTime(cfg({ source: "system", timezone: "Asia/Tokyo" }), HOST)).toBe(true);
     expect(isNonSystemTime(cfg({ source: "system", rate: "1x", timezone: HOST }), HOST)).toBe(false);
   });
 });
@@ -146,17 +145,6 @@ describe("makeTimeController — shim-backed (primary path)", () => {
     await tc.setConfig(cfg({ source: "custom", rate: "frozen", customWallMs: t0 }));
     await tc.setConfig(cfg({ source: "system", timezone: HOST }));
     expect(d.fake[d.fake.length - 1]).toEqual([t0Sec, 1]);
-    tc.stop();
-  });
-
-  it("timezone mode: setTzOffset(540, Asia/Tokyo) + setFakeTime(now,1); reassert re-pushes 540", async () => {
-    const d = fakeDriver();
-    const tc = makeTimeController(() => d, deps);
-    await tc.setConfig(cfg({ source: "system", timezone: "Asia/Tokyo" }));
-    expect(d.tz).toEqual([[540, "Asia/Tokyo"]]);
-    expect(d.fake).toEqual([[t0Sec, 1]]);
-    await tc.reassert();
-    expect(d.tz).toEqual([[540, "Asia/Tokyo"], [540, "Asia/Tokyo"]]);
     tc.stop();
   });
 
