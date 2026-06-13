@@ -32,6 +32,8 @@ const CAPTURE_DIR_KEY = "pebble-studio:capture-dir";
 const BACKLIGHT_CAPTURE_KEY = "pebble-studio:backlight-capture";
 const BACKLIGHT_METHOD_KEY = "pebble-studio:backlight-method";
 const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
+/** Auto-relaunch the emulator when the bridge crashes (EmulatorView reads this). Default OFF. */
+const AUTO_RELAUNCH_KEY = "pebble-studio:auto-relaunch";
 
 const TIME_SOURCE_KEY = "pebble-studio:time-source";
 const TIME_RATE_KEY = "pebble-studio:time-rate";
@@ -602,7 +604,21 @@ export class SettingsPane {
       },
     );
 
-    advanced.append(advHeading, diagRow, throttleRow);
+    // v0.0.13.5: the qemu-pebble phone bridge (pypkjs) can crash on its own —
+    // an upstream fragility, surfaced as "⚠ Emulator stopped responding". When
+    // this is ON, the app reboots the emulator and reinstalls your apps for you
+    // (capped, so a repeatedly-crashing bridge falls back to the manual Relaunch
+    // button instead of looping). EmulatorView reads this key directly.
+    const autoRelaunchRow = this.makeSwitchRow(
+      "Auto-relaunch if the emulator crashes",
+      "If the emulator bridge stops responding, automatically reboot it and reinstall your apps (falls back to manual Relaunch after repeated crashes).",
+      localStorage.getItem(AUTO_RELAUNCH_KEY) === "true", // default OFF
+      (on) => {
+        localStorage.setItem(AUTO_RELAUNCH_KEY, on ? "true" : "false");
+      },
+    );
+
+    advanced.append(advHeading, diagRow, throttleRow, autoRelaunchRow);
 
     this.el.append(appearance, watch, time, capture, keyboard, advanced);
 

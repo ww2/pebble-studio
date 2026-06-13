@@ -156,6 +156,23 @@ export function makeTimeController(
   let lastPushed: number | null = null;  // last offset minutes actually sent
   let timer: ReturnType<typeof setInterval> | null = null;
   let pushing = false;
+  // In-flight guard for the apply()/reassert host-offset push. setTzOffset opens a
+  // connection to the single-client pypkjs bridge; without this, a slow/contended
+  // push fired on every boot/install/relaunch overlaps with the next one and they
+  // stack up (confirmed live: 15+ hung pb-set-tz.py chains), starving the bridge.
+  // Combined with the helper's `timeout` bound, pushes can neither hang nor pile up.
+  let tzPushInFlight = false;
+  async function pushTzOffsetGuarded(d: TimeDriver, off: number, tzName?: string): Promise<void> {
+    if (tzPushInFlight) return; // a push is already running — skip (latest state re-pushes next time)
+    tzPushInFlight = true;
+    try {
+      await d.setTzOffset(off, tzName);
+    } catch {
+      /* bridge down — non-fatal */
+    } finally {
+      tzPushInFlight = false;
+    }
+  }
 
   /** Legacy custom: time-varying offset so the display tracks the virtual clock. */
   function legacyOffsetMinutesFor(c: TimeConfig, nowMs: number, anchor: number): number {
@@ -251,8 +268,7 @@ export function makeTimeController(
       // Skipped in legacy custom: legacyPush already owns the offset, and a
       // host-offset push here would clobber its virtual-clock offset.
       const tzName = cfg.source === "custom" ? hostTz() : cfg.timezone;
-      void d.setTzOffset(offsetMinutesFor(cfg, now(), hostTz()), tzName)
-        .catch(() => { /* bridge down — non-fatal */ });
+      void pushTzOffsetGuarded(d, offsetMinutesFor(cfg, now(), hostTz()), tzName);
     }
   }
 

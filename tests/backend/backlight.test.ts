@@ -145,4 +145,50 @@ describe("createBacklightController", () => {
     await vi.advanceTimersByTimeAsync(5000);
     expect(shellRun).not.toHaveBeenCalled();
   });
+
+  // v0.0.13.5: capture-hold must light the screen during a screenshot/GIF even
+  // when the always-on keepalive METHOD is "off" (the default). "off" only
+  // disables the intrusive always-on keepalive (which navigates menus); an
+  // explicit capture is a deliberate, temporary wake and should always work —
+  // otherwise "backlight during capture" silently does nothing for the default
+  // user, and GIFs record dim. With method "off", capture-hold falls back to a
+  // Back-press wake (harmless on a watchface, which is what users capture).
+  it("captureHold lights the screen even when method is 'off' (Back-press fallback)", async () => {
+    const ctrl = makeController();
+    ctrl.setMethod("off");
+    ctrl.setCaptureHold(true); // an explicit capture — must wake despite "off"
+    await vi.advanceTimersByTimeAsync(0);
+    expect(shellRun).toHaveBeenCalled(); // Back-press path reads the monitor port
+    expect(sendMotion).not.toHaveBeenCalled();
+  });
+
+  it("captureHold with method 'motion' uses motion (respects an explicit choice)", async () => {
+    const ctrl = makeController();
+    ctrl.setMethod("motion");
+    ctrl.setCaptureHold(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sendMotion).toHaveBeenCalledTimes(1);
+    expect(shellRun).not.toHaveBeenCalled();
+  });
+
+  it("releasing captureHold stops the interval when method is 'off'", async () => {
+    const ctrl = makeController();
+    ctrl.setMethod("off");
+    ctrl.setCaptureHold(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(shellRun).toHaveBeenCalled();
+    shellRun.mockClear();
+    ctrl.setCaptureHold(false); // capture done — interval must stop
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(shellRun).not.toHaveBeenCalled();
+  });
+
+  it("always=true with method 'off' stays inactive (only captureHold forces it)", async () => {
+    const ctrl = makeController();
+    ctrl.setMethod("off");
+    ctrl.setAlways(true); // the always-on keepalive still respects "off"
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(shellRun).not.toHaveBeenCalled();
+    expect(sendMotion).not.toHaveBeenCalled();
+  });
 });

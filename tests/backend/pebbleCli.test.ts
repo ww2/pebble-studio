@@ -86,6 +86,13 @@ describe("setTzOffsetCmd", () => {
     expect(oneLiner).toContain("-240");
     expect(oneLiner).toContain("America/New_York");
   });
+  it("hard-bounds the helper with `timeout` so a contended pypkjs push can't hang/pile up", () => {
+    const oneLiner = setTzOffsetCmd(-240, "America/New_York").args[1];
+    // SIGTERM at 6s, SIGKILL at 8s — a wedged bridge push always unwinds.
+    expect(oneLiner).toMatch(/timeout -k 2 6 \$PYBIN/);
+    expect(oneLiner).not.toContain("'"); // timeout adds no quotes
+    expect(oneLiner).not.toContain('"');
+  });
   it("falls back to a synthesized UTC±h name for non-shell-safe/absent zones", () => {
     expect(setTzOffsetCmd(540).args[1]).toContain("UTC+9");
     expect(setTzOffsetCmd(-240).args[1]).toContain("UTC-4");

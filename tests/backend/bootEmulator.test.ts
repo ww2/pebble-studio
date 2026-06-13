@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 
+/** Hermetic stub for the injected boot health probe (no real shell spawn). */
+const NOPROBE = async () => ({ qemuAlive: true, stateFile: true, rfbOpen: true, wsOpen: true });
+
 /**
  * Drive a module-level mock of the `spawn` named import. Each test sets
  * `spawnImpl` to a fake that records calls and returns a fake child. No real
@@ -56,7 +59,7 @@ vi.mock("node:net", () => ({
 }));
 
 // Import AFTER the mock is registered (vi.mock is hoisted, so this is fine).
-const { bootEmulator, BootAborted, makeWslBootDeps, makeNativeBootDeps, waitUntilDead } = await import(
+const { bootEmulator, BootAborted, makeWslBootDeps, makeNativeBootDeps, waitUntilDead, makeDiagnose, fmtProbe, extractBootErrors } = await import(
   "../../src/main/backend/bootEmulator.js"
 );
 // timeShim holds the module-level shim-readiness cache that bootControl consults;
@@ -199,6 +202,7 @@ describe("bootEmulator WSL shell construction", () => {
       killAll: async () => { order.push("killAll"); },
       ensureKeymap: async () => { order.push("ensureKeymap"); },
       bootControl: async () => { order.push("bootControl"); },
+      diagnose: NOPROBE,
       waitForEmuInfo: async () => { order.push("waitForEmuInfo"); },
       waitForPort: async () => { order.push("waitForPort"); },
     });
@@ -235,6 +239,8 @@ describe("bootEmulator cancellation", () => {
         killAll: async () => {},
         ensureKeymap: async () => {},
         bootControl: async () => {},
+        diagnose: NOPROBE,
+        readBootLog: async () => "",
         // This wait never succeeds on its own; only the token can end it.
         waitForEmuInfo: makeTokenAwareWait(),
         waitForPort: makeTokenAwareWait(),
@@ -254,6 +260,8 @@ describe("bootEmulator cancellation", () => {
         killAll,
         ensureKeymap: async () => {},
         bootControl,
+        diagnose: NOPROBE,
+        readBootLog: async () => "",
         // Simulates the real token-aware wait: cancel surfaces as BootAborted.
         waitForEmuInfo: async () => { throw new BootAborted(); },
         waitForPort: async () => {},
@@ -271,6 +279,8 @@ describe("bootEmulator cancellation", () => {
         killAll: async () => {},
         ensureKeymap: async () => {},
         bootControl,
+        diagnose: NOPROBE,
+        readBootLog: async () => "",
         waitForEmuInfo: async () => {
           token.cancelled = true; // cancel lands mid-wait…
           throw new Error("socket torn down"); // …but surfaces as a generic error
@@ -297,6 +307,65 @@ describe("bootEmulator cancellation", () => {
   });
 });
 
+describe("makeDiagnose + fmtProbe (boot health probe)", () => {
+  it("runs ONE quote-free one-liner (survives the WSL double-shell-hop)", async () => {
+    let captured = "";
+    const shell = {
+      run: async (cmd: string) => { captured = cmd; return { code: 0, stdout: "q0 i0 r0 w0", stderr: "" }; },
+      spawnDetached: async () => {},
+    };
+    await makeDiagnose(shell)();
+    // The command crosses `wsl.exe -- bash -lc "'bash' '-lc' '<cmd>'"` on Windows,
+    // so per the hard-won rule it MUST contain zero single/double quotes.
+    expect(captured).not.toMatch(/['"]/);
+    expect(captured).toContain("pgrep -x qemu-pebble");
+  });
+
+  it("parses the q/i/r/w flags into a BootProbe", async () => {
+    const shell = {
+      run: async () => ({ code: 0, stdout: "q1 i0 r1 w0\n", stderr: "" }),
+      spawnDetached: async () => {},
+    };
+    expect(await makeDiagnose(shell)()).toEqual({
+      qemuAlive: true, stateFile: false, rfbOpen: true, wsOpen: false,
+    });
+  });
+
+  it("reports all-false when the probe shell errors (degraded but safe)", async () => {
+    const shell = {
+      run: async () => { throw new Error("shell gone"); },
+      spawnDetached: async () => {},
+    };
+    expect(await makeDiagnose(shell)()).toEqual({
+      qemuAlive: false, stateFile: false, rfbOpen: false, wsOpen: false,
+    });
+  });
+
+  it("fmtProbe renders ✓/✗ per component", () => {
+    expect(fmtProbe({ qemuAlive: true, stateFile: false, rfbOpen: true, wsOpen: false }))
+      .toBe("qemu ✓ · state-file ✗ · RFB:5901 ✓ · ws:6080 ✗");
+  });
+
+  it("extractBootErrors pulls error lines out of an ANSI-art boot log", () => {
+    const ESC = String.fromCharCode(27);
+    const log = [
+      `${ESC}[7m  ${ESC}[0m${ESC}[49m  ${ESC}[0m`, // screen block-art (noise)
+      "Booting emery…",                              // informational (not an error)
+      "qemu-pebble: -vnc :1: Failed to find an available port: Address already in use",
+      `${ESC}[7m  ${ESC}[0m`,
+    ].join("\n");
+    const out = extractBootErrors(log);
+    expect(out).toContain("Address already in use");
+    expect(out).not.toContain("Booting"); // non-error lines are dropped
+    expect(out).not.toMatch(/\x1b/); // ANSI stripped
+  });
+
+  it("extractBootErrors returns empty when the log has no error lines", () => {
+    expect(extractBootErrors("Booting…\nrendering watch\n")).toBe("");
+    expect(extractBootErrors("")).toBe("");
+  });
+});
+
 describe("bootEmulator retry-once", () => {
   it("retries once after a readiness failure: clean kill, relaunch, resolves", async () => {
     const killAll = vi.fn(async () => {});
@@ -309,6 +378,8 @@ describe("bootEmulator retry-once", () => {
         killAll,
         ensureKeymap: async () => {},
         bootControl,
+        diagnose: NOPROBE,
+        readBootLog: async () => "",
         waitForEmuInfo: async () => {
           emuInfoCalls += 1;
           // The connect-after-marker race: first wait stalls out, second is fine.
@@ -320,26 +391,76 @@ describe("bootEmulator retry-once", () => {
       (msg) => steps.push(msg),
     );
     expect(endpoint).toEqual({ host: "localhost", port: 6080, wsPath: "/" });
-    expect(bootControl).toHaveBeenCalledTimes(2); // initial launch + retry launch
+    expect(bootControl).toHaveBeenCalledTimes(2); // initial launch + 1 retry launch
     expect(killAll).toHaveBeenCalledTimes(2); // initial teardown + pre-retry clean kill
-    expect(steps.some((s) => /retrying/i.test(s))).toBe(true);
+    expect(steps.some((s) => /retry/i.test(s))).toBe(true);
     expect(steps[steps.length - 1]).toBe("Ready");
   });
 
-  it("propagates the failure when the retry fails too (exactly one retry)", async () => {
+  it("after MAX_BOOT_ATTEMPTS stalls, wipes and retries once — recovering", async () => {
     const bootControl = vi.fn(async () => {});
     const killAll = vi.fn(async () => {});
-    await expect(
-      bootEmulator("basalt", {
+    const wipe = vi.fn(async () => {});
+    let calls = 0;
+    const steps: string[] = [];
+    const endpoint = await bootEmulator(
+      "basalt",
+      {
         killAll,
         ensureKeymap: async () => {},
         bootControl,
+        diagnose: NOPROBE,
+        readBootLog: async () => "",
+        wipe,
+        // First 3 attempts stall (corrupt-flash signature); the post-wipe 4th is fine.
+        waitForEmuInfo: async () => { calls += 1; if (calls <= 3) throw new Error("state file never appeared"); },
+        waitForPort: async () => {},
+      },
+      undefined,
+      (m) => steps.push(m),
+    );
+    expect(endpoint).toEqual({ host: "localhost", port: 6080, wsPath: "/" });
+    expect(bootControl).toHaveBeenCalledTimes(4); // 3 normal + 1 post-wipe
+    expect(wipe).toHaveBeenCalledTimes(1);
+    expect(killAll).toHaveBeenCalledTimes(4); // initial + 2 inter-retry + 1 pre-wipe
+    expect(steps.some((s) => /wiping/i.test(s))).toBe(true);
+    expect(steps[steps.length - 1]).toBe("Ready (recovered after wipe)");
+  });
+
+  it("propagates the last failure when even the wipe recovery fails", async () => {
+    const bootControl = vi.fn(async () => {});
+    const wipe = vi.fn(async () => {});
+    await expect(
+      bootEmulator("basalt", {
+        killAll: async () => {},
+        ensureKeymap: async () => {},
+        bootControl,
+        diagnose: NOPROBE,
+        readBootLog: async () => "",
+        wipe,
         waitForEmuInfo: async () => { throw new Error("still stuck"); },
         waitForPort: async () => {},
       }),
     ).rejects.toThrow("still stuck");
-    expect(bootControl).toHaveBeenCalledTimes(2); // never a third attempt
-    expect(killAll).toHaveBeenCalledTimes(2);
+    expect(bootControl).toHaveBeenCalledTimes(4); // 3 normal + 1 post-wipe recovery
+    expect(wipe).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT wipe when no wipe dep is provided (propagates after 3 attempts)", async () => {
+    const bootControl = vi.fn(async () => {});
+    await expect(
+      bootEmulator("basalt", {
+        killAll: async () => {},
+        ensureKeymap: async () => {},
+        bootControl,
+        diagnose: NOPROBE,
+        readBootLog: async () => "",
+        wipe: undefined, // explicitly no wipe dep → no recovery escalation
+        waitForEmuInfo: async () => { throw new Error("still stuck"); },
+        waitForPort: async () => {},
+      }),
+    ).rejects.toThrow("still stuck");
+    expect(bootControl).toHaveBeenCalledTimes(3);
   });
 });
 

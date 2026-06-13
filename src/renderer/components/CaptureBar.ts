@@ -19,6 +19,21 @@ const BACKLIGHT_CAPTURE_KEY = "pebble-studio:backlight-capture";
 /** Beat (ms) to let the backlight rise before grabbing an instant screenshot. */
 const BACKLIGHT_RISE_MS = 250;
 
+/**
+ * GIF pre-roll (ms): wake the backlight and let it fully rise BEFORE the first
+ * frame is grabbed, so the recording is bright from frame one (a touch longer
+ * than the screenshot rise since a GIF's opening frames are the most visible).
+ */
+const GIF_BACKLIGHT_PREROLL_MS = 400;
+
+/**
+ * GIF post-roll (ms): keep the capture backlight held for a short beat AFTER the
+ * user presses Stop, then release. Guarantees the final frames (grabbed right
+ * before Stop) stay lit and the release never races an in-flight last grab, so
+ * the whole recording is uniformly bright.
+ */
+const GIF_BACKLIGHT_POSTROLL_MS = 700;
+
 export class CaptureBar {
   readonly el: HTMLElement;
   private readonly select: HTMLSelectElement;
@@ -202,22 +217,37 @@ export class CaptureBar {
     const host = this.getHost();
     if (!host) { this.status.textContent = "No emulator screen"; return; }
 
+    // Mark recording immediately so the button reads "Stop GIF" and a second
+    // click can't start a parallel recording during the pre-roll await below.
+    this.recording = true;
+    this.recBtn.textContent = "Stop GIF";
+    this.recBtn.classList.add("capture-btn--recording");
+
+    // K: hold the backlight on for the whole recording so frames aren't dim;
+    // released (after a post-roll) in stopRecord(). Fire-and-forget.
+    void this.setBacklightHold(true);
+
+    // K (v0.0.13.5): let the backlight fully rise BEFORE grabbing any frame, so
+    // the GIF is lit from frame one (mirrors the screenshot pre-roll). If the
+    // user hits Stop during this beat, stopRecord() flips `recording` off — bail.
+    if (this.backlightDuringCapture()) {
+      this.status.textContent = "Lighting…";
+      await new Promise((r) => setTimeout(r, GIF_BACKLIGHT_PREROLL_MS));
+      if (!this.recording) return; // cancelled during pre-roll
+    }
+
     // Grab a first frame to determine dimensions
     let firstFrame: RgbaImage;
     try {
       firstFrame = grabUpscaled(host, this.factor());
     } catch (err) {
       this.status.textContent = `Grab failed: ${String(err)}`;
+      this.recording = false;
+      this.recBtn.textContent = "Record GIF";
+      this.recBtn.classList.remove("capture-btn--recording");
+      void this.setBacklightHold(false);
       return;
     }
-
-    this.recording = true;
-    this.recBtn.textContent = "Stop GIF";
-    this.recBtn.classList.add("capture-btn--recording");
-
-    // K: hold the backlight on for the whole recording so frames aren't dim;
-    // released in stopRecord(). Fire-and-forget — a failure must not break record.
-    void this.setBacklightHold(true);
 
     // A preset (5/10/15s) caps the budget at exactly that many seconds so the
     // existing isFull() path auto-stops. Manual uses the full hard cap.
@@ -306,8 +336,10 @@ export class CaptureBar {
     this.recording = false;
     this.recBtn.textContent = "Record GIF";
     this.recBtn.classList.remove("capture-btn--recording");
-    // K: release the recording's backlight hold (fire-and-forget, never throws).
-    void this.setBacklightHold(false);
+    // K (v0.0.13.5): keep the backlight held for a short post-roll after Stop,
+    // then release — so the final frames (grabbed just before this) stay lit and
+    // the release never races a last in-flight grab. Fire-and-forget.
+    setTimeout(() => { void this.setBacklightHold(false); }, GIF_BACKLIGHT_POSTROLL_MS);
     if (this.gif) {
       this.gif.render();
       this.gif = null;

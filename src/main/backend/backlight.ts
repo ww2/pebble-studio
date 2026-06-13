@@ -123,10 +123,25 @@ export function createBacklightController(
   // Guard so a slow fire (shell read + TCP) doesn't overlap the next interval.
   let ticking = false;
 
-  /** Perform a single keepalive action for the current method. */
+  /**
+   * The wake method to actually use for a fire. The always-on keepalive honors
+   * the user's `method` (incl. "off" = no keepalive). But `captureHold` is a
+   * deliberate, temporary wake tied to an explicit screenshot/GIF: it must light
+   * the screen even when the always-on keepalive is "off" (the default) — else
+   * "backlight during capture" silently does nothing and GIFs record dim. When
+   * the method is "off", a capture falls back to a Back-press wake (harmless on a
+   * watchface, which is what users capture); an explicit "motion" choice is kept.
+   */
+  function effectiveMethod(): BacklightMethod {
+    if (captureHold && method === "off") return "back";
+    return method;
+  }
+
+  /** Perform a single keepalive action for the effective method. */
   async function fire(): Promise<void> {
-    if (method === "off") return; // disabled — nothing to do
-    if (method === "motion") {
+    const m = effectiveMethod();
+    if (m === "off") return; // disabled — nothing to do
+    if (m === "motion") {
       try {
         await sendMotion();
       } catch {
@@ -134,7 +149,7 @@ export function createBacklightController(
       }
       return;
     }
-    // method === "back": read the monitor port through the shell, send a Back key.
+    // "back": read the monitor port through the shell, send a Back key.
     const kind = getKind();
     if (!kind) return; // backend not initialized yet — skip
     const port = await readMonitorPort(shellFor(kind));
@@ -155,9 +170,10 @@ export function createBacklightController(
   }
 
   function sync(): void {
-    // The loop runs while a flag is set AND a method is selected. "off" stops it
-    // even if always/captureHold are set.
-    const wantActive = (always || captureHold) && method !== "off";
+    // The always-on keepalive runs only when `always` is set AND the method is
+    // not "off". `captureHold` runs whenever set — even under method "off" —
+    // because a capture is an explicit, temporary wake (see effectiveMethod).
+    const wantActive = (always && method !== "off") || captureHold;
     if (wantActive && timer == null) {
       timer = setInterval(() => void tick(), TICK_MS);
       // Fire once immediately so the backlight rises without a full tick's wait.

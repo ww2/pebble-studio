@@ -68,11 +68,30 @@ export class BootAborted extends Error {
   }
 }
 
+/**
+ * A point-in-time health snapshot of the emulator stack, used to annotate boot
+ * progress so a stuck boot shows EXACTLY which component hasn't come up:
+ *   - qemuAlive  — a `qemu-pebble` process is running (pgrep -x)
+ *   - stateFile  — /tmp/pb-emulator.json exists and is non-empty
+ *   - rfbOpen    — qemu's raw VNC (RFB :5901) is accepting connections
+ *   - wsOpen     — websockify's proxy (ws :6080) is accepting connections
+ * The classic stuck-boot signature is qemuAlive=false + rfbOpen=true: a stale
+ * listener still holds :5901 so the fresh qemu died on "address already in use".
+ */
+export interface BootProbe {
+  qemuAlive: boolean;
+  stateFile: boolean;
+  rfbOpen: boolean;
+  wsOpen: boolean;
+}
+
 export interface SpawnDeps {
   /** Spawn `pebble emu-control --emulator <id> --vnc` detached; resolve once launched. */
   bootControl: (id: PlatformId) => Promise<void>;
   /** Ensure the qemu keymap exists at the pc-bios path the tool's VNC boot uses. */
   ensureKeymap: () => Promise<void>;
+  /** One-shot health snapshot used to annotate boot progress (diagnostics). */
+  diagnose: () => Promise<BootProbe>;
   /** Resolve once a TCP connection to host:port succeeds (or reject on timeout).
    * Honors the optional cancellation token: a cancelled token aborts an active
    * retry loop promptly with `BootAborted`. */
@@ -82,6 +101,20 @@ export interface SpawnDeps {
   waitForEmuInfo: (id: PlatformId, timeoutMs: number, token?: BootToken) => Promise<void>;
   /** Stop any prior emulator + websockify so we boot a clean stack. */
   killAll: () => Promise<void>;
+  /**
+   * Wipe all emulator persistent data (`pebble wipe`). Used ONLY as a last-resort
+   * recovery when every normal boot attempt fails: a corrupt SPI flash (e.g. left
+   * by a bridge/pypkjs crash mid-install) makes the firmware hang on boot with no
+   * console marker, which looks exactly like the `_wait_for_qemu` stall. Wiping
+   * regenerates a clean flash; the renderer reinstalls the app library afterward,
+   * so no user .pbw is lost. Optional — omitted in unit tests that don't want it.
+   */
+  wipe?: () => Promise<void>;
+  /**
+   * Read the raw emu-control boot log (EMU_LOG_PATH). On a failed attempt we mine
+   * it for the actual qemu-launch error to surface in the diagnostics. Optional.
+   */
+  readBootLog?: () => Promise<string>;
 }
 
 /**
@@ -209,6 +242,66 @@ function makeWaitForEmuInfo(shell: Shell) {
       if (token?.cancelled) throw new BootAborted();
     }
   };
+}
+
+/**
+ * Build a shell-backed health probe. ONE quote-free bash one-liner (it crosses
+ * the WSL double-shell-hop, so per the hard-won rule it must contain ZERO ' and
+ * ZERO " — see pebbleCli.setTzOffsetCmd / bridgeHealth.buildHealthCommand) prints
+ * four 0/1 flags: `q<0|1> i<0|1> r<0|1> w<0|1>`. A bare `/dev/tcp` connect tests a
+ * port without nc/timeout; a refused connect fails immediately.
+ */
+export function makeDiagnose(shell: Shell) {
+  const cmd =
+    `Q=0; pgrep -x qemu-pebble >/dev/null 2>&1 && Q=1; ` +
+    `I=0; [ -s ${EMU_INFO_PATH} ] && I=1; ` +
+    `R=0; (exec 3<>/dev/tcp/localhost/${VNC_RFB_PORT}) 2>/dev/null && R=1; ` +
+    `W=0; (exec 3<>/dev/tcp/localhost/${WS_PORT}) 2>/dev/null && W=1; ` +
+    `echo q$Q i$I r$R w$W`;
+  return async function diagnose(): Promise<BootProbe> {
+    try {
+      const { stdout } = await shell.run(cmd);
+      const t = stdout;
+      return {
+        qemuAlive: /q1/.test(t),
+        stateFile: /i1/.test(t),
+        rfbOpen: /r1/.test(t),
+        wsOpen: /w1/.test(t),
+      };
+    } catch {
+      // A probe failure is itself a (degraded) signal; report all-unknown=false.
+      return { qemuAlive: false, stateFile: false, rfbOpen: false, wsOpen: false };
+    }
+  };
+}
+
+/** Format a probe as a compact one-line note for the diagnostics boot log. */
+export function fmtProbe(p: BootProbe): string {
+  const m = (ok: boolean): string => (ok ? "✓" : "✗");
+  return `qemu ${m(p.qemuAlive)} · state-file ${m(p.stateFile)} · RFB:${VNC_RFB_PORT} ${m(p.rfbOpen)} · ws:${WS_PORT} ${m(p.wsOpen)}`;
+}
+
+/**
+ * Pull the meaningful ERROR lines out of the emu-control boot log. That log is
+ * mostly the watch screen rendered as ANSI block-art (noise), but on a failed
+ * boot the real cause is in there as plain text (e.g. "Address already in use",
+ * an LD_PRELOAD/shim error, a Python traceback, "command not found"). We strip
+ * ANSI escapes, drop the block-art lines, keep only error-shaped lines, and
+ * return the last few. Pure + unit-testable; filtering in Node sidesteps the
+ * WSL quote-free constraint that a shell-side grep would hit.
+ */
+export function extractBootErrors(log: string, maxLines = 4): string {
+  if (!log) return "";
+  const ESC = String.fromCharCode(27);
+  const lines = log
+    .split("\n")
+    // Strip ANSI SGR escapes (the block-art coloring) and trim.
+    .map((l) => l.replace(new RegExp(`${ESC}\\[[0-9;]*m`, "g"), "").trim())
+    // Drop empties and the screen block-art (runs of two-space cells).
+    .filter((l) => l.length > 0 && !/^[\s]*$/.test(l) && !/^( {2}){4,}$/.test(l));
+  const ERR = /error|fail|cannot|refus|address already|in use|preload|no such|traceback|exception|not found|abort|denied|missing/i;
+  const hits = lines.filter((l) => ERR.test(l));
+  return hits.slice(-maxLines).join(" | ");
 }
 
 function makeEnsureKeymap(shell: Shell) {
@@ -344,14 +437,34 @@ function makeKillAll(shell: Shell) {
   };
 }
 
+/** Read the emu-control boot log through the shell (quote-free `cat`). */
+function makeReadBootLog(shell: Shell) {
+  return async function readBootLog(): Promise<string> {
+    const { code, stdout } = await shell.run(`cat ${EMU_LOG_PATH} 2>/dev/null`);
+    return code === 0 ? stdout : "";
+  };
+}
+
+/** Wipe all emulator persistent data via `pebble wipe` (last-resort recovery). */
+function makeWipe(shell: Shell) {
+  return async function wipe(): Promise<void> {
+    // `pebble wipe` has no --emulator flag; it clears all platforms' data. It can
+    // exit nonzero on benign stderr warnings, so we don't throw on a bad code.
+    await shell.run("pebble wipe 2>/dev/null; true");
+  };
+}
+
 /** Build the SpawnDeps for a given shell (native or wsl). */
 function makeBootDeps(shell: Shell): SpawnDeps {
   return {
     bootControl: makeBootControl(shell),
     ensureKeymap: makeEnsureKeymap(shell),
+    diagnose: makeDiagnose(shell),
     waitForPort: defaultWaitForPort,
     waitForEmuInfo: makeWaitForEmuInfo(shell),
     killAll: makeKillAll(shell),
+    wipe: makeWipe(shell),
+    readBootLog: makeReadBootLog(shell),
   };
 }
 
@@ -375,6 +488,62 @@ const defaultDeps: SpawnDeps = makeNativeBootDeps();
  */
 export type OnStep = (msg: string) => void;
 
+/** How often (ms) to re-probe + re-emit a detailed note during a long wait. */
+const PROGRESS_TICK_MS = 1500;
+
+/**
+ * Per-attempt timeout for the pebble state file to appear. This is where the
+ * `_wait_for_qemu` marker hang shows up; a healthy boot writes the file within a
+ * few seconds, so 30s is a generous ceiling that still fails a HUNG attempt fast
+ * enough to retry (vs. the old 60s, which made a double-stall feel like forever).
+ */
+const STATE_FILE_TIMEOUT_MS = 30_000;
+/** Per-attempt timeout for the RFB / websockify ports (fast once the state file lands). */
+const PORT_TIMEOUT_MS = 30_000;
+/**
+ * Boot attempts before giving up. The stall is a race, so a clean relaunch wins
+ * more often than waiting — 3 fast attempts beat 1 long wait + 1 long retry both
+ * on success odds and on worst-case time-to-failure.
+ */
+const MAX_BOOT_ATTEMPTS = 3;
+
+/**
+ * Run `body` while emitting a detailed progress note for `phase` — immediately,
+ * then every PROGRESS_TICK_MS with elapsed seconds + a fresh health snapshot —
+ * so a stuck wait shows precisely what is (not) up and for how long. The ticker
+ * is overlap-guarded and always cleared when `body` settles.
+ */
+async function runWithProgress<T>(
+  phase: string,
+  step: OnStep,
+  diagnose: () => Promise<BootProbe>,
+  body: () => Promise<T>,
+): Promise<T> {
+  const started = Date.now();
+  step(phase); // immediate phase marker (before the first probe lands)
+  let busy = false;
+  const timer = setInterval(() => {
+    if (busy) return;
+    busy = true;
+    void (async () => {
+      try {
+        const p = await diagnose();
+        const secs = Math.round((Date.now() - started) / 1000);
+        step(`${phase} · ${secs}s · ${fmtProbe(p)}`);
+      } catch {
+        /* probe errors are non-fatal — the next tick retries */
+      } finally {
+        busy = false;
+      }
+    })();
+  }, PROGRESS_TICK_MS);
+  try {
+    return await body();
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 export async function bootEmulator(
   platformId: PlatformId,
   deps: Partial<SpawnDeps> = {},
@@ -391,6 +560,13 @@ export async function bootEmulator(
   // 1. Tear down any prior emulator so we own a clean stack.
   step("Killing stale emulator…");
   await d.killAll();
+  // Probe right after teardown: if RFB:5901 / ws:6080 are STILL open here, a
+  // stale listener survived the kill and the fresh qemu will die on
+  // "address already in use" — the classic stuck-boot cause. Surface it.
+  try {
+    const after = await d.diagnose();
+    step(`Stale stack cleared · ${fmtProbe(after)}`);
+  } catch { /* probe is best-effort */ }
   // 2. Make the tool's VNC keymap path valid.
   step("Preparing keymap…");
   await d.ensureKeymap();
@@ -398,36 +574,91 @@ export async function bootEmulator(
   // then wait for readiness: state file, raw RFB, and the websocket proxy. The
   // token threads into each wait so a cancel interrupts the active loop.
   const attempt = async (): Promise<VncEndpoint> => {
-    step("Launching qemu…");
+    step("Launching qemu (pebble emu-control --vnc)…");
     await d.bootControl(platformId);
-    step("Waiting for emulator state…");
-    await d.waitForEmuInfo(platformId, 60_000, token);
-    step("Waiting for VNC…");
-    await d.waitForPort("localhost", VNC_RFB_PORT, 60_000, token);
-    // websockify binds only after qemu's VNC is up, so it's often the slower
-    // wait — give it its own label so diagnostics show the real bottleneck.
-    step("Waiting for websockify…");
-    await d.waitForPort("localhost", WS_PORT, 60_000, token);
+    // Each wait emits periodic elapsed + health-snapshot notes so a stall shows
+    // which component is hung. waitForEmuInfo → the pebble state file gets a pid;
+    // RFB :5901 → qemu's VNC is up; ws :6080 → websockify proxy is up (the slower,
+    // last-to-bind step). The probe pinpoints the stall: qemu✓/state-file✗/RFB✓
+    // is pebble-tool's `_wait_for_qemu` console-marker hang (qemu booted, but the
+    // tool never wrote the state file nor spawned websockify) — the dominant cause
+    // of a stuck boot. We fail this attempt FAST (STATE_FILE_TIMEOUT_MS) rather
+    // than waiting a full minute, because a clean relaunch wins the race more
+    // often than waiting does.
+    await runWithProgress("Waiting for emulator state file…", step, d.diagnose, () =>
+      d.waitForEmuInfo(platformId, STATE_FILE_TIMEOUT_MS, token),
+    );
+    await runWithProgress("Waiting for qemu VNC (RFB :5901)…", step, d.diagnose, () =>
+      d.waitForPort("localhost", VNC_RFB_PORT, PORT_TIMEOUT_MS, token),
+    );
+    await runWithProgress("Waiting for websockify (ws :6080)…", step, d.diagnose, () =>
+      d.waitForPort("localhost", WS_PORT, PORT_TIMEOUT_MS, token),
+    );
     return { host: "localhost", port: WS_PORT, wsPath: "/" };
   };
-  try {
-    const ep = await attempt();
-    step("Ready");
-    return ep;
-  } catch (err) {
-    // Known flakiness: the managed boot intermittently hangs waiting for the
-    // emulator state (a connect-after-marker race in pebble-tool). A clean kill
-    // + ONE retry recovers it. Cancellation is never retried.
-    if (err instanceof BootAborted || token?.cancelled) throw err;
-    step("Boot stalled — retrying once…");
-    // The production killAll (makeKillAll) ends with waitUntilDead, so the
-    // retry's bootControl never races a not-yet-released qemu/port. Tests stub
-    // killAll, so they exercise the retry FLOW, not that teardown gate.
-    await d.killAll();
-    const ep = await attempt(); // second failure propagates
-    step("Ready");
-    return ep;
+  // Known flakiness: the managed boot intermittently hangs in pebble-tool's
+  // `_wait_for_qemu` (a connect-after-marker race) — qemu comes up but the state
+  // file is never written. It is a RACE, so a clean kill + relaunch usually wins
+  // where waiting would not. We try up to MAX_BOOT_ATTEMPTS, killing cleanly
+  // between tries (the production killAll ends with waitUntilDead so the relaunch
+  // never races a not-yet-released qemu/port). Cancellation is never retried.
+  let lastErr: unknown;
+  for (let i = 1; i <= MAX_BOOT_ATTEMPTS; i++) {
+    if (token?.cancelled) throw new BootAborted();
+    if (i > 1) {
+      step(`Boot stalled — clean retry ${i} of ${MAX_BOOT_ATTEMPTS}…`);
+      await d.killAll();
+    }
+    try {
+      const ep = await attempt();
+      step("Ready");
+      return ep;
+    } catch (err) {
+      if (err instanceof BootAborted || token?.cancelled) throw err;
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      step(`Attempt ${i} of ${MAX_BOOT_ATTEMPTS} failed: ${msg}`);
+      // Surface the REAL qemu-launch error from emu-control's log (e.g. a port
+      // collision, LD_PRELOAD/shim failure, or missing binary) so a `qemu ✗`
+      // stall isn't a mystery. Best-effort; the log is mostly screen art.
+      if (d.readBootLog) {
+        try {
+          const errs = extractBootErrors(await d.readBootLog());
+          if (errs) step(`qemu launch error: ${errs}`);
+        } catch { /* diagnostics only */ }
+      }
+    }
   }
+
+  // LAST-RESORT RECOVERY: every normal attempt stalled. The dominant cause of a
+  // persistent stall (qemu up, but the state file never lands) is a CORRUPT SPI
+  // flash — typically left by a bridge/pypkjs crash mid-install — which makes the
+  // firmware hang on boot. Plain relaunches can't fix that; only a wipe can. We
+  // regenerate a clean flash and try once more. The renderer reinstalls the app
+  // library after boot, so no user .pbw is lost (watch-side settings do reset).
+  if (d.wipe && !token?.cancelled) {
+    step("Boot keeps stalling — emulator data may be corrupt; wiping and retrying…");
+    await d.killAll();
+    try {
+      await d.wipe();
+    } catch (err) {
+      step(`Wipe failed (continuing): ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (token?.cancelled) throw new BootAborted();
+    try {
+      const ep = await attempt();
+      step("Ready (recovered after wipe)");
+      return ep;
+    } catch (err) {
+      if (err instanceof BootAborted || token?.cancelled) throw err;
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      step(`Recovery attempt after wipe failed: ${msg}`);
+    }
+  }
+
+  // Every attempt (incl. the wipe recovery) failed — propagate the last error.
+  throw lastErr;
 }
 
 export async function stopEmulator(deps: Partial<Pick<SpawnDeps, "killAll">> = {}): Promise<void> {

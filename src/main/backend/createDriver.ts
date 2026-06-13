@@ -63,7 +63,10 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
         // On a Windows host the emulator lifecycle must run inside WSL via
         // wsl.exe, not as Node-spawned Linux binaries on the Windows host. The
         // token threads through so a force-close aborts the in-WSL boot.
-        boot: (id, token) => bootEmulator(id, makeWslBootDeps(), token),
+        // onStep MUST be forwarded too — without it the WSL boot emits NO
+        // progress notes, so the diagnostics boot log is blank on Windows (the
+        // long-standing "no detailed steps on the .exe" bug, fixed v0.0.13.7).
+        boot: (id, token, onStep) => bootEmulator(id, makeWslBootDeps(), token, onStep),
         stop: () => stopEmulator({ killAll: makeWslBootDeps().killAll }),
       });
   return { driver, kind };

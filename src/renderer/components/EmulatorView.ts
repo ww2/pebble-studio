@@ -4,6 +4,7 @@ import { getPlatform } from "../../main/backend/emulatorRegistry.js"; // pure mo
 import { connectVnc, type VncHandle } from "../vncClient.js";
 import { loadBindings, resolveAction, type Bindings } from "../keybindings.js";
 import type { TimeConfig } from "../../main/backend/timeController.js";
+import { SessionLog } from "../sessionLog.js";
 
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 /** Format hours/minutes as 12h "h:mm AM/PM" (default) or 24h "HH:MM". */
@@ -15,7 +16,28 @@ function fmtHM(h: number, m: number, hour24: boolean): string {
   return `${h12}:${mm} ${ap}`;
 }
 
+/** Best-effort short message from an unknown thrown value (for the session log). */
+function errText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
 const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
+/** When "true", auto-reboot the emulator on a bridge crash (SettingsPane writes this). */
+const AUTO_RELAUNCH_KEY = "pebble-studio:auto-relaunch";
+/**
+ * Max consecutive auto-relaunches before falling back to the manual "Relaunch"
+ * button. The bridge crash is an upstream pypkjs fragility (see
+ * bridge-crash-root-cause): if it dies again and again within a short window we
+ * stop auto-rebooting so the app can't thrash in a relaunch loop.
+ */
+const AUTO_RELAUNCH_CAP = 2;
+/**
+ * If the emulator stays live this long after an auto-relaunch, the run counts as
+ * "recovered" and the consecutive-crash budget resets — so an occasional crash
+ * hours apart always gets a fresh set of auto-recovery attempts.
+ */
+const AUTO_RELAUNCH_HEALTHY_MS = 45_000;
 
 /**
  * Width of the `.emu-frame` casing border (px). The frame is `box-sizing:
@@ -136,13 +158,35 @@ export class EmulatorView {
 
   /** Diagnostics overlay (J-runtime): created lazily, surfaces FPS + boot notes. */
   private diagnostics = false;
-  private readonly diagLine: HTMLElement;
+  /** Whether the diagnostics panel body is expanded. Collapsed by default. */
+  private diagExpanded = false;
+  /** Collapsible diagnostics panel parts. */
+  private readonly diagEl: HTMLElement;
+  private readonly diagSummary: HTMLElement;
+  private readonly diagBody: HTMLElement;
+  private readonly diagLog: HTMLElement;
+  private readonly diagToggle: HTMLButtonElement;
+  private readonly diagCopyBtn: HTMLButtonElement;
   /** Disposer for the boot-progress subscription (active for diagnostics). */
   private bootProgressDispose: (() => void) | null = null;
   /** Disposer for the bridge-dead subscription (always active). */
   private bridgeDeadDispose: (() => void) | null = null;
-  /** Latest boot-progress note (shown in the diag line when diagnostics on). */
+  /** Consecutive auto-relaunches since the last sustained-healthy run (cap guard). */
+  private autoRelaunchCount = 0;
+  /** Timer that resets autoRelaunchCount once a run has stayed live long enough. */
+  private autoRelaunchResetTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Latest boot-progress note (shown in the diag summary when diagnostics on). */
   private lastBootNote = "";
+  /**
+   * Persistent session log: boot steps + lifecycle markers (Live, crash reason,
+   * auto-relaunch) + boot errors, each timestamped. Unlike the old `bootLog` it is
+   * NEVER wiped on launch or crash — only on app close or an explicit Clear — so a
+   * "loads then crashes" event can be read (and copied) after the fact. Boot ticks
+   * for the same phase collapse onto one updating entry (see SessionLog). It records
+   * across the whole app session regardless of the diagnostics flag, which only
+   * controls visibility — so a crash is captured even before the panel is opened.
+   */
+  private readonly sessionLog = new SessionLog();
   /** rAF id for the FPS sampler; non-null only while diagnostics on + live. */
   private fpsRaf: number | null = null;
   /** Most recent measured fps (changed-frames-per-second). */
@@ -204,7 +248,19 @@ export class EmulatorView {
       <div class="emu-status-row">
         <span class="emu-status" id="emu-status"></span>
       </div>
-      <div class="emu-diag" id="emu-diag" hidden></div>
+      <div class="emu-diag" id="emu-diag" hidden>
+        <button class="emu-diag-header" id="emu-diag-toggle" type="button" aria-expanded="false" title="Show/hide the diagnostics session log">
+          <span class="emu-diag-caret" aria-hidden="true">▸</span>
+          <span class="emu-diag-summary" id="emu-diag-summary">Diagnostics</span>
+        </button>
+        <div class="emu-diag-body" id="emu-diag-body" hidden>
+          <pre class="emu-diag-log" id="emu-diag-log"></pre>
+          <div class="emu-diag-actions">
+            <button class="emu-diag-btn" id="emu-diag-copy" type="button">Copy log</button>
+            <button class="emu-diag-btn" id="emu-diag-clear" type="button">Clear</button>
+          </div>
+        </div>
+      </div>
     `;
 
     this.screenHost = this.el.querySelector<HTMLElement>("#emu-screen")!;
@@ -227,7 +283,19 @@ export class EmulatorView {
     this.stage = this.el.querySelector<HTMLElement>("#emu-stage")!;
     this.switchOverlay = this.el.querySelector<HTMLElement>("#emu-switch-overlay")!;
     this.bezelToggle = this.el.querySelector<HTMLElement>("#emu-bezel-toggle")!;
-    this.diagLine = this.el.querySelector<HTMLElement>("#emu-diag")!;
+    this.diagEl = this.el.querySelector<HTMLElement>("#emu-diag")!;
+    this.diagSummary = this.el.querySelector<HTMLElement>("#emu-diag-summary")!;
+    this.diagBody = this.el.querySelector<HTMLElement>("#emu-diag-body")!;
+    this.diagLog = this.el.querySelector<HTMLElement>("#emu-diag-log")!;
+    this.diagToggle = this.el.querySelector<HTMLButtonElement>("#emu-diag-toggle")!;
+    this.diagCopyBtn = this.el.querySelector<HTMLButtonElement>("#emu-diag-copy")!;
+    this.diagToggle.addEventListener("click", () => this.setDiagExpanded(!this.diagExpanded));
+    this.diagCopyBtn.addEventListener("click", () => void this.copySessionLog());
+    this.el.querySelector<HTMLButtonElement>("#emu-diag-clear")!
+      .addEventListener("click", () => {
+        this.sessionLog.clear();
+        this.renderDiag();
+      });
 
     // Create the four physical button nubs ONCE. They persist across model
     // switches; applyGeometry only toggles the square/round classes so CSS can
@@ -299,16 +367,57 @@ export class EmulatorView {
     // J-runtime: diagnostics overlay. Restore the persisted flag; re-read on the
     // change event so the Settings toggle (Wave 2b) reflects live.
     window.addEventListener("pebble-studio:diagnostics-changed", this.onDiagnosticsChanged);
+    // Record boot-progress into the persistent session log for the WHOLE app
+    // session — NOT just while diagnostics is visible — so a "loads then crashes"
+    // event is captured even if the panel was never opened. The diagnostics flag
+    // only controls visibility (and the costly FPS sampler) below.
+    this.bootProgressDispose = studioBootProgress().onBootProgress((msg) => {
+      this.lastBootNote = msg;
+      this.sessionLog.appendBootStep(msg);
+      if (this.diagnostics) this.renderDiag();
+    });
     this.setDiagnostics(localStorage.getItem(DIAGNOSTICS_KEY) === "on");
 
     // H4: subscribe to bridge-dead notifications from the main-process health
     // monitor. Only transition when live — ignore if already stopping/booting.
     this.bridgeDeadDispose = studioBootProgress().onBridgeDead((reason) => {
       if (this.state !== "live") return;
-      console.warn("[emu] bridge-dead received (reason:", reason, ") — entering unresponsive");
+      // A run just ended — cancel the pending "recovered" reset so a crash
+      // before the healthy window elapses still counts toward the cap.
+      this.clearAutoRelaunchResetTimer();
+      // Record the crash in the persistent session log (this is the event that was
+      // invisible before — the watch "loaded then crashed" and the log was empty).
+      this.logEvent("crash", `⚠ Emulator stopped responding (reason: ${reason})`);
+
+      const autoEnabled = localStorage.getItem(AUTO_RELAUNCH_KEY) === "true";
+      if (autoEnabled && this.autoRelaunchCount < AUTO_RELAUNCH_CAP) {
+        this.autoRelaunchCount++;
+        this.logEvent("relaunch", `↻ Auto-relaunch (${this.autoRelaunchCount}/${AUTO_RELAUNCH_CAP})`);
+        console.warn(
+          "[emu] bridge-dead (reason:", reason, ") — auto-relaunching",
+          `(${this.autoRelaunchCount}/${AUTO_RELAUNCH_CAP})`,
+        );
+        this.disconnectVnc();
+        this.status.textContent = `⚠ Emulator crashed — reconnecting… (${this.autoRelaunchCount}/${AUTO_RELAUNCH_CAP})`;
+        this.status.classList.remove("emu-status--live");
+        this.status.classList.add("emu-status--dead");
+        // relaunch() runs from "unresponsive"; it stops + reboots + reinstalls.
+        this.state = "unresponsive";
+        this.updateLifecycleButtons();
+        void this.relaunch({ auto: true });
+        return;
+      }
+
+      // Auto-relaunch off, or the cap is exhausted → surface the manual recovery.
+      console.warn(
+        "[emu] bridge-dead (reason:", reason, ") — entering unresponsive",
+        autoEnabled ? "(auto-relaunch cap reached)" : "(auto-relaunch off)",
+      );
       this.state = "unresponsive";
       this.disconnectVnc();
-      this.status.textContent = "⚠ Emulator stopped responding — Relaunch";
+      this.status.textContent = autoEnabled
+        ? "⚠ Emulator keeps crashing — Relaunch"
+        : "⚠ Emulator stopped responding — Relaunch";
       this.status.classList.remove("emu-status--live");
       this.status.classList.add("emu-status--dead");
       this.updateLifecycleButtons();
@@ -616,32 +725,78 @@ export class EmulatorView {
    */
   setDiagnostics(on: boolean): void {
     this.diagnostics = on;
-    this.diagLine.hidden = !on;
-    if (on) {
-      // Subscribe to boot-progress notes only while diagnostics is on.
-      if (!this.bootProgressDispose) {
-        this.bootProgressDispose = studioBootProgress().onBootProgress((msg) => {
-          this.lastBootNote = msg;
-          if (this.diagnostics) this.renderDiagLine();
-        });
-      }
-      this.renderDiagLine();
-    } else {
-      if (this.bootProgressDispose) {
-        this.bootProgressDispose();
-        this.bootProgressDispose = null;
-      }
-      this.lastBootNote = "";
-    }
+    this.diagEl.hidden = !on;
+    // Recording is permanent (subscribed in the constructor) — diagnostics only
+    // controls visibility and the costly FPS sampler.
+    if (on) this.renderDiag();
     this.syncFpsSampler();
   }
 
-  /** Compose the diagnostics line from the current fps + latest boot note. */
-  private renderDiagLine(): void {
+  /** Expand/collapse the diagnostics panel body (collapsed by default). */
+  private setDiagExpanded(expanded: boolean): void {
+    this.diagExpanded = expanded;
+    this.diagBody.hidden = !expanded;
+    this.diagToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+    const caret = this.diagToggle.querySelector(".emu-diag-caret");
+    if (caret) caret.textContent = expanded ? "▾" : "▸";
+    if (expanded) this.renderDiag();
+  }
+
+  /**
+   * Record a discrete lifecycle/event entry (Live, crash reason, auto-relaunch,
+   * boot error) into the persistent session log. Never collapses; re-renders the
+   * panel if it's visible. Recording happens regardless of the diagnostics flag.
+   */
+  private logEvent(kind: "live" | "crash" | "relaunch" | "error" | "info", text: string): void {
+    this.sessionLog.append(kind, text);
+    if (this.diagnostics) this.renderDiag();
+  }
+
+  /**
+   * Render the collapsible diagnostics panel: a one-line summary (always visible —
+   * `~fps · N log lines · <latest note>`) plus, when expanded, the full timestamped
+   * session log. Cheap; called on each fps tick and on every log change.
+   */
+  private renderDiag(): void {
     if (!this.diagnostics) return;
-    const parts: string[] = [`~${this.fps} fps`];
-    if (this.lastBootNote) parts.push(this.lastBootNote);
-    this.diagLine.textContent = parts.join("  ·  ");
+    const n = this.sessionLog.size;
+    const summary = `~${this.fps} fps · ${n} log ${n === 1 ? "line" : "lines"}`;
+    this.diagSummary.textContent = this.lastBootNote
+      ? `${summary} · ${this.lastBootNote.split(" · ")[0]}`
+      : summary;
+    if (this.diagExpanded) {
+      this.diagLog.textContent = this.sessionLog.toText() || "(empty)";
+      // Keep the newest entries in view as the log grows.
+      this.diagLog.scrollTop = this.diagLog.scrollHeight;
+    }
+  }
+
+  /** Copy the full session log to the clipboard, with brief button feedback. */
+  private async copySessionLog(): Promise<void> {
+    const text = this.sessionLog.toText();
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch {
+      // Fallback for environments without the async clipboard API.
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand("copy");
+        ta.remove();
+      } catch {
+        ok = false;
+      }
+    }
+    const btn = this.diagCopyBtn;
+    const prev = btn.textContent;
+    btn.textContent = ok ? "Copied!" : "Copy failed";
+    setTimeout(() => { btn.textContent = prev; }, 1500);
   }
 
   /**
@@ -680,7 +835,7 @@ export class EmulatorView {
       this.fps = this.fpsChanged;
       this.fpsChanged = 0;
       this.fpsWindowStart = now;
-      this.renderDiagLine();
+      this.renderDiag();
     }
     this.fpsRaf = requestAnimationFrame(this.sampleFps);
   };
@@ -751,6 +906,9 @@ export class EmulatorView {
 
     this.state = "booting";
     this.currentPlatform = platformId;
+    // The session log is NOT wiped on boot (it persists across launch/crash so a
+    // crash can be inspected after the fact) — just mark the start of this attempt.
+    this.logEvent("info", `▶ Booting ${info.label}`);
     this.clearLaunchAttn(); // E: a new attempt clears any prior failure highlight
     this.disconnectVnc();
     this.beginSwitch();
@@ -774,6 +932,7 @@ export class EmulatorView {
       // E: draw the eye to the Launch button with an accent/danger glow ring.
       this.relaunchBtn.classList.add("emu-action--attn");
       console.error("[emu] start failed", err);
+      this.logEvent("error", `✖ Failed to start ${info.label}: ${errText(err)}`);
       this.updateLifecycleButtons();
       return;
     }
@@ -789,6 +948,13 @@ export class EmulatorView {
     this.status.classList.add("emu-status--live");
     this.vnc = connectVnc(this.screenHost, ep as { host: string; port: number; wsPath: string }, info.touch);
     this.updateLifecycleButtons();
+    // If this boot followed an auto-relaunch, give it a chance to prove healthy:
+    // staying live past AUTO_RELAUNCH_HEALTHY_MS resets the consecutive-crash
+    // budget (a crash before then keeps counting, capping a thrash loop).
+    this.armAutoRelaunchReset();
+    // Boot succeeded — mark it in the session log (NOT cleared; the boot steps stay
+    // so a "loads then crashes" sequence shows the boot + the crash together).
+    this.logEvent("live", "● Live");
 
     // Re-install library apps after boot so a platform switch picks them up.
     try {
@@ -816,9 +982,40 @@ export class EmulatorView {
     await this.boot(this.currentPlatform);
   }
 
-  /** Relaunch: stop the current emulator then boot the same platform. Only when live or unresponsive. */
-  async relaunch(): Promise<void> {
+  /**
+   * Arm (or re-arm) the healthy-stretch timer: if no auto-relaunches are pending
+   * (count 0) there is nothing to reset, so skip. Otherwise schedule a reset of
+   * the consecutive-crash budget once the run has stayed live long enough.
+   */
+  private armAutoRelaunchReset(): void {
+    this.clearAutoRelaunchResetTimer();
+    if (this.autoRelaunchCount === 0) return;
+    this.autoRelaunchResetTimer = setTimeout(() => {
+      this.autoRelaunchResetTimer = null;
+      this.autoRelaunchCount = 0;
+    }, AUTO_RELAUNCH_HEALTHY_MS);
+  }
+
+  /** Cancel any pending healthy-stretch reset. */
+  private clearAutoRelaunchResetTimer(): void {
+    if (this.autoRelaunchResetTimer !== null) {
+      clearTimeout(this.autoRelaunchResetTimer);
+      this.autoRelaunchResetTimer = null;
+    }
+  }
+
+  /**
+   * Relaunch: stop the current emulator then boot the same platform. Only when
+   * live or unresponsive. `auto` distinguishes an automatic crash-recovery
+   * relaunch (keeps the consecutive-crash count) from a user-initiated one (a
+   * deliberate click is a fresh start, so the count resets).
+   */
+  async relaunch(opts?: { auto?: boolean }): Promise<void> {
     if ((this.state !== "live" && this.state !== "unresponsive") || !this.currentPlatform) return;
+    if (!opts?.auto) {
+      this.autoRelaunchCount = 0; // manual relaunch → fresh recovery budget
+      this.clearAutoRelaunchResetTimer();
+    }
     const id = this.currentPlatform;
     this.resetTimelinePeek();
     this.state = "stopping";
@@ -845,6 +1042,9 @@ export class EmulatorView {
   async forceClose(): Promise<void> {
     if (this.state === "stopped") return;
     this.resetTimelinePeek();
+    // A deliberate force-close ends any crash-recovery cycle — reset the budget.
+    this.autoRelaunchCount = 0;
+    this.clearAutoRelaunchResetTimer();
     this.bootGen++; // invalidate any in-flight boot
     this.state = "stopping";
     this.status.textContent = "Stopping…";

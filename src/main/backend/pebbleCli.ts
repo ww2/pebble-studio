@@ -108,12 +108,18 @@ export function setTzOffsetCmd(offsetMin: number, tzName?: string): PebbleComman
   //   - $HOME/pebble paths have no spaces, so $VAR is left unquoted;
   //   - the shebang is stripped with `head -1 | cut -c3-` (no sed quotes);
   //   - the zone name is validated shell-safe above.
+  // `timeout -k 2 6` HARD-BOUNDS the push: the helper opens a connection to the
+  // single-client pypkjs bridge, which when contended/dead would otherwise hang
+  // FOREVER (the helper has no internal timeout). Fire-and-forget callers (reassert)
+  // then pile up dozens of stuck connections, starving/destabilising pypkjs — a
+  // confirmed live failure (15+ hung `pb-set-tz.py` chains). `timeout` is coreutils
+  // (quote-free); SIGTERM at 6 s, SIGKILL at 8 s, so a wedged push always unwinds.
   const oneLiner =
     `mkdir -p $HOME/.pebble-studio; ` +
     `H=$HOME/.pebble-studio/pb-set-tz.py; ` +
     `echo ${SET_TZ_HELPER_B64} | base64 -d > $H; ` +
     `PYBIN=$(head -1 $(command -v pebble) | cut -c3-); ` +
-    `$PYBIN $H ${off} ${name}`;
+    `timeout -k 2 6 $PYBIN $H ${off} ${name}`;
   return { cmd: "bash", args: ["-lc", oneLiner] };
 }
 
