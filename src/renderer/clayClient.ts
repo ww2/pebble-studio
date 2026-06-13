@@ -59,8 +59,8 @@ function wsCtorFrom(deps: ClayClientDeps): typeof WebSocket {
 /**
  * Connect to the phonesim bridge, send AppConfigSetup, await the AppConfigURL
  * broadcast on the SAME connection, close, resolve the URL. Rejects with
- * NoConfigPageError on timeout (default 8000 ms) or close-before-URL, and a
- * plain Error on a socket error.
+ * NoConfigPageError on timeout (default 8000 ms) or close-before-URL, and
+ * BridgeUnreachableError on a socket-level error.
  */
 export async function fetchConfigUrl(
   port: number,
@@ -102,7 +102,9 @@ export async function fetchConfigUrl(
       settle(() => resolve(url));
     };
     ws.onerror = () => {
-      settle(() => reject(new Error("websocket error talking to the phonesim bridge")));
+      settle(() =>
+        reject(new BridgeUnreachableError("websocket error talking to the phonesim bridge")),
+      );
     };
     ws.onclose = () => {
       settle(() =>

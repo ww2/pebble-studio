@@ -148,13 +148,11 @@ describe("fetchConfigUrl", () => {
     await expect(p).rejects.toBeInstanceOf(NoConfigPageError);
   });
 
-  it("rejects with a plain Error (not NoConfigPageError) on a socket error", async () => {
+  it("rejects with BridgeUnreachableError on a socket error", async () => {
     const p = fetchConfigUrl(9000, 8000, deps);
     const ws = FakeWebSocket.instances[0];
     ws.emitError();
-    await expect(p).rejects.toSatisfy(
-      (err: unknown) => err instanceof Error && !(err instanceof NoConfigPageError),
-    );
+    await expect(p).rejects.toBeInstanceOf(BridgeUnreachableError);
     expect(ws.closed).toBe(true);
   });
 
