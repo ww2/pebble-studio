@@ -9,6 +9,7 @@ import { EMU_INFO_PATH } from "./backend/hostPaths.js";
 import { openClayWindow, parsePhonesimPort } from "./clayWindow.js";
 import { createBacklightController } from "./backend/backlight.js";
 import { makeTimeController, isNonSystemTime, detectHostTimezone, type TimeConfig } from "./backend/timeController.js";
+import { makeBridgeMonitor } from "./backend/bridgeMonitor.js";
 import type { PlatformId, ButtonId } from "../shared/types.js";
 import { LibraryStore } from "./library.js";
 
@@ -116,6 +117,26 @@ export function registerIpc(): void {
     if (isNonSystemTime(time.getConfig(), detectHostTimezone())) void time.reassert();
   };
 
+  // Bridge-health monitor (Task H4). Polls qemu + pypkjs health after every
+  // successful boot; fires "emu:bridge-dead" to the renderer when the bridge dies.
+  const bridgeShell = (): ReturnType<typeof makeNativeShell> =>
+    driverKind === "wsl" ? makeWslShell() : makeNativeShell();
+  const bridgeMonitor = makeBridgeMonitor({
+    readEmuInfo: async () => {
+      const { code, stdout } = await bridgeShell().run(`cat ${EMU_INFO_PATH} 2>/dev/null`);
+      return code === 0 && stdout.trim() ? stdout : null;
+    },
+    runHealth: async (cmd) => {
+      const { code, stdout } = await bridgeShell().run(cmd);
+      return { code, stdout };
+    },
+    onDead: (reason) => {
+      // Single-instance app → one main window; notify the renderer.
+      const win = BrowserWindow.getAllWindows()[0];
+      win?.webContents.send("emu:bridge-dead", reason);
+    },
+  });
+
   ipcMain.handle("lib:add", async (_e, pbwPath: string) => { library.add(pbwPath); return library.list(); });
   ipcMain.handle("lib:list", async () => library.list());
   ipcMain.handle("lib:remove", async (_e, p: string) => {
@@ -151,6 +172,7 @@ export function registerIpc(): void {
     //    (that's what "clear" means: the watch starts fresh with no user apps).
     await driver!.start(platformId);
     void time.applyAll(); // re-assert time settings on the clear-rebooted emulator (fire-and-forget)
+    bridgeMonitor.start(platformId);
     // loaded remains empty after the clear reboot.
   });
 
@@ -185,6 +207,7 @@ export function registerIpc(): void {
     await driver?.ensureTimeShim().catch(() => false);
     const ep = await driver!.start(id, token, onStep);
     void time.applyAll(); // re-assert time settings on the fresh emulator (fire-and-forget)
+    bridgeMonitor.start(id);
     return ep;
   });
   ipcMain.handle("emu:abort", async () => {
@@ -193,9 +216,11 @@ export function registerIpc(): void {
     if (currentBootToken) currentBootToken.cancelled = true;
   });
   ipcMain.handle("emu:stop", async () => {
-    // Stop the backlight keepalive and time controller first so we don't tap a dead emulator.
+    // Stop the backlight keepalive, time controller, and bridge-health monitor
+    // first so we don't operate on a dead emulator.
     backlight.stop();
     time.stop();
+    bridgeMonitor.stop();
     // Cancel the in-flight boot BEFORE teardown so a mid-boot wait aborts and the
     // killAll sweep reliably reaps qemu/websockify/emu-control/pypkjs.
     if (currentBootToken) currentBootToken.cancelled = true;

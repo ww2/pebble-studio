@@ -55,6 +55,13 @@ const studio = {
     ipcRenderer.on("emu:boot-progress", handler);
     return () => ipcRenderer.removeListener("emu:boot-progress", handler);
   },
+  // Subscribe to bridge-death notifications (Task H4). Returns a disposer that
+  // removes the listener.
+  onBridgeDead: (cb: (reason: string) => void): (() => void) => {
+    const handler = (_e: unknown, reason: string): void => cb(reason);
+    ipcRenderer.on("emu:bridge-dead", handler);
+    return () => ipcRenderer.removeListener("emu:bridge-dead", handler);
+  },
 };
 
 contextBridge.exposeInMainWorld("studio", studio);
