@@ -14,16 +14,16 @@ export const RATE_MULT: Record<Rate, number> = { frozen: 0, "1x": 1, "2x": 2, "4
  *     by a control file `<target_unix|-> <rate>` re-read on mtime change. This
  *     is the PRIMARY lever: true absolute date, real frozen seconds, exact rates,
  *     via driver.setFakeTime(targetUnix|null, rate).
- *   - `utc_offset` (Int16 minutes, raw SetUTC via driver.setTzOffset) remains
- *     only for TIMEZONE DISPLAY: displayed local = fake_UTC + utc_offset. Every
- *     `pebble` command's connect re-pushes the HOST's current offset
- *     (post_connect clobber), so:
- *       · System   → host offset; control file `- 1` (shim is a no-op).
- *       · Timezone → chosen zone's offset; clobbers healed by reassert().
- *       · Custom   → we keep utc_offset AT THE HOST OFFSET and bake the entered
- *         wall-clock into the control-file target instead — the clobber's
- *         host-offset re-push is then a no-op (immune by construction); no
- *         reassert, no pusher timer.
+ *   - `utc_offset` (Int16 minutes, raw SetUTC via driver.setTzOffset) is the
+ *     display offset: displayed local = fake_UTC + utc_offset. It is ALWAYS the
+ *     HOST offset now (the user-facing Timezone picker was removed in v0.0.13.1);
+ *     pebble-tool's post_connect already re-pushes the host offset on every
+ *     command connect, so our push is a best-effort backstop (covers a freshly
+ *     booted watch with no app installed yet), not the mechanism:
+ *       · System → fake clock = real time (control file `<now> 1`).
+ *       · Custom → fake clock = the entered wall-clock baked into the control-file
+ *         target; utc_offset stays at the host offset, so post_connect's re-push
+ *         is a no-op (clobber-immune by construction; no reassert, no timer).
  *   - LEGACY FALLBACK (shim failed to deploy/self-test): the pre-v0.0.13
  *     virtual-clock path — a 1 s timer pushing time-varying utc_offset values.
  *     Minute granularity (seconds can't freeze), |offset| ≤ 32767 min caps the
@@ -74,10 +74,10 @@ function clampOffset(min: number): number {
 }
 
 /**
- * The CONSTANT `utc_offset` (minutes) for a config. System/Timezone: the
- * configured zone's offset. Custom: the HOST zone's offset — the entered time
- * lives in the control-file target instead, so post_connect's host-offset
- * re-push is a no-op (clobber-immune by construction).
+ * The CONSTANT `utc_offset` (minutes) for a config. This is always the host
+ * offset now (Timezone mode removed): System reads cfg.timezone, which the UI
+ * always sets to the host zone; Custom reads the host zone directly. (The pure
+ * function still accepts any zone — it's also where the host offset is computed.)
  */
 export function offsetMinutesFor(
   cfg: TimeConfig,
@@ -119,10 +119,10 @@ export interface TimeController {
   getConfig(): TimeConfig;
   /** Re-assert current config on the (re)booted emulator. */
   applyAll(): Promise<void>;
-  /** Force-push the current offset after a command that may have reset it (every
-   * pebble command re-syncs the HOST offset on connect). Only matters for
-   * Timezone mode and the legacy custom fallback — shim-backed custom keeps the
-   * offset at the host offset, so the clobber is already a no-op. */
+  /** Force-push the offset after a command that may have reset it. Only matters
+   * for the legacy custom fallback now — shim-backed custom keeps the offset at
+   * the host offset (post_connect's re-push is already a no-op), and System needs
+   * no re-push. */
   reassert(): Promise<void>;
   /** Time-shim readiness as last reported by ensureTimeShim(). `checked` is
    * false until the first real probe (at boot/apply) — the renderer must not
@@ -212,9 +212,8 @@ export function makeTimeController(
    * last held. Confirmed live: setTzOffset hung 25 s+, setFakeTime wrote in 129 ms.)
    *
    * Custom keeps the HOST offset (which post_connect already supplies, so a missed
-   * push is harmless); Timezone's offset is also healed by reassert() after each
-   * command. Only the LEGACY fallback (no shim) must await its offset push, since
-   * there the utc_offset IS the only lever.
+   * push is harmless). Only the LEGACY fallback (no shim) must await its offset
+   * push, since there the utc_offset IS the only lever.
    */
   async function apply(): Promise<void> {
     clearTimer();
@@ -236,15 +235,15 @@ export function makeTimeController(
       syncLegacyTimer();
     } else if (shimReady) {
       // PRIMARY PATH: write the control file FIRST. Custom → entered wall-clock at
-      // the chosen rate; System/Timezone → real time at 1× (the shim has no reset,
-      // so jumping the fake clock to now IS the reset; sub-second skew acceptable).
+      // the chosen rate; System → real time at 1× (the shim has no reset, so
+      // jumping the fake clock to now IS the reset; sub-second skew acceptable).
       const target = cfg.source === "custom"
         ? fakeTargetUnix(cfg.customWallMs, hostTz(), now())
         : Math.trunc(now() / 1000);
       const rate = cfg.source === "custom" ? RATE_MULT[cfg.rate] : 1;
       try { await d.setFakeTime(target, rate); } catch { /* ignore */ }
     }
-    // System/Timezone with no shim: nothing to write — skip.
+    // System with no shim: nothing to write — skip.
 
     // Best-effort, FIRE-AND-FORGET pypkjs work — must NOT block the write above.
     void d.timeFormat(cfg.hour24).catch(() => { /* bridge down — non-fatal */ });
