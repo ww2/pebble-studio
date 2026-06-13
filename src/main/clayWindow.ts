@@ -66,6 +66,62 @@ export function extractCloseFragment(url: string): string | null {
   return url.slice(hash + 1);
 }
 
+/** The return_to we inject so the config page's Save navigation is one our
+ * interceptor (extractCloseFragment) recognises. */
+const RETURN_TO_SENTINEL = "pebblejs://close#";
+
+/** Matches a clay.pebble.com *bootstrap* URL (the real `pebble-clay` config URL
+ * on the pypkjs emulator: `http://clay.pebble.com[.s3-…]/#<encoded HTML>`). */
+const CLAY_BOOTSTRAP_RE = /^https?:\/\/clay\.pebble\.com[./:]/i;
+
+/**
+ * Rewrite the broadcast AppConfig URL into the page we actually load, so the
+ * config page's Save lands on a URL we can intercept.
+ *
+ * THE PROBLEM (verified live against ForkliftCertified, 2026-06-12 — see memory
+ * `clay-config-return-to-mechanism`): on the pypkjs emulator `pebble-clay`
+ * builds the config URL as
+ *   http://clay.pebble.com.s3-website-us-west-2.amazonaws.com/#<encodeURIComponent(HTML)>
+ * where the HTML embeds `window.returnTo="$$RETURN_TO$$"` and Saves via
+ *   location.href = (window.returnTo || "pebblejs://close#") + encodeURIComponent(json)
+ * That clay.pebble.com page is a *bootstrap*: it reads a `return_to` QUERY param,
+ * substitutes `$$RETURN_TO$$` in the HTML, and renders the real page in an iframe.
+ * Loading the broadcast URL raw (as we used to) gives no `return_to` → Save goes
+ * nowhere we see (and the iframe defeats main-frame will-navigate anyway).
+ *
+ * THE FIX (self-host the bootstrap): for a clay.pebble.com URL we replicate the
+ * bootstrap ourselves — decode the fragment to HTML, substitute `$$RETURN_TO$$`
+ * with RETURN_TO_SENTINEL, and return it as a top-level `data:text/html` URL.
+ * Save then navigates the TOP frame to `pebblejs://close#<json>`, which
+ * extractCloseFragment handles — no iframe, no dependency on the (defunct) bucket.
+ *
+ * Non-clay.pebble.com URLs (an app self-hosting its own config page, or a
+ * `data:` URI) are returned UNCHANGED: those pages read `return_to` from their
+ * own query string and already default to `pebblejs://close#`, which we catch.
+ *
+ * Pure (no Electron) so it is unit-testable.
+ */
+export function rewriteClayConfigUrl(url: string): string {
+  if (!CLAY_BOOTSTRAP_RE.test(url)) return url;
+  const hash = url.indexOf("#");
+  if (hash === -1) return url; // no embedded page — nothing to self-host
+  const rawFragment = url.slice(hash + 1);
+  if (rawFragment === "") return url;
+
+  let data = decodeURIComponent(rawFragment);
+  // The bootstrap treats a fragment NOT starting with '<' as base64 HTML.
+  if (data.charAt(0) !== "<") {
+    try {
+      data = Buffer.from(data, "base64").toString("utf-8");
+    } catch {
+      return url; // not decodable — fall back to loading the URL as-is
+    }
+  }
+  // Match the bootstrap's single `replace` (first occurrence only).
+  const html = data.replace("$$RETURN_TO$$", RETURN_TO_SENTINEL);
+  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+}
+
 /**
  * Open a Clay/AppConfig page in a locked-down child BrowserWindow.
  *
@@ -76,6 +132,10 @@ export function extractCloseFragment(url: string): string | null {
  * extractCloseFragment above for why it must not be decoded). Closing the
  * window without saving fires `onClosed("")` (cancel). `onClosed` fires
  * exactly once.
+ *
+ * The incoming `url` is the raw broadcast AppConfig URL; rewriteClayConfigUrl
+ * self-hosts the clay.pebble.com bootstrap so Save lands on a top-frame
+ * pebblejs://close navigation we can intercept (see that function).
  */
 export function openClayWindow(
   url: string,
@@ -137,6 +197,6 @@ export function openClayWindow(
   // Window closed without a captured fragment = user cancelled.
   win.on("closed", () => fire(""));
 
-  void win.loadURL(url);
+  void win.loadURL(rewriteClayConfigUrl(url));
   return win;
 }

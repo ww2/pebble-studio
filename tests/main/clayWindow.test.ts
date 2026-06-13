@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { parsePhonesimPort, extractCloseFragment } from "../../src/main/clayWindow.js";
+import {
+  parsePhonesimPort,
+  extractCloseFragment,
+  rewriteClayConfigUrl,
+} from "../../src/main/clayWindow.js";
 
 describe("parsePhonesimPort", () => {
   const sample = JSON.stringify({
@@ -71,5 +75,67 @@ describe("extractCloseFragment", () => {
 
   it("splits on the FIRST '#' only", () => {
     expect(extractCloseFragment("pebblejs://close#a%23b#c")).toBe("a%23b#c");
+  });
+});
+
+describe("rewriteClayConfigUrl", () => {
+  /** Decode the HTML out of a `data:text/html;charset=utf-8,<enc>` URL. */
+  const htmlOf = (dataUrl: string): string => {
+    const prefix = "data:text/html;charset=utf-8,";
+    expect(dataUrl.startsWith(prefix)).toBe(true);
+    return decodeURIComponent(dataUrl.slice(prefix.length));
+  };
+
+  const clayUrl = (fragment: string): string =>
+    `http://clay.pebble.com.s3-website-us-west-2.amazonaws.com/#${fragment}`;
+
+  it("self-hosts a clay.pebble.com bootstrap URL, substituting return_to", () => {
+    const html = `<!DOCTYPE html><script>window.returnTo="$$RETURN_TO$$"</script>`;
+    const out = rewriteClayConfigUrl(clayUrl(encodeURIComponent(html)));
+    const decoded = htmlOf(out);
+    expect(decoded).toContain(`window.returnTo="pebblejs://close#"`);
+    expect(decoded).not.toContain("$$RETURN_TO$$");
+    expect(decoded.startsWith("<")).toBe(true);
+  });
+
+  it("decodes a base64 fragment (HTML not starting with '<')", () => {
+    const html = `<html><script>window.returnTo="$$RETURN_TO$$"</script></html>`;
+    const b64 = Buffer.from(html, "utf-8").toString("base64");
+    const out = rewriteClayConfigUrl(clayUrl(encodeURIComponent(b64)));
+    expect(htmlOf(out)).toContain(`window.returnTo="pebblejs://close#"`);
+  });
+
+  it("substitutes only the FIRST $$RETURN_TO$$ (matches the bootstrap)", () => {
+    const html = `<a>$$RETURN_TO$$</a><b>$$RETURN_TO$$</b>`;
+    const decoded = htmlOf(rewriteClayConfigUrl(clayUrl(encodeURIComponent(html))));
+    expect(decoded).toBe(`<a>pebblejs://close#</a><b>$$RETURN_TO$$</b>`);
+  });
+
+  it("matches the plain clay.pebble.com host too (no s3 suffix)", () => {
+    const html = `<x>$$RETURN_TO$$</x>`;
+    const out = rewriteClayConfigUrl(`https://clay.pebble.com/#${encodeURIComponent(html)}`);
+    expect(htmlOf(out)).toBe(`<x>pebblejs://close#</x>`);
+  });
+
+  it("leaves a non-clay http(s) config page unchanged", () => {
+    const u = "https://example.com/config?return_to=pebblejs://close%23";
+    expect(rewriteClayConfigUrl(u)).toBe(u);
+  });
+
+  it("leaves a data: URL unchanged", () => {
+    const u = "data:text/html,<html>hi</html>";
+    expect(rewriteClayConfigUrl(u)).toBe(u);
+  });
+
+  it("leaves a clay URL with no fragment unchanged (defensive)", () => {
+    const u = "http://clay.pebble.com.s3-website-us-west-2.amazonaws.com/";
+    expect(rewriteClayConfigUrl(u)).toBe(u);
+    const empty = "http://clay.pebble.com.s3-website-us-west-2.amazonaws.com/#";
+    expect(rewriteClayConfigUrl(empty)).toBe(empty);
+  });
+
+  it("does not treat an unrelated host as a clay bootstrap", () => {
+    expect(rewriteClayConfigUrl("https://notclay.example/#x")).toBe("https://notclay.example/#x");
+    expect(rewriteClayConfigUrl("https://pebble.com/#x")).toBe("https://pebble.com/#x");
   });
 });
