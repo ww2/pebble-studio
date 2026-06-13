@@ -49,6 +49,7 @@ const DARK: ThemeTokens = {
   "--danger": "#ff99a4",
   "--danger-soft": "rgba(255,153,164,0.18)",
   "--success": "#3fb950",
+  "--warn": "#ca5010",
   // Soft elevation — depth comes mostly from layered materials, so shadows are light.
   "--elev-1": "0 1px 2px rgba(0,0,0,0.28)",
   "--elev-2": "0 2px 6px rgba(0,0,0,0.32)",
@@ -95,6 +96,7 @@ const LIGHT: ThemeTokens = {
   "--danger": "#c42b1c",
   "--danger-soft": "rgba(196,43,28,0.10)",
   "--success": "#0f7b0f",
+  "--warn": "#8b3a00",
   // Soft elevation — depth comes mostly from layered materials, so shadows are light.
   "--elev-1": "0 1px 2px rgba(0,0,0,0.06)",
   "--elev-2": "0 2px 6px rgba(0,0,0,0.08)",

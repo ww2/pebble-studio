@@ -1051,7 +1051,7 @@ export class EmulatorView {
    * `libInstallAll()` (the whole point of Clear is to leave it empty).
    */
   async reconnectAfterClear(platformId: PlatformId): Promise<void> {
-    if (this.state !== "live" || !this.currentPlatform) return;
+    if ((this.state !== "live" && this.state !== "unresponsive") || !this.currentPlatform) return;
     const info = getPlatform(platformId);
     this.disconnectVnc();
     this.state = "live";

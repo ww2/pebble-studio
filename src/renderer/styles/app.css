@@ -24,6 +24,7 @@
   --control-bottom: rgba(0,0,0,0.30);
   --success: #3fb950;
   --danger: #ff99a4;
+  --warn: #ca5010;
   --acrylic: rgba(44,44,44,0.78);
   --menu-bg: rgba(44,44,44,0.82);
   --menu-text: rgba(255,255,255,0.89);
@@ -686,9 +687,10 @@ body {
 }
 
 /* H4 (v0.0.13): amber warning status for the "unresponsive" lifecycle state.
-   Selector doubled for the same specificity reason as --live above. */
+   Selector doubled for the same specificity reason as --live above.
+   Uses --warn token so dark (#ca5010) and light (#8b3a00) each clear WCAG AA. */
 .emu-status.emu-status--dead {
-  color: #ca5010;
+  color: var(--warn);
   font-weight: 700;
   letter-spacing: 0.3px;
 }
