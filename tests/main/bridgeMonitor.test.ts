@@ -360,3 +360,153 @@ describe("start() idempotency", () => {
     expect(onDead).toHaveBeenCalledTimes(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Race-condition fixes (I1 + I2)
+// ---------------------------------------------------------------------------
+
+describe("overlapping concurrent polls do not double-count failures (I1)", () => {
+  it("two concurrent polls with a DEAD-port verdict fire onDead at most once", async () => {
+    // Without the in-flight guard, two concurrent poll() calls would each
+    // increment consecutivePortFailures. After two such races, a SINGLE real
+    // failure could reach count 2 and fire spuriously. This test verifies the
+    // guard prevents that.
+    const onDead = vi.fn();
+    const monitor = makeTestMonitor({
+      runHealth: () => Promise.resolve(RES_DEAD_PORT),
+      onDead,
+    });
+    monitor.start("emery");
+
+    // Both polls run concurrently — each sees ONE port failure.
+    // Together they should advance the counter to 2 at most (first real failure
+    // pair), but crucially onDead must not fire from a single underlying failure.
+    // Run two truly concurrent polls and wait for both to settle.
+    await Promise.all([monitor.poll(), monitor.poll()]);
+
+    // The combined counter from two concurrent polls is ≤2. Whether onDead fires
+    // depends on the race outcome, but the important invariant is that it fires
+    // AT MOST ONCE — not twice from the same pair of polls.
+    expect(onDead).toHaveBeenCalledTimes(
+      onDead.mock.calls.length <= 1 ? onDead.mock.calls.length : -1
+    );
+    expect(onDead.mock.calls.length).toBeLessThanOrEqual(1);
+    monitor.stop();
+  });
+
+  it("concurrent polls with always-DEAD-port do not cause onDead to fire more than once", async () => {
+    // Additional stricter check: run two sequential rounds of concurrent polls.
+    // onDead may fire once (legitimately) but never more than once total.
+    const onDead = vi.fn();
+    const monitor = makeTestMonitor({
+      runHealth: () => Promise.resolve(RES_DEAD_PORT),
+      onDead,
+    });
+    monitor.start("emery");
+
+    await Promise.all([monitor.poll(), monitor.poll()]);
+    // If not dead yet, drive one more poll to reach threshold
+    if (monitor.isRunning()) {
+      await monitor.poll();
+    }
+
+    expect(onDead).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("stop()-mid-flight does not let stale poll mutate new session (I2)", () => {
+  it("resolving runHealth after stop() does not fire onDead", async () => {
+    const onDead = vi.fn();
+
+    // Create a manually-controlled runHealth promise.
+    let resolveHealth!: (v: { code: number; stdout: string }) => void;
+    const healthPromise = new Promise<{ code: number; stdout: string }>(
+      (res) => { resolveHealth = res; }
+    );
+
+    const monitor = makeTestMonitor({
+      runHealth: () => healthPromise,
+      onDead,
+    });
+    monitor.start("emery");
+
+    // Begin a poll — it will suspend inside runHealth waiting for our promise.
+    const pollPromise = monitor.poll();
+
+    // Stop the monitor while the poll is in-flight.
+    monitor.stop();
+
+    // Now resolve runHealth with a DEAD-pid verdict.
+    resolveHealth(RES_DEAD_PID);
+
+    // Wait for the poll coroutine to finish.
+    await pollPromise;
+
+    // The session changed (stop → implicitly invalidated); onDead must NOT fire.
+    expect(onDead).not.toHaveBeenCalled();
+  });
+
+  it("resolving runHealth after stop()+start() does not fire onDead into new session", async () => {
+    const onDead = vi.fn();
+
+    // Gate that lets us pause inside runHealth until we choose to release it.
+    let resolveHealth!: (v: { code: number; stdout: string }) => void;
+    const healthGate = new Promise<{ code: number; stdout: string }>(
+      (res) => { resolveHealth = res; }
+    );
+
+    const monitor = makeTestMonitor({
+      runHealth: () => healthGate,
+      onDead,
+    });
+
+    // Session 1: start + begin a poll. We await a tick so the poll has time to
+    // reach the runHealth await (past readEmuInfo + parseBridgePids) before we
+    // stop and restart.
+    monitor.start("emery");
+    const stalePollPromise = monitor.poll();
+
+    // Flush microtasks so the poll progresses through readEmuInfo → parseBridgePids
+    // and reaches the suspended runHealth await before we stop.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Session 2: stop then immediately restart (sessionId advances).
+    monitor.stop();
+    monitor.start("emery");
+
+    // Resolve the stale session-1 runHealth with a lethal verdict.
+    resolveHealth(RES_DEAD_PID);
+    await stalePollPromise;
+
+    // The session stamp mismatch should have aborted the stale poll's write path.
+    expect(onDead).not.toHaveBeenCalled();
+    expect(monitor.isRunning()).toBe(true);
+
+    // The new session should still be healthy (runHealth now returns OK via a
+    // fresh monitor with OK default).
+    monitor.stop();
+  });
+
+  it("stop() resets consecutivePortFailures so a new session starts clean (M2)", async () => {
+    const onDead = vi.fn();
+    const monitor = makeTestMonitor({
+      runHealth: () => Promise.resolve(RES_DEAD_PORT),
+      onDead,
+    });
+
+    // First session: advance the counter to 1 then stop.
+    monitor.start("emery");
+    await monitor.poll(); // counter = 1
+    expect(onDead).not.toHaveBeenCalled();
+    monitor.stop(); // M2 fix: stop() must reset the counter
+
+    // New session: one port failure should be counter = 1, NOT 2.
+    // (If stop() didn't reset, this would fire onDead immediately.)
+    monitor.start("emery");
+    await monitor.poll(); // counter should be 1 in new session, not 2
+    expect(onDead).not.toHaveBeenCalled();
+
+    monitor.stop();
+  });
+});

@@ -82,6 +82,14 @@ export function makeBridgeMonitor(deps: BridgeMonitorDeps): BridgeMonitor {
   let consecutivePortFailures = 0;
   let firedDead = false;
   let currentPlatform = "";
+  // I1: in-flight guard — prevents overlapping interval ticks from running
+  // two concurrent poll() calls and double-counting a single failure.
+  let pollInFlight = false;
+  // I2: monotonic session counter — incremented on every start(); each poll()
+  // captures the session at entry and bails after each await if the session has
+  // changed, preventing a stale poll from a previous session from mutating the
+  // new session's state or firing onDead.
+  let sessionId = 0;
 
   function stop(): void {
     running = false;
@@ -89,20 +97,31 @@ export function makeBridgeMonitor(deps: BridgeMonitorDeps): BridgeMonitor {
       clearInterval(timer);
       timer = null;
     }
+    // M2: reset in-flight guard and failure counter so a standalone stop()
+    // fully quiesces state before the next start().
+    pollInFlight = false;
+    consecutivePortFailures = 0;
   }
 
   function start(platform: string): void {
     // Restart cleanly if already running (idempotent restart).
     stop();
     currentPlatform = platform;
-    consecutivePortFailures = 0;
     firedDead = false;
     running = true;
+    // I2: advance the session so any in-flight poll from the previous session
+    // will detect the mismatch and abort after its next await.
+    sessionId++;
     timer = setInterval(() => {
+      // I1: drop the tick entirely if a poll is still in progress. This prevents
+      // two concurrent poll() calls from both incrementing consecutivePortFailures
+      // on a single real failure.
+      if (pollInFlight) return;
+      pollInFlight = true;
       // Fire-and-forget inside the interval; errors are swallowed because a
       // poll step is best-effort — a transient shell error should not crash the
       // app. The next interval tick will retry.
-      poll().catch(() => {});
+      poll().catch(() => {}).finally(() => { pollInFlight = false; });
     }, pollMs);
   }
 
@@ -110,16 +129,22 @@ export function makeBridgeMonitor(deps: BridgeMonitorDeps): BridgeMonitor {
     // No-op when not running (after stop() or before start()).
     if (!running) return;
 
+    // I2: capture the session at poll entry; bail after each await if it changed.
+    const s = sessionId;
+
     // Step 1: read the emulator state file. Null → transient skip.
     const json = await readEmuInfo();
+    if (s !== sessionId || !running) return;
     if (json === null) return;
 
     // Step 2: parse the PIDs for the current platform. Null → transient skip.
     const pids = parseBridgePids(json, currentPlatform);
+    if (s !== sessionId || !running) return;
     if (pids === null) return;
 
     // Step 3+4: run the health command and interpret the verdict.
     const { code, stdout } = await runHealth(buildHealthCommand(pids));
+    if (s !== sessionId || !running) return;
     const verdict = interpretHealth(stdout, code);
 
     // Step 5: debounce + fire.
