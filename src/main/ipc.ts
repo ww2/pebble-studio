@@ -212,7 +212,11 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     await driver?.ensureTimeShim().catch(() => false);
     const ep = await driver!.start(id, token, onStep);
     void time.applyAll(); // re-assert time settings on the fresh emulator (fire-and-forget)
-    bridgeMonitor.start(id);
+    // Arm the health monitor only if this boot wasn't superseded by a force-close
+    // mid-flight: emu:abort/emu:stop flip token.cancelled and call bridgeMonitor.stop(),
+    // and a boot that resolves in that same window would otherwise re-start a monitor
+    // polling an already-killed emulator (symmetric to the renderer's bootGen guard).
+    if (!token.cancelled) bridgeMonitor.start(id);
     return ep;
   });
   ipcMain.handle("emu:abort", async () => {
