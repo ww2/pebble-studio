@@ -178,7 +178,7 @@ function createWindow(): void {
 // second instance has already called app.quit() above.
 if (gotSingleInstanceLock) {
   app.whenReady().then(() => {
-    registerIpc();
+    registerIpc(() => mainWindow);
     createWindow();
 
     app.on("activate", () => {

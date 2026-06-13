@@ -93,7 +93,7 @@ export function nextIndexedName(existingNames: string[], base: string, ext: stri
   return max;
 }
 
-export function registerIpc(): void {
+export function registerIpc(getMainWindow: () => BrowserWindow | null = () => null): void {
   const library = new LibraryStore(path.join(app.getPath("userData"), "library.json"));
   // Default capture target is the user's Downloads; settings:setCaptureDir can
   // repoint it. Resolved here (not at module load) so app paths are ready.
@@ -131,8 +131,9 @@ export function registerIpc(): void {
       return { code, stdout };
     },
     onDead: (reason) => {
-      // Single-instance app → one main window; notify the renderer.
-      const win = BrowserWindow.getAllWindows()[0];
+      // Target the main window explicitly (not getAllWindows()[0], which could
+      // be a Clay config child window or the splash and would silently drop the event).
+      const win = getMainWindow();
       win?.webContents.send("emu:bridge-dead", reason);
     },
   });
@@ -163,6 +164,10 @@ export function registerIpc(): void {
 
   ipcMain.handle("loaded:list", async () => Array.from(loaded));
   ipcMain.handle("loaded:clear", async (_e, platformId: PlatformId) => {
+    // Stop the bridge-health monitor before teardown so it doesn't poll a dead
+    // emulator during the wipe window (mirrors emu:stop). It is re-started after
+    // the clean reboot below via bridgeMonitor.start(platformId).
+    bridgeMonitor.stop();
     // 1. Stop the running emulator so wipe can safely delete its files.
     try { await driver!.stop(); } catch { /* ignore — may already be stopped */ }
     loaded.clear();
