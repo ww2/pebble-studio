@@ -134,6 +134,27 @@ describe("buildHealthCommand", () => {
   it("contains NO double-quote characters (survives the Windows→wsl.exe→bash hops)", () => {
     expect(buildHealthCommand(pids)).not.toContain('"');
   });
+
+  // Structural assertions: a gutted command body must not pass these.
+  it("reads qemu process state from /proc/<qemuPid>/status", () => {
+    expect(buildHealthCommand(pids)).toContain("/proc/1854238/status");
+  });
+
+  it("reads pypkjs process state from /proc/<pypkjsPid>/status", () => {
+    expect(buildHealthCommand(pids)).toContain("/proc/1854276/status");
+  });
+
+  it("probes TCP via /dev/tcp/localhost/<pypkjsPort>", () => {
+    expect(buildHealthCommand(pids)).toContain("/dev/tcp/localhost/57749");
+  });
+
+  it("emits echo OK on success", () => {
+    expect(buildHealthCommand(pids)).toContain("echo OK");
+  });
+
+  it("emits echo DEAD on failure paths", () => {
+    expect(buildHealthCommand(pids)).toContain("echo DEAD");
+  });
 });
 
 // ---------------------------------------------------------------------------

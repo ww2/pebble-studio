@@ -99,67 +99,30 @@ export function parseBridgePids(json: string, platform: string): BridgePids | nu
  * and all of which survive the WSL double-shell-hop unmangled.
  *
  * Implementation strategy (quote-free):
- *   Step 1: Read process states from /proc/<pid>/status (field "State:").
- *           `grep -m1 ^State /proc/<pid>/status` returns e.g. "State:\tZ (zombie)"
- *           or fails with exit code 1 when the file is absent (process gone).
- *           We run this for both PIDs and count how many lines contain Z.
- *           If fewer than 2 lines came back, or any line starts with Z, the
- *           PID check fails → print DEAD pid and exit 1.
- *   Step 2: Attempt a TCP connection to localhost:<pypkjsPort> using bash's
- *           built-in /dev/tcp device (quote-free: /dev/tcp/localhost/<port>
- *           uses no word-splitting characters). A refused/timed-out connect
- *           fails fast (no timeout wrapper needed for refuse; a live but slow
- *           port could hang, so we wrap the subshell with a `timeout 2`
- *           invocation — `timeout 2 bash -lc ...` would need inner quotes, so
- *           instead we use the /dev/tcp redirect directly in a subshell with
- *           `timeout 2 /bin/bash` passing the compound command as a here-doc
- *           — but here-docs need quotes. Simplest truly quote-free approach:
- *           use `(exec 3<>/dev/tcp/localhost/PORT) 2>/dev/null` — parentheses
- *           open a subshell whose failure mode on refused/nonexistent port is
- *           immediate; on a live but slow port this subshell blocks, so we
- *           accept that `timeout` is omitted (a refused connection is
- *           instant; a half-open one that hangs is itself a signal of
- *           degraded health that the caller's debounce will surface).
+ *   Step 1: Read a single state char from /proc/<pid>/status via grep+cut.
+ *           `grep -m1 ^State /proc/<pid>/status | cut -f2 | cut -c1` yields
+ *           one char (Z/S/R/…) or empty when the process is gone.
+ *           If either QSTATE or PSTATE is empty or equals Z → DEAD pid.
+ *   Step 2: TCP probe via bare `(exec 3<>/dev/tcp/localhost/PORT) 2>/dev/null`.
+ *           A refused connect fails immediately — no timeout wrapper needed.
  *   Verdict: on success echo OK; on failure echo DEAD port.
  */
 export function buildHealthCommand(pids: BridgePids): string {
   const { qemuPid, pypkjsPid, pypkjsPort } = pids;
 
-  // Step 1: collect "State:" lines from /proc/<pid>/status for both processes.
-  // grep -m1 exits 0 and prints "State:\t<char> ..." on success; exits 1 when
-  // the file is absent (process gone). We gather both outputs separated by a
-  // newline via printf, then count lines.
-  //
-  // We use `awk` to extract the single state character from each "State:" line:
-  //   awk NR==1{print $2} → first field after "State:", e.g. "Z", "S", "R", ...
-  // Then we count total lines and lines starting with Z.
-  //
-  // quote-free count-of-Z lines: `grep -c ^Z` counts matching lines (0 if none).
-  // quote-free total-line count: `wc -l` — but note: if proc file is absent,
-  // grep -m1 exits 1. We use `|| true` to suppress the exit code and still
-  // allow the pipeline to proceed, counting an empty line contribution.
-  //
-  // Simpler approach that avoids counting: build a small if-block using process
-  // substitution. But process substitution uses <(...) which requires no quotes.
-  //
-  // Final chosen design (clearest and verifiably quote-free):
-  //   STATES=$(grep -m1 ^State /proc/<q>/status 2>/dev/null | awk {print $2};
-  //            grep -m1 ^State /proc/<p>/status 2>/dev/null | awk {print $2})
-  //   LINE_COUNT=$(echo $STATES | wc -w)   # word count = number of state chars
-  //   ZOMBIE_COUNT=$(echo $STATES | grep -c ^Z)
-  //   if [ $LINE_COUNT -lt 2 ] || [ $ZOMBIE_COUNT -gt 0 ]; then echo DEAD pid; exit 1; fi
-  //
-  // awk program: {print $2} — braces are fine (no quotes needed); $2 is the
-  // second whitespace-separated field of "State:\tZ (zombie)".
+  // Step 1: extract a single state char from /proc/<pid>/status.
+  // "State:" and the value are separated by a TAB, so `cut -f2` gives the value
+  // field ("Z (zombie)", "S (sleeping)", etc.) and `cut -c1` reduces it to one
+  // safe char. Empty when the process file is absent (process gone).
+  // Single char, no spaces → unquoted [ ] tests are safe.
   //
   // Step 2: TCP probe — (exec 3<>/dev/tcp/localhost/PORT) 2>/dev/null
   // On connect refused this fails immediately. On success the subshell exits 0.
 
   return (
-    `QSTATE=$(grep -m1 ^State /proc/${qemuPid}/status 2>/dev/null | awk {print $2}); ` +
-    `PSTATE=$(grep -m1 ^State /proc/${pypkjsPid}/status 2>/dev/null | awk {print $2}); ` +
-    `if [ -z $QSTATE ] || [ -z $PSTATE ]; then echo DEAD pid; exit 1; fi; ` +
-    `if [ $(echo $QSTATE | cut -c1) = Z ] || [ $(echo $PSTATE | cut -c1) = Z ]; then echo DEAD pid; exit 1; fi; ` +
+    `QSTATE=$(grep -m1 ^State /proc/${qemuPid}/status 2>/dev/null | cut -f2 | cut -c1); ` +
+    `PSTATE=$(grep -m1 ^State /proc/${pypkjsPid}/status 2>/dev/null | cut -f2 | cut -c1); ` +
+    `if [ -z $QSTATE ] || [ -z $PSTATE ] || [ $QSTATE = Z ] || [ $PSTATE = Z ]; then echo DEAD pid; exit 1; fi; ` +
     `(exec 3<>/dev/tcp/localhost/${pypkjsPort}) 2>/dev/null && echo OK || echo DEAD port`
   );
 }
