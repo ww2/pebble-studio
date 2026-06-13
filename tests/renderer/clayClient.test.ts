@@ -3,6 +3,7 @@ import {
   fetchConfigUrl,
   sendConfigResult,
   NoConfigPageError,
+  BridgeUnreachableError,
 } from "../../src/renderer/clayClient.js";
 
 const te = new TextEncoder();
@@ -197,20 +198,66 @@ describe("sendConfigResult", () => {
     expect(ws.closed).toBe(true);
   });
 
-  it("rejects on a socket error before open", async () => {
+  it("rejects with BridgeUnreachableError on a socket error before open", async () => {
     const p = sendConfigResult(9000, "x", deps);
     const ws = FakeWebSocket.instances[0];
     ws.emitError();
-    await expect(p).rejects.toBeInstanceOf(Error);
+    await expect(p).rejects.toBeInstanceOf(BridgeUnreachableError);
     expect(ws.closed).toBe(true);
     expect(ws.sent).toHaveLength(0);
   });
 
-  it("rejects when the socket closes before the result was sent", async () => {
+  it("rejects with BridgeUnreachableError when the socket closes before the result was sent", async () => {
     const p = sendConfigResult(9000, "x", deps);
     const ws = FakeWebSocket.instances[0];
     ws.emitClose();
-    await expect(p).rejects.toBeInstanceOf(Error);
+    await expect(p).rejects.toBeInstanceOf(BridgeUnreachableError);
     expect(ws.sent).toHaveLength(0);
+  });
+
+  it("rejects with BridgeUnreachableError on timeout (ws never opens)", async () => {
+    vi.useFakeTimers();
+    const p = sendConfigResult(9000, "x", deps, 50);
+    const ws = FakeWebSocket.instances[0];
+    const assertion = expect(p).rejects.toBeInstanceOf(BridgeUnreachableError);
+    await vi.advanceTimersByTimeAsync(50);
+    await assertion;
+    expect(ws.closed).toBe(true);
+    expect(ws.sent).toHaveLength(0);
+  });
+
+  it("clears the timeout and does not double-settle after a successful send", async () => {
+    vi.useFakeTimers();
+    const p = sendConfigResult(9000, "ok", deps, 5000);
+    const ws = FakeWebSocket.instances[0];
+    ws.open();
+    await expect(p).resolves.toBeUndefined();
+    // Advancing past the original deadline must be a no-op (timer was cleared).
+    await vi.advanceTimersByTimeAsync(10000);
+    ws.emitClose(); // late close after settle is also ignored
+  });
+
+  it("does not reject after a successful send when the socket later closes", async () => {
+    const p = sendConfigResult(9000, "ok", deps);
+    const ws = FakeWebSocket.instances[0];
+    ws.open();
+    await expect(p).resolves.toBeUndefined();
+    // settled flag prevents late onclose from re-rejecting
+    ws.emitClose();
+  });
+});
+
+describe("BridgeUnreachableError", () => {
+  it("is exported and extends Error", () => {
+    const err = new BridgeUnreachableError("test");
+    expect(err).toBeInstanceOf(Error);
+    expect(err).toBeInstanceOf(BridgeUnreachableError);
+    expect(err.name).toBe("BridgeUnreachableError");
+    expect(err.message).toBe("test");
+  });
+
+  it("is distinct from NoConfigPageError", () => {
+    expect(new BridgeUnreachableError("x")).not.toBeInstanceOf(NoConfigPageError);
+    expect(new NoConfigPageError("x")).not.toBeInstanceOf(BridgeUnreachableError);
   });
 });

@@ -1,4 +1,9 @@
-import { fetchConfigUrl, sendConfigResult, NoConfigPageError } from "../clayClient.js";
+import {
+  fetchConfigUrl,
+  sendConfigResult,
+  NoConfigPageError,
+  BridgeUnreachableError,
+} from "../clayClient.js";
 
 /** Extract the filename from an absolute path (works on both / and \ separators). */
 function basename(p: string): string {
@@ -237,7 +242,9 @@ export class AppLibrary {
     } catch (err) {
       console.error("[lib] clay config failed", pbwPath, err);
       this.errorMsg.classList.remove("lib-error--info");
-      if (err instanceof NoConfigPageError) {
+      if (err instanceof BridgeUnreachableError) {
+        this.errorMsg.textContent = "Couldn't reach the watch — try Relaunch.";
+      } else if (err instanceof NoConfigPageError) {
         this.errorMsg.textContent =
           "No config page (app may not support Clay — make sure it's running)";
       } else {

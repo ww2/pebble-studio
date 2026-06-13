@@ -38,6 +38,20 @@ export class NoConfigPageError extends Error {
   }
 }
 
+/**
+ * "The phone bridge couldn't be reached / didn't respond" class of failure:
+ * transport-level — the websocket errored, closed before the handshake
+ * completed, or timed out waiting for a response. Distinct from
+ * NoConfigPageError (bridge answered, but the app has no config page) so the
+ * UI can ask the user to Relaunch rather than blaming the app.
+ */
+export class BridgeUnreachableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BridgeUnreachableError";
+  }
+}
+
 function wsCtorFrom(deps: ClayClientDeps): typeof WebSocket {
   return deps.wsCtor ?? globalThis.WebSocket;
 }
@@ -103,11 +117,16 @@ export async function fetchConfigUrl(
  * result: AppConfigResponse carrying the RAW STILL-PERCENT-ENCODED fragment,
  * or AppConfigCancelled when the fragment is empty (user cancelled). Resolves
  * once sent; WebSocket.close() flushes already-buffered data per spec.
+ *
+ * Rejects with BridgeUnreachableError on timeout (default 5000 ms), socket
+ * error, or close-before-open — transport failures distinct from
+ * NoConfigPageError so the UI can surface the right recovery hint.
  */
 export async function sendConfigResult(
   port: number,
   rawFragment: string,
   deps: ClayClientDeps = {},
+  timeoutMs = 5000,
 ): Promise<void> {
   const Ctor = wsCtorFrom(deps);
   return new Promise<void>((resolve, reject) => {
@@ -115,9 +134,12 @@ export async function sendConfigResult(
     ws.binaryType = "arraybuffer";
 
     let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    /** Single exit point: clear the timer + close the socket on EVERY path. */
     const settle = (outcome: () => void): void => {
       if (settled) return;
       settled = true;
+      if (timer !== undefined) clearTimeout(timer);
       try {
         ws.close();
       } catch {
@@ -126,6 +148,12 @@ export async function sendConfigResult(
       outcome();
     };
 
+    timer = setTimeout(
+      () =>
+        settle(() => reject(new BridgeUnreachableError("timed out delivering the config result"))),
+      timeoutMs,
+    );
+
     ws.onopen = () => {
       // Raw fragment goes through UNDECODED — the watch app's JS calls
       // decodeURIComponent itself (clayProtocol.ts contract).
@@ -133,10 +161,14 @@ export async function sendConfigResult(
       settle(resolve);
     };
     ws.onerror = () => {
-      settle(() => reject(new Error("websocket error talking to the phonesim bridge")));
+      settle(() =>
+        reject(new BridgeUnreachableError("websocket error talking to the phonesim bridge")),
+      );
     };
     ws.onclose = () => {
-      settle(() => reject(new Error("connection closed before the config result was sent")));
+      settle(() =>
+        reject(new BridgeUnreachableError("connection closed before the config result was sent")),
+      );
     };
   });
 }
