@@ -191,43 +191,66 @@ export function makeTimeController(
   }
   // ----------------------------- end legacy ---------------------------------
 
-  /** Apply the current cfg: 12/24h format, the constant utc_offset, then the
-   * shim control file (or the legacy fallback when the shim is unavailable). */
+  /**
+   * Apply the current cfg. ORDER IS LOAD-BEARING (v0.0.13.1 fix):
+   *
+   * The shim control-file write (setFakeTime) is CONNECTION-FREE and is the
+   * ENTIRE custom/freeze/rate mechanism, so it runs FIRST and is the only awaited
+   * emulator call. The 12/24h format and the utc_offset push connect to the
+   * SINGLE-CLIENT pypkjs bridge, which hangs for tens of seconds — or FOREVER if
+   * the bridge has died (a real failure mode: pypkjs crashes, leaving qemu up) —
+   * under contention. They are therefore best-effort FIRE-AND-FORGET and can
+   * never starve the control-file write or block the renderer.
+   *
+   * (Pre-fix bug: setFakeTime sat AFTER an awaited setTzOffset. When pypkjs was
+   * contended/dead, setTzOffset hung and setFakeTime never ran, so custom time
+   * silently never reached the watch — it kept showing whatever the control file
+   * last held. Confirmed live: setTzOffset hung 25 s+, setFakeTime wrote in 129 ms.)
+   *
+   * Custom keeps the HOST offset (which post_connect already supplies, so a missed
+   * push is harmless); Timezone's offset is also healed by reassert() after each
+   * command. Only the LEGACY fallback (no shim) must await its offset push, since
+   * there the utc_offset IS the only lever.
+   */
   async function apply(): Promise<void> {
     clearTimer();
     legacyActive = false;
     const d = getDriver();
     if (!d) return;
 
-    try { await d.timeFormat(cfg.hour24); } catch { /* ignore */ }
-
-    // Constant offset for ALL modes — boot needs it (firmware may default to
-    // offset 0). Custom keeps the HOST offset (clobber-immune, see contract).
-    const tzName = cfg.source === "custom" ? hostTz() : cfg.timezone;
-    try { await d.setTzOffset(offsetMinutesFor(cfg, now(), hostTz()), tzName); } catch { /* ignore */ }
-
+    // Shim readiness — connection-free (cached after the first deploy).
     try { shimReady = await d.ensureTimeShim(); } catch { shimReady = false; }
     shimChecked = true;
 
-    if (cfg.source === "custom") {
-      if (shimReady) {
-        try {
-          await d.setFakeTime(fakeTargetUnix(cfg.customWallMs, hostTz(), now()), RATE_MULT[cfg.rate]);
-        } catch { /* ignore */ }
-      } else {
-        // Legacy fallback: virtual clock via utc_offset.
-        legacyActive = true;
-        anchorMs = now();
-        lastPushed = null;
-        await legacyPush(true);
-        syncLegacyTimer();
-      }
+    if (cfg.source === "custom" && !shimReady) {
+      // Legacy fallback (no shim): the utc_offset virtual clock IS the mechanism,
+      // so its push must be awaited. Only reached when the shim can't deploy.
+      legacyActive = true;
+      anchorMs = now();
+      lastPushed = null;
+      await legacyPush(true);
+      syncLegacyTimer();
     } else if (shimReady) {
-      // System & Timezone: return the fake clock to real time. The shim has no
-      // reset; jumping to now at 1× IS the reset (sub-second skew acceptable).
-      try { await d.setFakeTime(Math.trunc(now() / 1000), 1); } catch { /* ignore */ }
+      // PRIMARY PATH: write the control file FIRST. Custom → entered wall-clock at
+      // the chosen rate; System/Timezone → real time at 1× (the shim has no reset,
+      // so jumping the fake clock to now IS the reset; sub-second skew acceptable).
+      const target = cfg.source === "custom"
+        ? fakeTargetUnix(cfg.customWallMs, hostTz(), now())
+        : Math.trunc(now() / 1000);
+      const rate = cfg.source === "custom" ? RATE_MULT[cfg.rate] : 1;
+      try { await d.setFakeTime(target, rate); } catch { /* ignore */ }
     }
-    // System/Timezone with no shim: nothing to undo — skip silently.
+    // System/Timezone with no shim: nothing to write — skip.
+
+    // Best-effort, FIRE-AND-FORGET pypkjs work — must NOT block the write above.
+    void d.timeFormat(cfg.hour24).catch(() => { /* bridge down — non-fatal */ });
+    if (!(cfg.source === "custom" && !shimReady)) {
+      // Skipped in legacy custom: legacyPush already owns the offset, and a
+      // host-offset push here would clobber its virtual-clock offset.
+      const tzName = cfg.source === "custom" ? hostTz() : cfg.timezone;
+      void d.setTzOffset(offsetMinutesFor(cfg, now(), hostTz()), tzName)
+        .catch(() => { /* bridge down — non-fatal */ });
+    }
   }
 
   return {

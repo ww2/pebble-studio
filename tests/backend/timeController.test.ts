@@ -110,6 +110,24 @@ describe("makeTimeController — shim-backed (primary path)", () => {
     tc.stop();
   });
 
+  it("control-file write is NOT gated behind a hung pypkjs bridge (regression: custom time silently never applied when setTzOffset/timeFormat hung)", async () => {
+    const fake: Array<[number | null, number]> = [];
+    const neverResolves = (): Promise<void> => new Promise<void>(() => { /* hung bridge */ });
+    const hung = {
+      setTzOffset: neverResolves, // single-client pypkjs contended/dead → hangs
+      timeFormat: neverResolves,
+      setFakeTime: async (t: number | null, r: number) => { fake.push([t, r]); },
+      ensureTimeShim: async () => true,
+    };
+    const wall = t0 + 3600_000;
+    const tc = makeTimeController(() => hung, deps);
+    // setConfig MUST resolve promptly even though both pypkjs calls hang forever;
+    // the connection-free control-file write is what custom time actually needs.
+    await tc.setConfig(cfg({ source: "custom", rate: "frozen", customWallMs: wall }));
+    expect(fake).toEqual([[fakeTargetUnix(wall, HOST, t0), 0]]);
+    tc.stop();
+  });
+
   it("custom@10x → rate 10; custom@1x → rate 1", async () => {
     const d = fakeDriver();
     const tc = makeTimeController(() => d, deps);
@@ -198,8 +216,9 @@ describe("makeTimeController — legacy fallback (shim unavailable)", () => {
     let t = t0;
     const tc = makeTimeController(() => d, { now: () => t, hostTz: () => HOST });
     await tc.setConfig(cfg({ source: "custom", rate: "frozen", customWallMs: t0 + 3600_000 })); // +60 min
-    // Constant host-offset push first (clobber baseline), then the legacy virtual offset.
-    expect(d.tz).toEqual([[-480, HOST], [60, undefined]]);
+    // Legacy custom pushes ONLY the virtual-clock offset (no redundant host-offset
+    // push — that would clobber it; v0.0.13.1 dropped the old double-push).
+    expect(d.tz).toEqual([[60, undefined]]);
     expect(d.fake).toEqual([]); // never touches the control file without the shim
 
     t += 5 * 60_000; // 5 real minutes pass
@@ -214,7 +233,7 @@ describe("makeTimeController — legacy fallback (shim unavailable)", () => {
     let t = t0;
     const tc = makeTimeController(() => d, { now: () => t, hostTz: () => HOST });
     await tc.setConfig(cfg({ source: "custom", rate: "10x", customWallMs: t0 }));
-    expect(d.tz).toEqual([[-480, HOST], [0, undefined]]);
+    expect(d.tz).toEqual([[0, undefined]]); // virtual offset only (no host-offset double-push)
 
     t += 60_000; // +1 real min → display +10 min → offset +9
     await vi.advanceTimersByTimeAsync(1000);
