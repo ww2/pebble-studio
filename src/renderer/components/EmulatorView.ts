@@ -26,6 +26,37 @@ const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
 /** When "true", auto-reboot the emulator on a bridge crash (SettingsPane writes this). */
 const AUTO_RELAUNCH_KEY = "pebble-studio:auto-relaunch";
 /**
+ * How the main-page "Backlight" button wakes the screen (SettingsPane writes
+ * this). "back" = a Back-button press (reliable wake, can navigate inside an
+ * app); "shake" = an accelerometer nudge (like a real Pebble's motion trigger,
+ * won't navigate). Default "back".
+ */
+const BACKLIGHT_ACTIVATION_KEY = "pebble-studio:backlight-activation";
+
+/** The two ways the Backlight button can wake the screen. */
+export type BacklightActivation = "shake" | "back";
+
+/**
+ * Map the persisted backlight-activation setting to a concrete action. Only the
+ * exact string "shake" selects the motion nudge; everything else (null, unknown,
+ * legacy values) falls back to the safe default "back". Pure + unit-tested.
+ */
+export function backlightActivationFromSetting(raw: string | null): BacklightActivation {
+  return raw === "shake" ? "shake" : "back";
+}
+
+/**
+ * Decide which action-button GROUPS should draw their leading divider, given each
+ * group's vertical offset (offsetTop). A divider sits BETWEEN two groups, so it's
+ * only wanted when a group shares a row with the one before it. The first group
+ * never has a leading divider; any group that wrapped onto a new row (its top
+ * differs from the previous group's) drops its divider since it's now at a row
+ * start. Pure + unit-tested; the DOM caller toggles a class from this result.
+ */
+export function actionDividerFlags(groupTops: number[]): boolean[] {
+  return groupTops.map((top, i) => i > 0 && top === groupTops[i - 1]);
+}
+/**
  * Max consecutive auto-relaunches before falling back to the manual "Relaunch"
  * button. The bridge crash is an upstream pypkjs fragility (see
  * bridge-crash-root-cause): if it dies again and again within a short window we
@@ -109,6 +140,7 @@ export class EmulatorView {
   private readonly tapBtn: HTMLButtonElement;
   private readonly shakeBtn: HTMLButtonElement;
   private readonly timelineBtn: HTMLButtonElement;
+  private readonly backlightBtn: HTMLButtonElement;
   private timelinePeek = false;
   private readonly zoomSelect: HTMLSelectElement;
   private readonly frameWrapper: HTMLElement;
@@ -124,6 +156,12 @@ export class EmulatorView {
   private fitObserver: ResizeObserver | null = null;
   /** The element the fit observer is currently watching (column once attached). */
   private fitObserverTarget: Element | null = null;
+  /** The action-button row; watched so group dividers update when buttons wrap. */
+  private readonly actionsRow: HTMLElement;
+  /** The logical button groups (Tap/Shake, Timeline/Backlight, Relaunch/Force-close). */
+  private readonly actionGroups: HTMLElement[];
+  /** Always-on observer: recomputes which groups draw a divider as the row wraps. */
+  private actionsObserver: ResizeObserver | null = null;
   /** Selected screen-bezel color (B5); persisted, applied to round models. */
   private bezelColor: BezelColor = "black";
   /** True while the current platform is round (gates the bezel toggle + bezel color). */
@@ -220,13 +258,19 @@ export class EmulatorView {
         </div>
       </div>
       <div class="emu-caption" id="emu-caption"></div>
-      <div class="emu-actions">
-        <button class="emu-action emu-action--subtle" id="emu-tap" type="button">Tap</button>
-        <button class="emu-action emu-action--subtle" id="emu-shake" type="button">Shake</button>
-        <button class="emu-action emu-action--subtle" id="emu-timeline" type="button" title="Toggle timeline quick view (peek)">Timeline</button>
-        <div class="emu-actions-sep" aria-hidden="true"></div>
-        <button class="emu-action emu-action--subtle" id="emu-relaunch" type="button" title="Stop and reboot the current platform">Relaunch</button>
-        <button class="emu-action emu-action--subtle emu-action--danger" id="emu-force-close" type="button" title="Force-close the emulator">Force-close</button>
+      <div class="emu-actions" id="emu-actions">
+        <div class="emu-action-group">
+          <button class="emu-action emu-action--subtle" id="emu-tap" type="button">Tap</button>
+          <button class="emu-action emu-action--subtle" id="emu-shake" type="button">Shake</button>
+        </div>
+        <div class="emu-action-group">
+          <button class="emu-action emu-action--subtle" id="emu-timeline" type="button" title="Toggle timeline quick view (peek)">Timeline</button>
+          <button class="emu-action emu-action--subtle" id="emu-backlight" type="button" title="Wake the backlight (method set in Settings)">Backlight</button>
+        </div>
+        <div class="emu-action-group">
+          <button class="emu-action emu-action--subtle" id="emu-relaunch" type="button" title="Stop and reboot the current platform">Relaunch</button>
+          <button class="emu-action emu-action--subtle emu-action--danger" id="emu-force-close" type="button" title="Force-close the emulator">Force-close</button>
+        </div>
       </div>
       <div class="emu-zoom-row">
         <span class="emu-zoom-label">Zoom</span>
@@ -323,6 +367,28 @@ export class EmulatorView {
       this.timelineBtn.classList.toggle("emu-action--on", this.timelinePeek);
       void window.studio.timelineQuickView(this.timelinePeek).catch(() => {});
     });
+    // Backlight — wake the screen once. The activation method (Back-button press
+    // vs accelerometer shake) is chosen in Settings; we read it fresh on each
+    // click so a change applies immediately. Both routes reuse existing IPC.
+    this.backlightBtn = this.el.querySelector<HTMLButtonElement>("#emu-backlight")!;
+    this.backlightBtn.addEventListener("click", () => {
+      if (this.state !== "live") return;
+      const how = backlightActivationFromSetting(localStorage.getItem(BACKLIGHT_ACTIVATION_KEY));
+      if (how === "shake") void window.studio.accelTap();
+      else void window.studio.button("back");
+    });
+
+    // Group dividers: each logical group wraps as a unit (CSS), and the row
+    // centers when it wraps. The 1px divider between groups is drawn as a
+    // zero-layout ::before on each follower group, so toggling it never changes
+    // wrapping (no oscillation). syncActionDividers() decides which groups are
+    // row-followers and shows their divider; an always-on ResizeObserver re-runs
+    // it as the window/row width changes.
+    this.actionsRow = this.el.querySelector<HTMLElement>("#emu-actions")!;
+    this.actionGroups = Array.from(this.actionsRow.querySelectorAll<HTMLElement>(".emu-action-group"));
+    this.actionsObserver = new ResizeObserver(() => this.syncActionDividers());
+    this.actionsObserver.observe(this.actionsRow);
+    this.syncActionDividers();
 
     // Lifecycle buttons. The single Launch/Relaunch button routes to relaunch()
     // when live and launch() otherwise.
@@ -601,6 +667,18 @@ export class EmulatorView {
   }
 
   /**
+   * Recompute which action groups draw their leading divider. A divider is only
+   * wanted between two groups on the SAME row, so we read each group's offsetTop
+   * and let actionDividerFlags() (pure, tested) decide; a group that has wrapped
+   * to a new row drops its divider. Dividers are zero-layout ::before elements,
+   * so toggling `has-divider` never re-triggers wrapping.
+   */
+  private syncActionDividers(): void {
+    const flags = actionDividerFlags(this.actionGroups.map((g) => g.offsetTop));
+    this.actionGroups.forEach((g, i) => g.classList.toggle("has-divider", flags[i]));
+  }
+
+  /**
    * B5 (v0.0.5): apply the SCREEN-bezel color (the dark area inside the stage,
    * between the live screen and the stage edge) by setting `--screen-bezel-color`
    * on `.emu-stage`. Persisted so it survives relaunch and re-applies when
@@ -644,6 +722,7 @@ export class EmulatorView {
     this.tapBtn.disabled = !liveActions;
     this.shakeBtn.disabled = !liveActions;
     this.timelineBtn.disabled = !liveActions;
+    this.backlightBtn.disabled = !liveActions;
     for (const el of this.buttonEls) el.disabled = !liveActions;
 
     // J-runtime: the FPS sampler only runs while diagnostics on AND live.

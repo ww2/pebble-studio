@@ -31,6 +31,8 @@ interface SettingsOptions {
 const CAPTURE_DIR_KEY = "pebble-studio:capture-dir";
 const BACKLIGHT_CAPTURE_KEY = "pebble-studio:backlight-capture";
 const BACKLIGHT_METHOD_KEY = "pebble-studio:backlight-method";
+/** How the main-page Backlight button wakes the screen (EmulatorView reads this). "back" | "shake". Default "back". */
+const BACKLIGHT_ACTIVATION_KEY = "pebble-studio:backlight-activation";
 const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
 /** Auto-relaunch the emulator when the bridge crashes (EmulatorView reads this). Default OFF. */
 const AUTO_RELAUNCH_KEY = "pebble-studio:auto-relaunch";
@@ -552,7 +554,38 @@ export class SettingsPane {
     void window.studio.backlightMethod(initialBlMethod).catch(() => {});
     void window.studio.backlightAlways(initialBlMethod !== "off").catch(() => {});
 
-    capture.append(blCaptureRow, blMethodControl, blMethodDesc);
+    // Backlight BUTTON activation method (separate from the keepalive above):
+    // controls only the one-shot "Backlight" button on the main page. No IPC at
+    // change time — EmulatorView reads this localStorage key when the button is
+    // clicked. Default "back".
+    const blBtnControl = document.createElement("label");
+    blBtnControl.className = "settings-watch-control";
+    const blBtnLabel = document.createElement("span");
+    blBtnLabel.className = "settings-watch-label type-body";
+    blBtnLabel.textContent = "Backlight button";
+    const blBtnSelect = document.createElement("select");
+    blBtnSelect.className = "settings-watch-select";
+    for (const [value, text] of [
+      ["back", "Back button"],
+      ["shake", "Shake"],
+    ]) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = text;
+      blBtnSelect.appendChild(opt);
+    }
+    blBtnSelect.value = localStorage.getItem(BACKLIGHT_ACTIVATION_KEY) ?? "back";
+    blBtnSelect.addEventListener("change", () => {
+      localStorage.setItem(BACKLIGHT_ACTIVATION_KEY, blBtnSelect.value);
+    });
+    blBtnControl.append(blBtnLabel, blBtnSelect);
+
+    const blBtnDesc = document.createElement("p");
+    blBtnDesc.className = "settings-row-desc type-caption";
+    blBtnDesc.textContent =
+      "What the main-page Backlight button does: Back button reliably wakes the screen but can navigate inside an app; Shake sends a motion nudge (won't navigate).";
+
+    capture.append(blCaptureRow, blMethodControl, blMethodDesc, blBtnControl, blBtnDesc);
 
     // ── Keyboard section (I) ──────────────────────────────────────────────
     const keyboard = document.createElement("section");
