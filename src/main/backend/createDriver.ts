@@ -1,9 +1,12 @@
 import { access } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { spawnRunner } from "./spawnRunner.js";
 import { selectDriverKind, type ProbeResult, type DriverKind } from "./driverFactory.js";
 import { NativeDriver } from "./NativeDriver.js";
 import { WslDriver } from "./WslDriver.js";
+import { WindowsNativeDriver } from "./WindowsNativeDriver.js";
 import { bootEmulator, stopEmulator, makeWslBootDeps } from "./bootEmulator.js";
+import { makeWinBootDeps } from "./winBootDeps.js";
 import type { BackendDriver } from "./BackendDriver.js";
 
 /**
@@ -43,8 +46,22 @@ async function qemuAvailable(): Promise<boolean> {
     await access(sdkQemu);
     return true;
   } catch {
-    return false;
+    /* fall through */
   }
+
+  // Probe the Windows bundled SDK location (win32 only).
+  if (process.platform === "win32") {
+    const local = process.env.LOCALAPPDATA ?? "";
+    const sdkQemu = `${local}\\pebble-sdk\\SDKs\\current\\toolchain\\bin\\qemu-pebble.exe`;
+    try { await access(sdkQemu); return true; } catch { /* fall through */ }
+  }
+
+  return false;
+}
+
+/** Maps a driver kind to its class (used by createDriver + a construction test). */
+export function driverClassForKind(kind: DriverKind): unknown {
+  return kind === "native" ? NativeDriver : kind === "wsl" ? WslDriver : WindowsNativeDriver;
 }
 
 export async function createDriver(override?: DriverKind): Promise<{ driver: BackendDriver; kind: DriverKind }> {
@@ -56,18 +73,36 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
     override,
   };
   const kind = selectDriverKind(probe);
-  const driver = kind === "native"
-    ? new NativeDriver({ run: spawnRunner }) // native default boot/stop
-    : new WslDriver({
-        run: spawnRunner,
-        // On a Windows host the emulator lifecycle must run inside WSL via
-        // wsl.exe, not as Node-spawned Linux binaries on the Windows host. The
-        // token threads through so a force-close aborts the in-WSL boot.
-        // onStep MUST be forwarded too — without it the WSL boot emits NO
-        // progress notes, so the diagnostics boot log is blank on Windows (the
-        // long-standing "no detailed steps on the .exe" bug, fixed v0.0.13.7).
-        boot: (id, token, onStep) => bootEmulator(id, makeWslBootDeps(), token, onStep),
-        stop: () => stopEmulator({ killAll: makeWslBootDeps().killAll }),
-      });
+
+  let driver: BackendDriver;
+  if (kind === "windows-native") {
+    // Detached spawn into a new process group (Job Object assignment is a later
+    // increment — see the Phase-1 spec). windowsHide avoids a console flash.
+    const detachSpawn = async (cmd: string, args: string[]): Promise<void> => {
+      const child = spawn(cmd, args, { detached: true, windowsHide: true, stdio: "ignore" });
+      child.unref();
+      child.on("error", () => { /* readiness is checked via ports/state file */ });
+    };
+    const winDeps = makeWinBootDeps({ run: spawnRunner, detachSpawn });
+    driver = new WindowsNativeDriver({
+      run: spawnRunner,
+      boot: (id, token, onStep) => bootEmulator(id, winDeps, token, onStep),
+      stop: () => stopEmulator({ killAll: winDeps.killAll }),
+    });
+  } else if (kind === "native") {
+    driver = new NativeDriver({ run: spawnRunner }); // native default boot/stop
+  } else {
+    driver = new WslDriver({
+      run: spawnRunner,
+      // On a Windows host the emulator lifecycle must run inside WSL via
+      // wsl.exe, not as Node-spawned Linux binaries on the Windows host. The
+      // token threads through so a force-close aborts the in-WSL boot.
+      // onStep MUST be forwarded too — without it the WSL boot emits NO
+      // progress notes, so the diagnostics boot log is blank on Windows (the
+      // long-standing "no detailed steps on the .exe" bug, fixed v0.0.13.7).
+      boot: (id, token, onStep) => bootEmulator(id, makeWslBootDeps(), token, onStep),
+      stop: () => stopEmulator({ killAll: makeWslBootDeps().killAll }),
+    });
+  }
   return { driver, kind };
 }
