@@ -87,43 +87,61 @@ export function parseBridgePids(json: string, platform: string): BridgePids | nu
 /**
  * Build a quote-free bash one-liner that probes qemu + pypkjs health and
  * prints exactly ONE verdict token to stdout:
- *   OK        — both processes are alive (not zombies) and the pypkjs port
- *               accepts a TCP connection.
- *   DEAD pid  — at least one PID is gone or in zombie state (Z).
- *   DEAD port — both PIDs are alive but the pypkjs TCP port is not reachable.
+ *   OK        — the pypkjs port accepts a TCP connection (the bridge is
+ *               serving), OR both processes are alive (not zombies).
+ *   DEAD port — both PIDs are alive but the pypkjs TCP port is not reachable
+ *               (pypkjs hung — debounced by the monitor).
+ *   DEAD pid  — the port is NOT reachable AND a PID is gone/zombie (a real,
+ *               confirmed death).
+ *
+ * WHY PORT-FIRST (the relaunch-loop fix, v0.0.13.10):
+ *   The /proc/<pid> read is fragile across the Windows→wsl.exe→bash boundary —
+ *   the first poll after boot intermittently read an empty state for a pid that
+ *   was demonstrably alive (the qemu/pypkjs processes survived long after the
+ *   app gave up looping). The old command checked the pid FIRST and
+ *   short-circuited to `DEAD pid` before ever probing the port, so one bad read
+ *   tore down a healthy, port-reachable bridge and triggered an infinite
+ *   relaunch loop. A reachable pypkjs port is authoritative proof the bridge is
+ *   alive, so we probe it FIRST: if it answers, the verdict is OK no matter what
+ *   the pid reads say. `DEAD pid` is now only reachable when the port is ALSO
+ *   down, which makes it a genuine death (and safe to fire without debounce).
  *
  * CRITICAL — the returned string MUST contain ZERO ' and ZERO " characters.
  * See module-level comment for why. All tokens are unquoted; the only
  * shell-special characters used are redirection (>/dev/null, 2>/dev/null),
- * pipe (|), semicolon (;), and parentheses — none of which require quoting
- * and all of which survive the WSL double-shell-hop unmangled.
+ * semicolon (;), and parentheses — none of which require quoting and all of
+ * which survive the WSL double-shell-hop unmangled.
  *
  * Implementation strategy (quote-free):
- *   Step 1: Read a single state char from /proc/<pid>/status via grep+cut.
- *           `grep -m1 ^State /proc/<pid>/status | cut -f2 | cut -c1` yields
- *           one char (Z/S/R/…) or empty when the process is gone.
- *           If either QSTATE or PSTATE is empty or equals Z → DEAD pid.
- *   Step 2: TCP probe via bare `(exec 3<>/dev/tcp/localhost/PORT) 2>/dev/null`.
+ *   Step 1: TCP probe via bare `(exec 3<>/dev/tcp/localhost/PORT) 2>/dev/null`.
  *           A refused connect fails immediately — no timeout wrapper needed.
- *   Verdict: on success echo OK; on failure echo DEAD port.
+ *           On success → echo OK and exit (port-reachable ⇒ alive, authoritative).
+ *   Step 2 (only when the port is down): read a single state char from
+ *           /proc/<pid>/status via grep+cut. `grep -m1 ^State /proc/<pid>/status
+ *           | cut -f2 | cut -c1` yields one char (Z/S/R/…) or empty when the
+ *           process is gone. If either QSTATE or PSTATE is empty or equals Z →
+ *           DEAD pid; otherwise → DEAD port.
  */
 export function buildHealthCommand(pids: BridgePids): string {
   const { qemuPid, pypkjsPid, pypkjsPort } = pids;
 
-  // Step 1: extract a single state char from /proc/<pid>/status.
+  // Step 1: TCP probe — (exec 3<>/dev/tcp/localhost/PORT) 2>/dev/null
+  // On connect refused this fails immediately; on success the subshell exits 0.
+  // A reachable port is authoritative: the bridge is serving ⇒ OK, regardless
+  // of any (fragile) /proc pid read.
+  //
+  // Step 2 (port down only): extract a single state char from /proc/<pid>/status.
   // "State:" and the value are separated by a TAB, so `cut -f2` gives the value
   // field ("Z (zombie)", "S (sleeping)", etc.) and `cut -c1` reduces it to one
   // safe char. Empty when the process file is absent (process gone).
   // Single char, no spaces → unquoted [ ] tests are safe.
-  //
-  // Step 2: TCP probe — (exec 3<>/dev/tcp/localhost/PORT) 2>/dev/null
-  // On connect refused this fails immediately. On success the subshell exits 0.
 
   return (
+    `if (exec 3<>/dev/tcp/localhost/${pypkjsPort}) 2>/dev/null; then echo OK; exit 0; fi; ` +
     `QSTATE=$(grep -m1 ^State /proc/${qemuPid}/status 2>/dev/null | cut -f2 | cut -c1); ` +
     `PSTATE=$(grep -m1 ^State /proc/${pypkjsPid}/status 2>/dev/null | cut -f2 | cut -c1); ` +
     `if [ -z $QSTATE ] || [ -z $PSTATE ] || [ $QSTATE = Z ] || [ $PSTATE = Z ]; then echo DEAD pid; exit 1; fi; ` +
-    `(exec 3<>/dev/tcp/localhost/${pypkjsPort}) 2>/dev/null && echo OK || echo DEAD port`
+    `echo DEAD port`
   );
 }
 

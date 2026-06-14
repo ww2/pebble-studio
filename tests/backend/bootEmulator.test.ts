@@ -22,7 +22,7 @@ vi.mock("node:child_process", () => ({
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
     child.unref = () => {};
-    // The verify-dead gate (waitUntilDead) shells out `pgrep -x qemu-pebble`.
+    // The verify-dead gate (waitUntilDead) shells out `pgrep -f '[q]emu-pebble'`.
     // For these construction tests there is no real qemu, so report "dead"
     // (non-zero exit, empty stdout) so the gate resolves immediately instead of
     // polling to its timeout. Other commands use the shared exitCode/stdoutFor.
@@ -68,7 +68,7 @@ const { ensureTimeShim, _resetShimState, WRAPPER } = await import(
   "../../src/main/backend/timeShim.js"
 );
 
-/** Build a fake Shell whose `pgrep -x qemu-pebble` returns a scripted sequence
+/** Build a fake Shell whose `pgrep -f '[q]emu-pebble'` returns a scripted sequence
  * of {code,stdout} (one per poll); `run` for anything else is a no-op success. */
 function makePgrepShell(seq: { code: number; stdout: string }[]) {
   let i = 0;
@@ -158,9 +158,12 @@ describe("bootEmulator WSL shell construction", () => {
     expect(call!.args.slice(0, 3)).toEqual(["--", "bash", "-lc"]);
     const cmdline = call!.args[3];
     expect(cmdline).toContain("pebble kill");
-    // qemu is matched by EXACT process name (avoids the shell self-match hazard).
-    expect(cmdline).toContain("pkill -9 -x qemu-pebble");
-    // websockify/emu-control use the [c]haracter-class self-exclusion trick.
+    // qemu is matched by argv path with the [c]haracter-class self-exclusion
+    // trick (NOT -x: the time-shim wrapper's comm is sh/dash pre-exec).
+    expect(cmdline).toContain("pkill -9 -f '[q]emu-pebble'");
+    // It must NOT use the old comm-exact form that misses the wrapper.
+    expect(cmdline).not.toContain("pkill -9 -x qemu-pebble");
+    // websockify/emu-control use the same [c]haracter-class self-exclusion trick.
     expect(cmdline).toContain("[w]ebsockify");
     expect(cmdline).toContain("[e]mu-control");
   });
@@ -318,7 +321,11 @@ describe("makeDiagnose + fmtProbe (boot health probe)", () => {
     // The command crosses `wsl.exe -- bash -lc "'bash' '-lc' '<cmd>'"` on Windows,
     // so per the hard-won rule it MUST contain zero single/double quotes.
     expect(captured).not.toMatch(/['"]/);
-    expect(captured).toContain("pgrep -x qemu-pebble");
+    // qemu matched by argv path (catches the sh/dash time-shim wrapper that -x
+    // misses), kept quote-free + glob-safe via `set -f` + a [q] character class.
+    expect(captured).toContain("pgrep -f [q]emu-pebble");
+    expect(captured).toContain("set -f");
+    expect(captured).not.toContain("pgrep -x qemu-pebble");
   });
 
   it("parses the q/i/r/w flags into a BootProbe", async () => {

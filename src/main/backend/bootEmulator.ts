@@ -71,7 +71,7 @@ export class BootAborted extends Error {
 /**
  * A point-in-time health snapshot of the emulator stack, used to annotate boot
  * progress so a stuck boot shows EXACTLY which component hasn't come up:
- *   - qemuAlive  — a `qemu-pebble` process is running (pgrep -x)
+ *   - qemuAlive  — a `qemu-pebble` process is running (pgrep -f, argv match)
  *   - stateFile  — /tmp/pb-emulator.json exists and is non-empty
  *   - rfbOpen    — qemu's raw VNC (RFB :5901) is accepting connections
  *   - wsOpen     — websockify's proxy (ws :6080) is accepting connections
@@ -253,7 +253,19 @@ function makeWaitForEmuInfo(shell: Shell) {
  */
 export function makeDiagnose(shell: Shell) {
   const cmd =
-    `Q=0; pgrep -x qemu-pebble >/dev/null 2>&1 && Q=1; ` +
+    // Match qemu by its argv PATH (not comm) with a self-excluding character
+    // class — see makeKillAll for the full rationale. `pgrep -x qemu-pebble`
+    // misses the process whenever it is still the `#!/bin/sh` time-shim wrapper
+    // (comm `sh`/`dash`) that has not yet `exec`d the real binary, which is why
+    // the diagnostics line could show `qemu ✗` for a live emulator.
+    //
+    // This command MUST stay quote-free (it crosses the WSL double-shell-hop —
+    // see the not-toMatch(/['"]/) test). So instead of quoting the [q] class we
+    // disable globbing with `set -f`, which keeps `[q]emu-pebble` literal for
+    // pgrep regardless of the shell's cwd (an unquoted [q]…  would otherwise be
+    // pathname-expanded if a matching file happened to exist).
+    `set -f; ` +
+    `Q=0; pgrep -f [q]emu-pebble >/dev/null 2>&1 && Q=1; ` +
     `I=0; [ -s ${EMU_INFO_PATH} ] && I=1; ` +
     `R=0; (exec 3<>/dev/tcp/localhost/${VNC_RFB_PORT}) 2>/dev/null && R=1; ` +
     `W=0; (exec 3<>/dev/tcp/localhost/${WS_PORT}) 2>/dev/null && W=1; ` +
@@ -370,9 +382,12 @@ export interface WaitUntilDeadDeps {
  * (b) RFB port 5901 is free, AND (c) websockify's ws port 6080 is free,
  * before letting a new boot proceed.
  *
- * `pgrep -x qemu-pebble` matches the EXACT process NAME; the polling shell's comm
- * is `bash`/`pgrep`, never `qemu-pebble`, so there is no self-match (unlike the
- * `-f` patterns killAll must guard with character classes).
+ * `pgrep -f '[q]emu-pebble'` matches qemu by its argv PATH, with the same
+ * self-excluding character class killAll uses. The argv form (not `pgrep -x`,
+ * which matches comm) is required because the time-shim wrapper runs qemu as a
+ * `#!/bin/sh` script: until it `exec`s the real binary its comm is `sh`/`dash`,
+ * so `-x qemu-pebble` would falsely report it dead and let a relaunch race a
+ * still-live (or stuck-pre-exec) process.
  *
  * If the timeout elapses we resolve anyway (never hang the app); after a SIGKILL
  * it normally resolves within a poll or two.
@@ -388,7 +403,7 @@ export async function waitUntilDead(
   for (;;) {
     // (a) No qemu-pebble process: pgrep exits non-zero (and prints nothing) when
     // there is no match.
-    const { code, stdout } = await shell.run("pgrep -x qemu-pebble");
+    const { code, stdout } = await shell.run("pgrep -f '[q]emu-pebble'");
     const qemuGone = code !== 0 && stdout.trim() === "";
     // (b) RFB port released.
     const rfbFree = qemuGone ? await portFree("127.0.0.1", VNC_RFB_PORT) : false;
@@ -405,14 +420,19 @@ function makeKillAll(shell: Shell) {
   // CRITICAL — SELF-MATCH HAZARD: this sweep runs inside `bash -lc "<cmdline>"`,
   // so the controlling shell's OWN argv literally CONTAINS these patterns. A naive
   // `pkill -9 -f qemu-pebble` therefore matches (and kills) the very shell running
-  // it, before it reaches the real emulator. Two defenses:
-  //   * qemu — match the EXACT process name with `pkill -x qemu-pebble` (the shell's
-  //     comm is `bash`, not `qemu-pebble`, so no self-match).
-  //   * websockify / emu-control / pypkjs run as `python …`, so we must use `-f`;
-  //     we wrap the first letter in a `[c]haracter class`. `[w]ebsockify` matches
-  //     the string "websockify" in the TARGET's argv, but our own cmdline contains
-  //     the literal "[w]ebsockify", which does NOT match — the classic grep/pkill
-  //     self-exclusion trick.
+  // it, before it reaches the real emulator. The defense for EVERY pattern is the
+  // `[c]haracter class` self-exclusion trick: `[w]ebsockify` matches the string
+  // "websockify" in the TARGET's argv, but our own cmdline contains the literal
+  // "[w]ebsockify", which does NOT match.
+  //   * websockify / emu-control / pypkjs run as `python …` so `-f` (argv match)
+  //     is mandatory.
+  //   * qemu ALSO needs `-f '[q]emu-pebble'` (argv match), NOT `-x qemu-pebble`
+  //     (comm match): the time-shim wrapper launches qemu as a `#!/bin/sh` script,
+  //     so until it `exec`s the real binary its comm is `sh`/`dash` — `-x` would
+  //     miss it and leave a stale process holding RFB :5901, causing the next
+  //     boot to die on "address already in use". The argv carries the wrapper
+  //     PATH (…/qemu-pebble) in both the pre- and post-exec states, so `-f` reaps
+  //     it either way.
   //
   // ORDER MATTERS: the `emu-control --vnc` session SUPERVISES qemu and respawns it
   // if killed alone, so we kill the supervisor FIRST, then qemu/websockify/pypkjs,
@@ -420,7 +440,7 @@ function makeKillAll(shell: Shell) {
   // to catch anything that respawned in the race window, then delete the state file.
   const sweep =
     `pkill -9 -f '[e]mu-control' 2>/dev/null; ` +
-    `pkill -9 -x qemu-pebble 2>/dev/null; ` +
+    `pkill -9 -f '[q]emu-pebble' 2>/dev/null; ` +
     `pkill -9 -f '[w]ebsockify' 2>/dev/null; ` +
     `pkill -9 -f '[m] pypkjs' 2>/dev/null; ` +
     `pebble kill 2>/dev/null; true`;

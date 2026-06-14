@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+import { spawn } from "node:child_process";
+import { createServer, type Server } from "node:net";
 import {
   parseBridgePids,
   buildHealthCommand,
@@ -154,6 +156,116 @@ describe("buildHealthCommand", () => {
 
   it("emits echo DEAD on failure paths", () => {
     expect(buildHealthCommand(pids)).toContain("echo DEAD");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildHealthCommand — EXECUTED behaviour (the real bug)
+//
+// The relaunch-loop bug (v0.0.13.10): on the Windows→wsl.exe path the first
+// health poll reported `DEAD pid` while the emulator was demonstrably alive
+// (the qemu/pypkjs processes survived long after the app gave up). The
+// /proc/<pid> liveness read is fragile across the shell boundary, so a single
+// unreadable read tore down a healthy, port-reachable bridge.
+//
+// CONTRACT: a reachable pypkjs port is authoritative proof the bridge is alive.
+// If the port answers, the verdict MUST be OK regardless of what the /proc
+// pid reads say. `DEAD pid` is only legitimate when the port is ALSO down.
+// These tests execute the generated command against controlled pids/ports.
+// ---------------------------------------------------------------------------
+
+/** Open a TCP server on 127.0.0.1 and resolve its port. */
+function openPort(): Promise<{ port: number; server: Server }> {
+  return new Promise((resolve) => {
+    const server = createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      resolve({ port: typeof addr === "object" && addr ? addr.port : 0, server });
+    });
+  });
+}
+
+/** Reserve a port number then immediately free it — guaranteed-closed for the test window. */
+function closedPort(): Promise<number> {
+  return new Promise((resolve) => {
+    const server = createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+/** Spawn a short-lived process, kill it, and return its now-dead pid. */
+function deadPid(): Promise<number> {
+  return new Promise((resolve) => {
+    const child = spawn("sleep", ["30"]);
+    const pid = child.pid!;
+    child.on("exit", () => resolve(pid));
+    // Give it a tick to actually be running, then kill so /proc/<pid> disappears.
+    setTimeout(() => child.kill("SIGKILL"), 50);
+  });
+}
+
+/** Run the health one-liner through bash and return its trimmed stdout token. */
+function runHealthCmd(cmd: string): Promise<string> {
+  return new Promise((resolve) => {
+    const child = spawn("bash", ["-lc", cmd]);
+    let out = "";
+    child.stdout.on("data", (d) => (out += d.toString()));
+    child.on("close", () => resolve(out.trim()));
+  });
+}
+
+describe("buildHealthCommand executed against real pids/ports", () => {
+  const ALIVE = process.pid; // the test process is, by definition, alive.
+
+  it("returns OK when both pids are alive and the port is reachable", async () => {
+    const { port, server } = await openPort();
+    try {
+      const out = await runHealthCmd(buildHealthCommand({ qemuPid: ALIVE, pypkjsPid: ALIVE, pypkjsPort: port }));
+      expect(out).toBe("OK");
+    } finally {
+      server.close();
+    }
+  });
+
+  // THE REGRESSION TEST for the relaunch loop: a dead/unreadable pid must NOT
+  // produce `DEAD pid` while the port still answers.
+  it("returns OK (NOT DEAD pid) when the qemu pid is unreadable but the port is reachable", async () => {
+    const { port, server } = await openPort();
+    const gonePid = await deadPid();
+    try {
+      const out = await runHealthCmd(buildHealthCommand({ qemuPid: gonePid, pypkjsPid: ALIVE, pypkjsPort: port }));
+      expect(out).toBe("OK");
+    } finally {
+      server.close();
+    }
+  });
+
+  it("returns OK when the pypkjs pid is unreadable but the port is reachable", async () => {
+    const { port, server } = await openPort();
+    const gonePid = await deadPid();
+    try {
+      const out = await runHealthCmd(buildHealthCommand({ qemuPid: ALIVE, pypkjsPid: gonePid, pypkjsPort: port }));
+      expect(out).toBe("OK");
+    } finally {
+      server.close();
+    }
+  });
+
+  it("returns DEAD pid when a pid is gone AND the port is unreachable (a real death)", async () => {
+    const port = await closedPort();
+    const gonePid = await deadPid();
+    const out = await runHealthCmd(buildHealthCommand({ qemuPid: gonePid, pypkjsPid: ALIVE, pypkjsPort: port }));
+    expect(out).toBe("DEAD pid");
+  });
+
+  it("returns DEAD port when both pids are alive but the port is unreachable (pypkjs hung)", async () => {
+    const port = await closedPort();
+    const out = await runHealthCmd(buildHealthCommand({ qemuPid: ALIVE, pypkjsPid: ALIVE, pypkjsPort: port }));
+    expect(out).toBe("DEAD port");
   });
 });
 
