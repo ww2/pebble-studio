@@ -9,6 +9,9 @@ export function tasklistArgs(imageName: string): string[] {
  * True iff `tasklist` output contains at least one real process row. When nothing
  * matches, tasklist prints an "INFO: No tasks…" banner (to stdout) instead of CSV
  * rows; a real row is a quoted CSV line beginning with the image name.
+ *
+ * Assumes `imageName` ends in `.exe` (always true for the qemu/websockify images
+ * this checks); a row whose image name has no `.exe` suffix is treated as not-alive.
  */
 export function parseTasklistAlive(stdout: string): boolean {
   if (!stdout) return false;
