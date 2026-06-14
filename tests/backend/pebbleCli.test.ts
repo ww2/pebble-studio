@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  installCmd, buttonCmd, accelTapCmd, setTimeCmd, timeFormatCmd, btCmd, batteryCmd, screenshotCmd, bootCmd, wipeCmd, timelineQuickViewCmd, setTzOffsetCmd,
+  installCmd, buttonCmd, accelTapCmd, setTimeCmd, timeFormatCmd, btCmd, batteryCmd, screenshotCmd, bootCmd, wipeCmd, timelineQuickViewCmd, setTzOffsetCmd, winSetTzOffsetArgv,
 } from "../../src/main/backend/pebbleCli.js";
 
 describe("pebbleCli argv builders", () => {
@@ -100,5 +100,30 @@ describe("setTzOffsetCmd", () => {
     const c = setTzOffsetCmd(540, "Asia/Tokyo; rm -rf /");
     expect(c.args[1]).not.toContain("rm -rf");
     expect(c.args[1]).toContain("UTC+9");
+  });
+});
+
+describe("winSetTzOffsetArgv", () => {
+  const py = "C:\\py\\python.exe";
+  const helper = "C:\\Users\\x\\.pebble-studio\\pb-set-tz.py";
+
+  it("builds an argv (no shell) invoking python on the helper with offset + zone", () => {
+    const c = winSetTzOffsetArgv({ pythonExe: py, helperPath: helper, offsetMin: -240, tzName: "America/New_York" });
+    expect(c.cmd).toBe(py);
+    expect(c.args).toEqual([helper, "-240", "America/New_York"]);
+  });
+
+  it("synthesizes a UTC±h name when no zone is given", () => {
+    expect(winSetTzOffsetArgv({ pythonExe: py, helperPath: helper, offsetMin: 540 }).args[2]).toBe("UTC+9");
+    expect(winSetTzOffsetArgv({ pythonExe: py, helperPath: helper, offsetMin: -240 }).args[2]).toBe("UTC-4");
+  });
+
+  it("rejects an unsafe zone name and falls back to the synthesized UTC±h", () => {
+    const c = winSetTzOffsetArgv({ pythonExe: py, helperPath: helper, offsetMin: 540, tzName: "Asia/Tokyo; rm -rf /" });
+    expect(c.args[2]).toBe("UTC+9");
+  });
+
+  it("truncates a fractional offset to an integer string", () => {
+    expect(winSetTzOffsetArgv({ pythonExe: py, helperPath: helper, offsetMin: 90.7 }).args[1]).toBe("90");
   });
 });

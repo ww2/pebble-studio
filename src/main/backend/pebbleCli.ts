@@ -123,6 +123,28 @@ export function setTzOffsetCmd(offsetMin: number, tzName?: string): PebbleComman
   return { cmd: "bash", args: ["-lc", oneLiner] };
 }
 
+export interface WinSetTzOffsetOpts {
+  /** Absolute path to the Python interpreter that has pebble-tool's libpebble2. */
+  pythonExe: string;
+  /** Absolute path to the deployed pb-set-tz.py helper. */
+  helperPath: string;
+  offsetMin: number;
+  tzName?: string;
+}
+
+/**
+ * Windows-native form of setTzOffset: a direct argv (cmd=python, no shell) that
+ * runs the same pb-set-tz.py helper used by the POSIX path. No bash, no base64,
+ * no quoting hops — so the v0.0.12 "quote-free" rule is N/A here (nothing crosses
+ * a shell). The zone name is still validated shell-safe for defense in depth and
+ * to keep behavior identical to the POSIX path's synthesized UTC±h fallback.
+ */
+export function winSetTzOffsetArgv(o: WinSetTzOffsetOpts): PebbleCommand {
+  const off = Math.trunc(o.offsetMin);
+  const name = shellSafeZoneName(o.tzName, off);
+  return { cmd: o.pythonExe, args: [o.helperPath, String(off), name] };
+}
+
 /** Toggle the timeline quick-view (peek) on the watchface. Real CLI:
  * pebble emu-set-timeline-quick-view {on|off} */
 export function timelineQuickViewCmd(on: boolean): PebbleCommand {
