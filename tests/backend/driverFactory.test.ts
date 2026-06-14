@@ -19,4 +19,32 @@ describe("selectDriverKind", () => {
   it("honors an explicit override", () => {
     expect(selectDriverKind({ ...base, override: "wsl", wslAvailable: true })).toBe("wsl");
   });
+
+  it("prefers windows-native on win32 when pebble.exe AND qemu(.exe)/PEBBLE_QEMU_PATH resolve", () => {
+    expect(
+      selectDriverKind({ ...base, platform: "win32", nativePebbleOnPath: true, nativeQemuOnPath: true }),
+    ).toBe("windows-native");
+  });
+
+  it("on win32 falls back to wsl when native qemu is absent but wsl exists", () => {
+    expect(
+      selectDriverKind({ ...base, platform: "win32", nativePebbleOnPath: true, nativeQemuOnPath: false, wslAvailable: true }),
+    ).toBe("wsl");
+  });
+
+  it("honors an explicit windows-native override when win tools are present", () => {
+    expect(
+      selectDriverKind({ ...base, platform: "win32", override: "windows-native", nativePebbleOnPath: true, nativeQemuOnPath: true }),
+    ).toBe("windows-native");
+  });
+
+  it("throws if windows-native is overridden but win tools are missing", () => {
+    expect(() =>
+      selectDriverKind({ ...base, platform: "win32", override: "windows-native", nativePebbleOnPath: false, nativeQemuOnPath: false }),
+    ).toThrow(/windows-native.*not found/i);
+  });
+
+  it("keeps native (Linux) selection unchanged", () => {
+    expect(selectDriverKind({ ...base, nativePebbleOnPath: true, nativeQemuOnPath: true })).toBe("native");
+  });
 });
