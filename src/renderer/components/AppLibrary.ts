@@ -146,6 +146,12 @@ export class AppLibrary {
   }
 
   /** Open the native file picker and install whatever the user selects. */
+  /** Public entry point for the File → Install PBW… menu item. */
+  async pickAndInstall(): Promise<void> { await this.handlePick(); }
+
+  /** Public entry point for the File → Clear Emulator menu item. */
+  async clearEmulator(): Promise<void> { await this.handleClear(); }
+
   private async handlePick(): Promise<void> {
     this.errorMsg.textContent = "";
     const paths = await window.studio.pickPbw();

@@ -2,6 +2,7 @@ import { resolveTheme, applyTheme } from "./theme.js";
 import { EmulatorView } from "./components/EmulatorView.js";
 import { VersionSwitcher } from "./components/VersionSwitcher.js";
 import { AppLibrary } from "./components/AppLibrary.js";
+import { ChangelogModal } from "./components/ChangelogModal.js";
 import { CaptureBar } from "./components/CaptureBar.js";
 import { NavRail } from "./components/NavRail.js";
 import { SettingsPane } from "./components/SettingsPane.js";
@@ -50,6 +51,9 @@ interface StudioApi {
   // RAW still-percent-encoded close fragment ("" = cancelled).
   clayPhonesimPort(): Promise<number | null>;
   clayOpenWindow(url: string): Promise<string>;
+  // v1.0.0: app version + application-menu action subscription.
+  appVersion(): Promise<string>;
+  onMenu(cb: (action: string) => void): () => void;
 }
 
 declare global {
@@ -131,6 +135,18 @@ const library = new AppLibrary(
   (platformId: string) => view.reconnectAfterClear(platformId as PlatformId),
   () => view.isLive(),
 );
+
+// Application-menu wiring (v1.0.0): File → Install PBW / Clear Emulator reuse the
+// AppLibrary flows; Help → What's New opens the changelog modal.
+const changelogModal = new ChangelogModal(() => window.studio.appVersion());
+// Disposer kept for the app lifetime (renderer is a singleton); stored rather
+// than discarded so the subscription is explicit and test-cleanable.
+const disposeMenu = window.studio.onMenu((action) => {
+  if (action === "install-pbw") void library.pickAndInstall();
+  else if (action === "clear-emulator") void library.clearEmulator();
+  else if (action === "changelog") void changelogModal.open();
+});
+window.addEventListener("beforeunload", () => disposeMenu());
 const captureBar = new CaptureBar(
   () => document.querySelector<HTMLElement>("#emu-screen"),
   () => getPlatform(switcher.value as PlatformId).round,

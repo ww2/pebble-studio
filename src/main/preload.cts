@@ -48,6 +48,14 @@ const studio = {
   // unfocused (the default); pass true to allow Electron's normal throttling.
   setBackgroundThrottling: (throttle: boolean): Promise<void> =>
     ipcRenderer.invoke("app:setBackgroundThrottling", throttle),
+  // App version (v1.0.0) — for the Help → What's New modal header.
+  appVersion: (): Promise<string> => ipcRenderer.invoke("app:version"),
+  // Subscribe to application-menu actions (v1.0.0). Returns a disposer.
+  onMenu: (cb: (action: string) => void): (() => void) => {
+    const handler = (_e: unknown, action: string): void => cb(action);
+    ipcRenderer.on("menu:action", handler);
+    return () => ipcRenderer.removeListener("menu:action", handler);
+  },
   // Subscribe to boot-progress notes (Task J). Returns a disposer that removes
   // the listener.
   onBootProgress: (cb: (msg: string) => void): (() => void) => {

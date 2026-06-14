@@ -11,6 +11,7 @@ extraResources:
     to: timeshim
     filter: ["timeshim.c", "timeshim-x86_64.so"]
 win:
+  icon: build/icon.ico
   target:
     - dir
   artifactName: "Pebble Studio ${version}.${ext}"

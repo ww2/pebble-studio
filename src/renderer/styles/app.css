@@ -718,16 +718,35 @@ body {
 .emu-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  /* Center the groups so a wrapped line sits centered (not left-justified). */
+  justify-content: center;
+  /* The 12px gap holds the inter-group divider (drawn in it via ::before). */
+  gap: 12px;
   flex-wrap: wrap;
 }
 
-/* Separator between Tap/Shake and lifecycle buttons */
-.emu-actions-sep {
+/* Each logical group (Tap/Shake · Timeline/Backlight · Relaunch/Force-close)
+   stays on one line and wraps as a single unit (no internal wrap). */
+.emu-action-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  position: relative; /* anchors the ::before divider */
+}
+
+/* Inter-group divider: a 1px line drawn in the gap to the group's LEFT. It is
+   absolutely positioned (zero layout footprint) so showing/hiding it never
+   changes wrapping. JS adds `has-divider` only to groups that share a row with
+   the previous group, so the divider disappears wherever the row wraps. */
+.emu-action-group.has-divider::before {
+  content: "";
+  position: absolute;
+  left: -6px; /* centered in the 12px inter-group gap */
+  top: 50%;
+  transform: translateY(-50%);
   width: 1px;
   height: 22px;
   background: var(--border);
-  margin: 0 2px;
 }
 
 /* Danger-tinted subtle button for Force-close */
@@ -1371,3 +1390,28 @@ body {
 }
 .stage-col::-webkit-scrollbar-thumb:hover,
 .inspector::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); background-clip: padding-box; }
+
+/* Changelog / What's New modal (Help menu). */
+.cl-overlay {
+  position: fixed; inset: 0; z-index: 50;
+  display: grid; place-items: center;
+  background: rgba(0, 0, 0, 0.5);
+}
+.cl-card {
+  width: min(560px, 92vw); max-height: 80vh; display: flex; flex-direction: column;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-card);
+  box-shadow: var(--elev-1); overflow: hidden;
+}
+.cl-head { display: flex; align-items: center; gap: 12px; padding: 16px 18px; border-bottom: 1px solid var(--border); }
+.cl-title { flex: 1; }
+.cl-version { color: var(--text-secondary); font-size: var(--type-caption); }
+.cl-close { border: none; background: transparent; color: var(--text-secondary); font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: var(--radius-control); }
+.cl-close:hover { background: var(--control-hover); color: var(--text); }
+.cl-body { padding: 8px 18px 18px; overflow-y: auto; }
+.cl-entry { padding: 12px 0; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
+.cl-entry:last-child { border-bottom: none; }
+.cl-entry-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+.cl-ev { font-weight: 700; color: var(--accent); }
+.cl-entry ul { margin: 4px 0 0; padding-left: 18px; }
+.cl-entry li { margin: 2px 0; }

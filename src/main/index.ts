@@ -1,7 +1,8 @@
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, dialog } from "electron";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { registerIpc } from "./ipc.js";
+import { buildMenuTemplate } from "./menu.js";
 
 // This file is bundled to CommonJS (dist/main/index.cjs) by esbuild, where
 // `__dirname` is a native global. The ambient declare keeps it typechecking
@@ -65,6 +66,9 @@ function createWindow(): void {
     title: "Pebble Studio",
     width: 1100,
     height: 760,
+    // dist/main/index.cjs -> <repo>/build/icon.png (dev/taskbar parity; the
+    // packaged .exe icon comes from electron-builder win.icon).
+    icon: join(__dirname, "..", "..", "build", "icon.png"),
     // Hidden until the renderer has finished loading; we then swap from the
     // splash to this fully-painted window in one step.
     show: false,
@@ -174,12 +178,46 @@ function createWindow(): void {
   }
 }
 
+// Build + install the application menu (File/Edit/Window/Help). Menu actions are
+// forwarded to the renderer as `menu:action` events; Clear Emulator confirms via
+// a native dialog first. Reuses the existing install/clear IPC flows downstream.
+function setupApplicationMenu(): void {
+  const send = (action: string): void => {
+    mainWindow?.webContents.send("menu:action", action);
+  };
+  const menu = Menu.buildFromTemplate(
+    buildMenuTemplate(
+      {
+        installPbw: () => send("install-pbw"),
+        clearEmulator: () => {
+          if (!mainWindow) return;
+          const choice = dialog.showMessageBoxSync(mainWindow, {
+            type: "warning",
+            buttons: ["Cancel", "Clear"],
+            defaultId: 0,
+            cancelId: 0,
+            title: "Clear Emulator",
+            message: "Clear the emulator?",
+            detail:
+              "This wipes all installed apps from the running watch and reboots it. Your PBW library is kept.",
+          });
+          if (choice === 1) send("clear-emulator");
+        },
+        showChangelog: () => send("changelog"),
+      },
+      app.getVersion(),
+    ),
+  );
+  Menu.setApplicationMenu(menu);
+}
+
 // Only stand up the app when we hold the single-instance lock. Without it the
 // second instance has already called app.quit() above.
 if (gotSingleInstanceLock) {
   app.whenReady().then(() => {
     registerIpc(() => mainWindow);
     createWindow();
+    setupApplicationMenu();
 
     app.on("activate", () => {
       // macOS: re-create a window when the dock icon is clicked and none are open.

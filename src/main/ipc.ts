@@ -197,6 +197,8 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     console.log(`[backend] initialized kind=${kind}`);
     return { kind };
   });
+  // App version (v1.0.0) — surfaced in the Help → What's New modal.
+  ipcMain.handle("app:version", () => app.getVersion());
   ipcMain.handle("emu:start", async (e, id: PlatformId) => {
     currentPlatform = id; // remembered for clay:phonesimPort's state-file lookup
     // Fresh token per boot, stored as current so abort/stop can cancel it.
