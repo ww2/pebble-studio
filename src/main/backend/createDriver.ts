@@ -52,16 +52,28 @@ async function qemuAvailable(): Promise<boolean> {
   // Probe the Windows bundled SDK location (win32 only).
   if (process.platform === "win32") {
     const local = process.env.LOCALAPPDATA ?? "";
-    const sdkQemu = `${local}\\pebble-sdk\\SDKs\\current\\toolchain\\bin\\qemu-pebble.exe`;
-    try { await access(sdkQemu); return true; } catch { /* fall through */ }
+    const winSdkQemu = `${local}\\pebble-sdk\\SDKs\\current\\toolchain\\bin\\qemu-pebble.exe`;
+    try {
+      await access(winSdkQemu);
+      return true;
+    } catch {
+      /* fall through */
+    }
   }
 
   return false;
 }
 
-/** Maps a driver kind to its class (used by createDriver + a construction test). */
-export function driverClassForKind(kind: DriverKind): unknown {
-  return kind === "native" ? NativeDriver : kind === "wsl" ? WslDriver : WindowsNativeDriver;
+type DriverClass = typeof NativeDriver | typeof WslDriver | typeof WindowsNativeDriver;
+
+/** Maps a driver kind to its class (used by createDriver + a construction test).
+ * The `never` guard makes a new DriverKind member a compile error here. */
+export function driverClassForKind(kind: DriverKind): DriverClass {
+  if (kind === "native") return NativeDriver;
+  if (kind === "wsl") return WslDriver;
+  if (kind === "windows-native") return WindowsNativeDriver;
+  const _never: never = kind;
+  throw new Error(`Unknown driver kind: ${String(_never)}`);
 }
 
 export async function createDriver(override?: DriverKind): Promise<{ driver: BackendDriver; kind: DriverKind }> {
