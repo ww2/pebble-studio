@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { EMU_INFO_PATH, EMU_LOG_PATH, SDK_ROOT } from "../../src/main/backend/hostPaths.js";
+import { winHostPaths } from "../../src/main/backend/hostPaths.js";
 
 describe("hostPaths", () => {
   it("exports POSIX-shaped, quote-free, space-free path strings", () => {
@@ -18,5 +19,25 @@ describe("hostPaths", () => {
     expect(EMU_INFO_PATH).toBe("/tmp/pb-emulator.json");
     expect(EMU_LOG_PATH).toBe("/tmp/pebble-emu.log");
     expect(SDK_ROOT).toBe("$HOME/.local/share/pebble-sdk/SDKs/current");
+  });
+});
+
+describe("winHostPaths", () => {
+  const env = { TEMP: "C:\\Temp", LOCALAPPDATA: "C:\\Users\\x\\AppData\\Local" };
+
+  it("places the state + log files under %TEMP% (matches pebble-tool's tempfile.gettempdir)", () => {
+    const p = winHostPaths(env);
+    expect(p.emuInfo).toBe("C:\\Temp\\pb-emulator.json");
+    expect(p.emuLog).toBe("C:\\Temp\\pebble-emu.log");
+  });
+
+  it("places the SDK root under %LOCALAPPDATA%", () => {
+    expect(winHostPaths(env).sdkRoot).toBe("C:\\Users\\x\\AppData\\Local\\pebble-sdk\\SDKs\\current");
+  });
+
+  it("falls back to a sane default when env vars are missing", () => {
+    const p = winHostPaths({});
+    expect(p.emuInfo.endsWith("pb-emulator.json")).toBe(true);
+    expect(p.sdkRoot.endsWith("SDKs\\current")).toBe(true);
   });
 });
