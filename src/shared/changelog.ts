@@ -13,6 +13,9 @@ export interface ChangelogEntry {
 export const CHANGELOG: ChangelogEntry[] = [
   // The 2.x line is the native-Windows track (no WSL); the 1.x line is the
   // WSL-connected track. 2.0.1 is the first native release.
+  { version: "2.1.1", date: "2026-06-14", changes: [
+    "Fixed custom time snapping back to system time a few seconds after being set — the emulator was re-reading the real clock through a code path the time shim wasn't covering yet.",
+  ]},
   { version: "2.1.0", date: "2026-06-14", changes: [
     "Custom time, freeze, and time-rate (2×/4×/10×) now work on native Windows — set any date 1970–2099 in Settings → Time and it applies live on the watch.",
     "App settings (the ⚙ Clay gear) now open on native Windows — fixed the emulator-port lookup that made the gear do nothing.",

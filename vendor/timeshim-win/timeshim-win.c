@@ -122,18 +122,44 @@ static void check_ctl_file(int64_t real) {
     }
 }
 
-static void fill_fake(LPFILETIME ft) {
+/* Current fake time in 100ns FILETIME units (locked). */
+static int64_t fake_100ns(void) {
     EnterCriticalSection(&g_lock);
     int64_t real = real_now_100ns();
     check_ctl_file(real);
     int64_t f = fake_now_locked(real);
     LeaveCriticalSection(&g_lock);
-    i64_to_ft(f, ft);
+    return f;
 }
 
-/* Replacement exports — same signature as the originals (return void). */
+static void fill_fake(LPFILETIME ft) {
+    i64_to_ft(fake_100ns(), ft);
+}
+
+/* Current fake time in unix seconds (for the CRT time() family). */
+static int64_t fake_unix_seconds(void) {
+    return (fake_100ns() - EPOCH_DIFF_100NS) / TEN_MILLION;
+}
+
+/* Replacement KERNEL32 exports — same signature as the originals (return void). */
 static void WINAPI Fake_GetSystemTimeAsFileTime(LPFILETIME ft) { if (ft) fill_fake(ft); }
 static void WINAPI Fake_GetSystemTimePreciseAsFileTime(LPFILETIME ft) { if (ft) fill_fake(ft); }
+
+/* Replacement msvcrt time sources. qemu-pebble imports _time64 + _time32 and
+ * calls them (via time()) to re-jam the firmware RTC; on Windows the CRT reads
+ * these straight from KUSER_SHARED_DATA, bypassing the KERNEL32 hooks above, so
+ * WITHOUT faking them the watch snapped back to real time a few seconds after a
+ * custom set. __cdecl (one x64 convention); time_t* in/out like the originals. */
+static long long __cdecl Fake_time64(long long *t) {
+    long long s = (long long)fake_unix_seconds();
+    if (t) *t = s;
+    return s;
+}
+static long __cdecl Fake_time32(long *t) {
+    long s = (long)fake_unix_seconds();
+    if (t) *t = s;
+    return s;
+}
 
 /* Overwrite the first 14 bytes of `target` with an absolute jmp to `hook`:
  *   FF 25 00000000     jmp qword ptr [rip+0]
@@ -186,6 +212,16 @@ static void init_once(void) {
     install_jmp((void *)realGetTime, (void *)Fake_GetSystemTimeAsFileTime);
     if (realPrecise)
         install_jmp(realPrecise, (void *)Fake_GetSystemTimePreciseAsFileTime);
+
+    /* Also hook the CRT time() sources qemu imports from msvcrt. msvcrt is mapped
+     * by the time we run (our own DLL imports it), so GetModuleHandle succeeds. */
+    HMODULE crt = GetModuleHandleW(L"msvcrt.dll");
+    if (crt) {
+        void *t64 = (void *)GetProcAddress(crt, "_time64");
+        void *t32 = (void *)GetProcAddress(crt, "_time32");
+        if (t64) install_jmp(t64, (void *)Fake_time64);
+        if (t32) install_jmp(t32, (void *)Fake_time32);
+    }
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
