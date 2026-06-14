@@ -4,3 +4,12 @@ dist/
 .DS_Store
 release/
 test-results/
+
+# Native-Windows self-contained runtime bundles (large; shipped as release assets,
+# not committed). Reproducible from the build scripts / docs:
+#  - qemu-pebble-win  (~34 MB)  docs/build/windows-qemu-msys2.md
+#  - pebble-py        (~191 MB) scripts/build-pebble-py.ps1 (relocatable Python + patched pebble-tool)
+#  - pebble-sdk       (~109 MB) clean sdk-core copied per docs/handoff/...CONTINUE.md Step 6
+vendor/qemu-pebble-win/
+vendor/pebble-py/
+vendor/pebble-sdk/

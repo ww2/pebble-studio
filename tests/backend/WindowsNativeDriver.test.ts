@@ -1,5 +1,9 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { WindowsNativeDriver } from "../../src/main/backend/WindowsNativeDriver.js";
+import { _resetWinShimState } from "../../src/main/backend/winTimeShim.js";
 
 const ep = { host: "localhost", port: 6080, wsPath: "/" };
 
@@ -17,6 +21,24 @@ describe("WindowsNativeDriver", () => {
     expect(calls[0].args).not.toContain("-lc");          // NOT wrapped in bash -lc
   });
 
+  it("routes discrete pebble commands through the injected bundled invocation (python + run_tool + env)", async () => {
+    const calls: { cmd: string; args: string[]; env?: Record<string, string> }[] = [];
+    const run = vi.fn(async (cmd: string, args: string[], env?: Record<string, string>) => { calls.push({ cmd, args, env }); return { code: 0, stdout: "", stderr: "" }; });
+    const pebble = (args: string[]) => ({
+      cmd: "C:\\py\\python.exe",
+      args: ["-c", "from pebble_tool import run_tool; run_tool()", ...args],
+      env: { PEBBLE_QEMU_PATH: "C:\\q\\qemu-pebble.exe", XDG_DATA_HOME: "C:\\data\\pebble-data" },
+    });
+    const d = new WindowsNativeDriver({ run, pebble, boot: async () => ep, stop: async () => {} });
+    d.setPlatform("basalt");
+    await d.button("up", "press");
+    expect(calls[0].cmd).toBe("C:\\py\\python.exe");
+    expect(calls[0].args.slice(0, 2)).toEqual(["-c", "from pebble_tool import run_tool; run_tool()"]);
+    expect(calls[0].args).toContain("emu-button");
+    expect(calls[0].args).toContain("--vnc");           // inner NativeDriver still injects --vnc
+    expect(calls[0].env?.PEBBLE_QEMU_PATH).toBe("C:\\q\\qemu-pebble.exe");
+  });
+
   it("normalizes a Windows .pbw path with winPath on install (no /mnt translation)", async () => {
     const calls: string[][] = [];
     const run = vi.fn(async (_c: string, args: string[]) => { calls.push(args); return { code: 0, stdout: "", stderr: "" }; });
@@ -26,17 +48,48 @@ describe("WindowsNativeDriver", () => {
     expect(calls[0]).toContain("C:\\Users\\Jane Doe\\My Watch.pbw");
   });
 
-  it("reports the time shim as unavailable (no LD_PRELOAD on Windows)", async () => {
+  it("reports the time shim as unavailable when no timeShim dep is wired", async () => {
     const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
     const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {} });
     expect(await d.ensureTimeShim()).toBe(false);
   });
 
-  it("setFakeTime is a no-op that resolves (legacy utc_offset path drives time)", async () => {
+  it("setFakeTime is a no-op that resolves when no timeShim dep is wired", async () => {
     const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
     const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {} });
     await expect(d.setFakeTime(123, 0)).resolves.toBeUndefined();
     expect(run).not.toHaveBeenCalled();
+  });
+
+  describe("with the injected-DLL time shim wired", () => {
+    beforeEach(() => _resetWinShimState());
+
+    it("ensureTimeShim is false when the bundled shim files are absent (graceful)", async () => {
+      const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+      const d = new WindowsNativeDriver({
+        run, boot: async () => ep, stop: async () => {},
+        timeShim: {
+          paths: { dll: "C:\\nope\\timeshim-win.dll", launcher: "C:\\nope\\launcher.exe", probe: "C:\\nope\\probe.exe" },
+          ctlPath: join(tmpdir(), "pb-faketime-test.ctl"),
+        },
+      });
+      expect(await d.ensureTimeShim()).toBe(false);
+    });
+
+    it("setFakeTime writes the control file the DLL reads ('<target> <rate>')", async () => {
+      const ctlPath = join(tmpdir(), `pb-faketime-${process.pid}.ctl`);
+      await rm(ctlPath, { force: true });
+      const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+      const d = new WindowsNativeDriver({
+        run, boot: async () => ep, stop: async () => {},
+        timeShim: { paths: { dll: "d", launcher: "l", probe: "p" }, ctlPath },
+      });
+      await d.setFakeTime(1577836800, 0); // freeze at 2020-01-01
+      expect(await readFile(ctlPath, "utf8")).toBe("1577836800 0");
+      await d.setFakeTime(null, 10); // rate-only
+      expect(await readFile(ctlPath, "utf8")).toBe("- 10");
+      await rm(ctlPath, { force: true });
+    });
   });
 
   it("setTzOffset runs the python helper argv when paths are configured", async () => {

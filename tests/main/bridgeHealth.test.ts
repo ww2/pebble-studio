@@ -218,7 +218,11 @@ function runHealthCmd(cmd: string): Promise<string> {
   });
 }
 
-describe("buildHealthCommand executed against real pids/ports", () => {
+// These execute the generated bash one-liner against a real Linux /proc + /dev/tcp,
+// so they require a POSIX host (bash, sleep, /proc). They run on the Linux/WSL dev
+// host but are skipped on the Windows host. The command-string structure itself is
+// covered by the platform-agnostic "buildHealthCommand" describe above.
+describe.skipIf(process.platform === "win32")("buildHealthCommand executed against real pids/ports", () => {
   const ALIVE = process.pid; // the test process is, by definition, alive.
 
   it("returns OK when both pids are alive and the port is reachable", async () => {

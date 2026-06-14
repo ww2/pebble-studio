@@ -2,15 +2,24 @@ import type { PlatformId } from "../../shared/types.js";
 import type { BootToken, SpawnDeps, BootProbe } from "./bootEmulator.js";
 import { BootAborted } from "./bootEmulator.js";
 import { winHostPaths } from "./hostPaths.js";
-import { tasklistArgs, parseTasklistAlive, taskkillByImageArgs } from "./winProc.js";
+import { tasklistArgs, parseTasklistAlive, taskkillByImageArgs, taskkillByPidArgs, parseStatePids } from "./winProc.js";
 import { connect as netConnect } from "node:net";
-import { readFile as fsReadFile, rm as fsRm, mkdir, copyFile } from "node:fs/promises";
+import { readFile as fsReadFile, rm as fsRm } from "node:fs/promises";
+import type { PebbleCommand } from "./pebbleCli.js";
 
 const VNC_RFB_PORT = 5901;
 const WS_PORT = 6080;
 
 /** Argv runner (shell:false). Injected so tests don't spawn real processes. */
-export type WinRunner = (cmd: string, args: string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+export type WinRunner = (cmd: string, args: string[], env?: Record<string, string>) => Promise<{ code: number; stdout: string; stderr: string }>;
+
+/**
+ * Builds the bundled pebble-tool invocation for a given pebble argv (see
+ * winRuntime.pebbleCmd: cmd=bundled python, args prefixed with run_tool(), env
+ * carrying PEBBLE_QEMU_PATH + XDG_DATA_HOME). Injected by createDriver; the
+ * default below is bare `pebble` on PATH for non-bundled/legacy use.
+ */
+export type PebbleCmdBuilder = (args: string[]) => PebbleCommand;
 
 export interface WinBootDepsImpl {
   run: WinRunner;
@@ -19,8 +28,11 @@ export interface WinBootDepsImpl {
   /** Remove a file (ignore-missing). Injected for tests. */
   rm?: (path: string) => Promise<void>;
   /** Launch a long-running detached process (Job Object assignment lives here in
-   * production). Resolves once launched. Injected for tests. */
-  detachSpawn?: (cmd: string, args: string[]) => Promise<void>;
+   * production). The `env` (merged over process.env by the spawner) carries the
+   * bundled-pebble runtime env. Resolves once launched. Injected for tests. */
+  detachSpawn?: (cmd: string, args: string[], env?: Record<string, string>) => Promise<void>;
+  /** Build the bundled pebble-tool invocation. Defaults to bare `pebble` on PATH. */
+  pebble?: PebbleCmdBuilder;
   /** Override host paths (tests). Defaults to winHostPaths(). */
   paths?: { emuInfo: string; emuLog: string; sdkRoot: string };
   /**
@@ -58,6 +70,9 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps {
   const rm = impl.rm ?? (async (p: string) => { await fsRm(p, { force: true }).catch(() => {}); });
   // no real default — the production caller (createDriver) MUST provide this; the real impl needs detached-spawn + Job Object wiring.
   const detachSpawn = impl.detachSpawn ?? (async () => { throw new Error("detachSpawn not provided"); });
+  // Default: bare `pebble` on PATH (legacy / non-bundled). Production injects the
+  // bundled-python invocation (winRuntime.pebbleCmd) carrying the runtime env.
+  const pebble = impl.pebble ?? ((args: string[]): PebbleCommand => ({ cmd: "pebble", args }));
   const paths = impl.paths ?? winHostPaths();
   const checkPortOpen = impl.portOpen ?? portOpen;
 
@@ -96,11 +111,27 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps {
     });
   };
 
+  const safeRun = (cmd: string, args: string[]): Promise<unknown> =>
+    run(cmd, args).catch(() => ({ code: 0, stdout: "", stderr: "" }));
+
   const killAll = async (): Promise<void> => {
-    await run("taskkill", taskkillByImageArgs("qemu-pebble.exe")).catch(() => ({ code: 0, stdout: "", stderr: "" }));
-    await run("taskkill", taskkillByImageArgs("websockify.exe")).catch(() => ({ code: 0, stdout: "", stderr: "" }));
+    // 1. Ask pebble-tool to kill the emulator FIRST. emu-control supervises qemu
+    //    and would respawn it if we killed qemu alone, so the clean shutdown must
+    //    bring the supervisor down before we force-kill the rest. Best-effort.
+    const k = pebble(["kill"]);
+    await run(k.cmd, k.args, k.env).catch(() => {});
+    // 2. Force-kill by PID from the state file. THE PROCESS-LEAK FIX: pypkjs AND
+    //    websockify both run as python.exe, so an image-only kill leaks them (and
+    //    we must not blanket-kill python.exe). The state file lists every pid we
+    //    own; /T also takes each pid's child tree.
+    const pids = parseStatePids(await readFile(paths.emuInfo));
+    for (const pid of pids) await safeRun("taskkill", taskkillByPidArgs(pid));
+    // 3. Backstop: kill any remaining qemu-pebble.exe by image (covers a pid a
+    //    partial/absent state-file write missed). Safe — that image is uniquely ours.
+    await safeRun("taskkill", taskkillByImageArgs("qemu-pebble.exe"));
     await rm(paths.emuInfo);
-    // taskkill /F is async; we settle on ports free as a proxy for exit (port is released on process exit on Windows). TODO(Phase-2): also confirm qemu-pebble.exe has exited via tasklist, analogous to waitUntilDead.
+    // taskkill /F is async; we settle on ports free as a proxy for exit (the port
+    // is released on process exit on Windows).
     // Settle: poll the ports free (best-effort; never hang).
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
@@ -109,22 +140,45 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps {
     }
   };
 
+  const preflight = async (): Promise<void> => {
+    // Runs ONCE before the boot retry loop, AFTER killAll has freed OUR stack. If
+    // the VNC/ws ports are STILL occupied, a FOREIGN process owns them — most
+    // commonly a WSL Pebble emulator (WSL2 mirrors localhost to Windows) or a
+    // second Pebble Studio instance. emu-control hardcodes -vnc :1 (5901), so we
+    // cannot pick alternate ports for v0.0.1; surface a clear, actionable error
+    // instead of letting the fresh qemu die on the cryptic "address already in use".
+    const [rfb, ws] = await Promise.all([
+      checkPortOpen("127.0.0.1", VNC_RFB_PORT),
+      checkPortOpen("127.0.0.1", WS_PORT),
+    ]);
+    if (!rfb && !ws) return;
+    const which = [rfb ? String(VNC_RFB_PORT) : null, ws ? String(WS_PORT) : null].filter(Boolean).join(" and ");
+    throw new Error(
+      `Emulator port ${which} is already in use by another process — likely a WSL Pebble emulator or a second Pebble Studio instance. Close it, then try again.`,
+    );
+  };
+
   const ensureKeymap = async (): Promise<void> => {
-    const dir = `${paths.sdkRoot}\\toolchain\\lib\\pc-bios\\keymaps`;
-    await mkdir(dir, { recursive: true }).catch(() => {});
-    // NOTE: no-op until the Windows SDK ships en-us at the pc-bios root (or a seeding step is added, analogous to the POSIX time-shim stub).
-    // Best-effort: a stub en-us keymap; the real qemu build ships its own.
-    await copyFile(`${dir}\\..\\en-us`, `${dir}\\en-us`).catch(() => {});
+    // No-op: keymaps are seeded ONCE at first-run provisioning
+    // (winSdkProvision.provisionWinSdk), which copies the qemu bundle's
+    // pc-bios\keymaps into the WRITABLE persist dir (XDG_DATA_HOME) that
+    // pebble-tool resolves SDKs\current against — the correct location. The old
+    // per-boot stub targeted winHostPaths().sdkRoot (%LOCALAPPDATA%), which the
+    // invocation contract does not use, so it never seeded the keymaps qemu reads.
   };
 
   return {
-    bootControl: (id: PlatformId) => detachSpawn("pebble", ["emu-control", "--emulator", id, "--vnc"]),
+    bootControl: (id: PlatformId) => {
+      const c = pebble(["emu-control", "--emulator", id, "--vnc"]);
+      return detachSpawn(c.cmd, c.args, c.env);
+    },
     ensureKeymap,
+    preflight,
     diagnose,
     waitForPort,
     waitForEmuInfo,
     killAll,
-    wipe: async () => { await run("pebble", ["wipe"]).catch(() => {}); },
+    wipe: async () => { const c = pebble(["wipe"]); await run(c.cmd, c.args, c.env).catch(() => {}); },
     readBootLog: async () => readFile(paths.emuLog),
   };
 }

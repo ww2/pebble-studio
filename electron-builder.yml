@@ -10,6 +10,21 @@ extraResources:
   - from: vendor/timeshim
     to: timeshim
     filter: ["timeshim.c", "timeshim-x86_64.so"]
+  # Native-Windows time shim: an injected DLL that fakes qemu's wall clock (the
+  # Windows analog of the LD_PRELOAD .so). launcher.exe wraps qemu via
+  # PEBBLE_QEMU_PATH and injects timeshim-win.dll; probe.exe is the self-test
+  # target. Resolved under resourcesPath/timeshim-win (packaged) or vendor/ (dev).
+  - from: vendor/timeshim-win
+    to: timeshim-win
+    filter: ["timeshim-win.dll", "launcher.exe", "probe.exe"]
+  # Native-Windows self-contained emulator stack. winRuntime.ts resolves each of
+  # these under process.resourcesPath when packaged (and under vendor/ in dev).
+  - from: vendor/qemu-pebble-win
+    to: qemu-pebble-win
+  - from: vendor/pebble-py
+    to: pebble-py
+  - from: vendor/pebble-sdk
+    to: pebble-sdk
 win:
   icon: build/icon.ico
   target:

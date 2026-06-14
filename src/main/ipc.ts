@@ -10,6 +10,12 @@ import { openClayWindow, parsePhonesimPort } from "./clayWindow.js";
 import { createBacklightController } from "./backend/backlight.js";
 import { makeTimeController, isNonSystemTime, detectHostTimezone, type TimeConfig } from "./backend/timeController.js";
 import { makeBridgeMonitor } from "./backend/bridgeMonitor.js";
+import { buildHealthCommand, interpretHealth } from "./backend/bridgeHealth.js";
+import { makeNativeHealthCheck } from "./backend/winBridgeHealth.js";
+import { winHostPaths } from "./backend/hostPaths.js";
+import { readPypkjsPort } from "./backend/winInputChannel.js";
+import { defaultCtx } from "./backend/winRuntime.js";
+import { ensureWinSdkProvisioned } from "./backend/winSdkProvision.js";
 import type { PlatformId, ButtonId } from "../shared/types.js";
 import { LibraryStore } from "./library.js";
 
@@ -119,16 +125,28 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
 
   // Bridge-health monitor (Task H4). Polls qemu + pypkjs health after every
   // successful boot; fires "emu:bridge-dead" to the renderer when the bridge dies.
+  // The POSIX (WSL / native-Linux) path runs the bash `/proc` + `/dev/tcp` probe
+  // through the matching shell. The windows-native path must NOT use a shell at
+  // all: on a Windows host `bash` resolves to the WSL launcher, so a bash probe
+  // would inspect WSL's stale state file + `/proc` (which never holds the native
+  // qemu/pypkjs pids) and falsely report DEAD pid — the v2.0.1 false-death loop.
   const bridgeShell = (): ReturnType<typeof makeNativeShell> =>
     driverKind === "wsl" ? makeWslShell() : makeNativeShell();
+  const nativeHealthCheck = makeNativeHealthCheck();
   const bridgeMonitor = makeBridgeMonitor({
     readEmuInfo: async () => {
+      if (driverKind === "windows-native") {
+        // Read the WINDOWS state file directly via Node fs (no bash/WSL).
+        const raw = await fs.readFile(winHostPaths().emuInfo, "utf8").catch(() => "");
+        return raw.trim() ? raw : null;
+      }
       const { code, stdout } = await bridgeShell().run(`cat ${EMU_INFO_PATH} 2>/dev/null`);
       return code === 0 && stdout.trim() ? stdout : null;
     },
-    runHealth: async (cmd) => {
-      const { code, stdout } = await bridgeShell().run(cmd);
-      return { code, stdout };
+    checkHealth: async (pids) => {
+      if (driverKind === "windows-native") return nativeHealthCheck(pids);
+      const { code, stdout } = await bridgeShell().run(buildHealthCommand(pids));
+      return interpretHealth(stdout, code);
     },
     onDead: (reason) => {
       // Target the main window explicitly (not getAllWindows()[0], which could
@@ -195,6 +213,32 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     driver = d;
     driverKind = kind;
     console.log(`[backend] initialized kind=${kind}`);
+    // First-run SDK provisioning for the native-Windows stack: the bundled SDK is
+    // read-only, so we materialise a writable copy under the app-data persist dir
+    // (the XDG_DATA_HOME the invocation contract points at) BEFORE any boot. Runs
+    // here at init — which the renderer awaits before enabling Launch — so the
+    // first emu:start always finds a ready SDK. Idempotent (cached), so this is a
+    // near-instant no-op on every launch after the first.
+    if (process.platform === "win32" && kind === "windows-native") {
+      try {
+        const ctx = await defaultCtx();
+        const res = await ensureWinSdkProvisioned(ctx, {
+          onProgress: (msg) => {
+            console.log(`[provision] ${msg}`);
+            getMainWindow()?.webContents.send("emu:boot-progress", msg);
+          },
+        });
+        console.log(`[provision] SDK ${res.version} ready at ${res.sdkCoreDir}`);
+      } catch (e) {
+        console.error(`[provision] FAILED: ${String(e)}`);
+        // Surface to the renderer so the failure isn't silent; boot would fail
+        // anyway without a provisioned SDK.
+        getMainWindow()?.webContents.send(
+          "emu:boot-progress",
+          `SDK provisioning failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
     return { kind };
   });
   // App version (v1.0.0) — surfaced in the Help → What's New modal.
@@ -288,9 +332,17 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // the config page in a locked-down child window.
   ipcMain.handle("clay:phonesimPort", async (): Promise<number | null> => {
     if (currentPlatform == null) return null; // nothing booted yet
-    // Read the emulator state file through the Shell matching the active driver
-    // kind (same pattern as the backlight controller's monitor-port read), so it
-    // works on a Windows+WSL host where Node can't read the POSIX path directly.
+    // windows-native must NOT use a shell: on a Windows host `bash` resolves to
+    // the WSL launcher, so `cat /tmp/pb-emulator.json` would read WSL's stale
+    // state file (never the native emulator's %TEMP%\pb-emulator.json) and return
+    // null → the Clay gear reported "emulator not running" and never opened.
+    // Read the Windows state file directly via Node fs, mirroring the bridge
+    // monitor (readEmuInfo above) and the input channel (createDriver readPort).
+    if (driverKind === "windows-native") {
+      return readPypkjsPort(winHostPaths().emuInfo);
+    }
+    // POSIX (WSL / native-Linux): read the state file through the matching Shell
+    // (Node can't read the in-distro POSIX path directly on a Windows+WSL host).
     const shell = driverKind === "wsl" ? makeWslShell() : makeNativeShell();
     const { code, stdout } = await shell.run(`cat ${EMU_INFO_PATH} 2>/dev/null`);
     if (code !== 0 || !stdout.trim()) return null;

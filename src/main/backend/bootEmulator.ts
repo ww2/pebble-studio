@@ -90,6 +90,14 @@ export interface SpawnDeps {
   bootControl: (id: PlatformId) => Promise<void>;
   /** Ensure the qemu keymap exists at the pc-bios path the tool's VNC boot uses. */
   ensureKeymap: () => Promise<void>;
+  /**
+   * Optional fail-fast preflight, run ONCE after the initial teardown and BEFORE
+   * the boot retry loop. Throws a clear, actionable error if a FOREIGN process
+   * still holds the VNC/ws ports (e.g. a WSL Pebble emulator or a second Pebble
+   * Studio instance) — emu-control hardcodes -vnc :1 so we cannot pick alternate
+   * ports. Omitted by the POSIX/WSL deps (no behavior change there).
+   */
+  preflight?: () => Promise<void>;
   /** One-shot health snapshot used to annotate boot progress (diagnostics). */
   diagnose: () => Promise<BootProbe>;
   /** Resolve once a TCP connection to host:port succeeds (or reject on timeout).
@@ -137,7 +145,8 @@ function execArgv(
   args: string[],
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { env: process.env });
+    // windowsHide suppresses a console-window flash for each spawned helper. No-op off Windows.
+    const child = spawn(cmd, args, { env: process.env, windowsHide: true });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d.toString()));
@@ -155,7 +164,7 @@ export function makeNativeShell(): Shell {
       // Wrap in setsid+nohup so the process survives this bash exiting, and
       // detach the Node child so our event loop isn't held open by it.
       const wrapped = `setsid nohup bash -lc ${shQuote(cmdline)} >${EMU_LOG_PATH} 2>&1 &`;
-      const child = spawn("bash", ["-lc", wrapped], { detached: true, stdio: "ignore", env: process.env });
+      const child = spawn("bash", ["-lc", wrapped], { detached: true, stdio: "ignore", env: process.env, windowsHide: true });
       child.unref();
       child.on("error", () => { /* readiness is checked via ports */ });
     },
@@ -514,10 +523,12 @@ const PROGRESS_TICK_MS = 1500;
 /**
  * Per-attempt timeout for the pebble state file to appear. This is where the
  * `_wait_for_qemu` marker hang shows up; a healthy boot writes the file within a
- * few seconds, so 30s is a generous ceiling that still fails a HUNG attempt fast
- * enough to retry (vs. the old 60s, which made a double-stall feel like forever).
+ * few seconds. The native stack has no wsl.exe per-call latency, so 20s is a
+ * generous ceiling that still fails a HUNG attempt fast enough to retry — since
+ * the stall is a race, a clean relaunch wins more often than a longer wait (was
+ * 30s; 60s before that, which made a double-stall feel like forever).
  */
-const STATE_FILE_TIMEOUT_MS = 30_000;
+const STATE_FILE_TIMEOUT_MS = 20_000;
 /** Per-attempt timeout for the RFB / websockify ports (fast once the state file lands). */
 const PORT_TIMEOUT_MS = 30_000;
 /**
@@ -587,6 +598,14 @@ export async function bootEmulator(
     const after = await d.diagnose();
     step(`Stale stack cleared · ${fmtProbe(after)}`);
   } catch { /* probe is best-effort */ }
+  // 1b. Fail-fast preflight (native): if a FOREIGN process still holds the VNC/ws
+  // ports after our teardown, abort now with a clear error rather than letting the
+  // fresh qemu die on "address already in use" three attempts in a row. Runs once,
+  // before the retry loop; a throw here propagates straight out (not retried).
+  if (d.preflight) {
+    step("Checking emulator ports…");
+    await d.preflight();
+  }
   // 2. Make the tool's VNC keymap path valid.
   step("Preparing keymap…");
   await d.ensureKeymap();

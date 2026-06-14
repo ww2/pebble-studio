@@ -11,6 +11,30 @@ export interface ChangelogEntry {
  * truth for the Help → "What's New" modal.
  */
 export const CHANGELOG: ChangelogEntry[] = [
+  // The 2.x line is the native-Windows track (no WSL); the 1.x line is the
+  // WSL-connected track. 2.0.1 is the first native release.
+  { version: "2.1.0", date: "2026-06-14", changes: [
+    "Custom time, freeze, and time-rate (2×/4×/10×) now work on native Windows — set any date 1970–2099 in Settings → Time and it applies live on the watch.",
+    "App settings (the ⚙ Clay gear) now open on native Windows — fixed the emulator-port lookup that made the gear do nothing.",
+  ]},
+  { version: "2.0.5", date: "2026-06-14", changes: [
+    "Much faster button response — presses go through a persistent connection instead of launching a process each time.",
+    "No more Windows Defender Firewall prompt for python — the emulator's sensor page now binds to localhost too.",
+  ]},
+  { version: "2.0.4", date: "2026-06-14", changes: [
+    "Fixed the emulator failing to boot ('timeout waiting for emulator info') — qemu now binds VNC and its serial console via localhost, the form this qemu build accepts.",
+    "Removed the last stray console window that opened on each launch.",
+  ]},
+  { version: "2.0.3", date: "2026-06-14", changes: [
+    "No more Windows Defender Firewall prompts — the emulator now binds only to localhost.",
+    "Cleaner launch: no extra console windows pop up while the emulator boots.",
+    "Fixed the emulator falsely reporting 'stopped responding' moments after boot and looping.",
+  ]},
+  { version: "2.0.1", date: "2026-06-14", changes: [
+    "Native Windows emulator — runs the Pebble emulator with no WSL required.",
+    "Self-contained: bundles qemu, pebble-tool, and the SDK; first launch provisions the SDK automatically.",
+    "Faster, more reliable boot, with a clear error when another emulator already holds the ports.",
+  ]},
   { version: "1.0.0", date: "2026-06-13", changes: [
     "First stable release — the WSL-connected Pebble emulator GUI.",
     "New app & Windows .exe icon (Pebble Time 2 watch design).",

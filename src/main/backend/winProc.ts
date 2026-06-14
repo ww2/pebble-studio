@@ -29,3 +29,43 @@ export function taskkillByImageArgs(imageName: string): string[] {
 export function taskkillByPidArgs(pid: number): string[] {
   return ["/PID", String(pid), "/T", "/F"];
 }
+
+/**
+ * Extract EVERY process pid from pebble-tool's emulator state file
+ * (%TEMP%\pb-emulator.json). The file shape is:
+ *   { "<platform>": { "<sdkVersion>": {
+ *       "qemu":       { "pid": <n>, ... },
+ *       "pypkjs":     { "pid": <n>, ... },
+ *       "websockify": { "pid": <n> } } } }
+ *
+ * Returns the deduped, finite, positive pids across ALL platform/version entries.
+ *
+ * WHY (the process-leak fix): pypkjs AND websockify both run as `python.exe`, so a
+ * `taskkill /IM` by image can only safely target `qemu-pebble.exe` — it must NOT
+ * blanket-kill `python.exe` (that could hit an unrelated user Python). The state
+ * file is the authoritative source of OUR pids, so killAll force-kills each listed
+ * pid by PID instead of leaking the python-hosted bridge + proxy.
+ *
+ * Pure (no fs) so it is unit-testable; tolerates missing/partial/malformed JSON
+ * and non-object shapes at any level without throwing.
+ */
+export function parseStatePids(json: string): number[] {
+  const pids = new Set<number>();
+  try {
+    const root = JSON.parse(json) as unknown;
+    if (!root || typeof root !== "object") return [];
+    for (const versions of Object.values(root as Record<string, unknown>)) {
+      if (!versions || typeof versions !== "object") continue;
+      for (const entry of Object.values(versions as Record<string, unknown>)) {
+        if (!entry || typeof entry !== "object") continue;
+        for (const proc of Object.values(entry as Record<string, unknown>)) {
+          const pid = (proc as { pid?: unknown } | null)?.pid;
+          if (typeof pid === "number" && Number.isFinite(pid) && pid > 0) pids.add(pid);
+        }
+      }
+    }
+  } catch {
+    /* missing / partial / malformed json → no pids */
+  }
+  return [...pids];
+}

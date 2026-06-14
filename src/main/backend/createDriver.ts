@@ -7,6 +7,12 @@ import { WslDriver } from "./WslDriver.js";
 import { WindowsNativeDriver } from "./WindowsNativeDriver.js";
 import { bootEmulator, stopEmulator, makeWslBootDeps } from "./bootEmulator.js";
 import { makeWinBootDeps } from "./winBootDeps.js";
+import { defaultCtx, pebbleCmd, bundledToolsPresent, pebblePyExe, qemuExe, timeShimWinDir } from "./winRuntime.js";
+import { winShimPaths, winFakeTimeCtlPath, isWinShimReady } from "./winTimeShim.js";
+import { winHostPaths } from "./hostPaths.js";
+import { deployWinHelpers } from "./winHelpers.js";
+import { WinInputChannel, readPypkjsPort } from "./winInputChannel.js";
+import { join as pathJoin } from "node:path";
 import type { BackendDriver } from "./BackendDriver.js";
 
 /**
@@ -77,10 +83,16 @@ export function driverClassForKind(kind: DriverKind): DriverClass {
 }
 
 export async function createDriver(override?: DriverKind): Promise<{ driver: BackendDriver; kind: DriverKind }> {
+  // On win32, resolve the self-contained native stack once. When the bundled
+  // qemu + python are present, selection prefers windows-native regardless of
+  // the system PATH; the same ctx builds the path-independent pebble invocation.
+  const winCtx = process.platform === "win32" ? await defaultCtx() : null;
+  const bundled = winCtx ? bundledToolsPresent(winCtx) : false;
+
   const probe: ProbeResult = {
     platform: process.platform,
-    nativePebbleOnPath: await onPath("pebble"),
-    nativeQemuOnPath: await qemuAvailable(),
+    nativePebbleOnPath: bundled || (await onPath("pebble")),
+    nativeQemuOnPath: bundled || (await qemuAvailable()),
     wslAvailable: process.platform === "win32" ? await onPath("wsl.exe") : false,
     override,
   };
@@ -88,18 +100,61 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
 
   let driver: BackendDriver;
   if (kind === "windows-native") {
-    // Detached spawn into a new process group (Job Object assignment is a later
-    // increment — see the Phase-1 spec). windowsHide avoids a console flash.
-    const detachSpawn = async (cmd: string, args: string[]): Promise<void> => {
-      const child = spawn(cmd, args, { detached: true, windowsHide: true, stdio: "ignore" });
+    // windows-native is only selectable on win32, so winCtx is non-null here.
+    const ctx = winCtx!;
+    // Time-shim artifacts + control file (the injected-DLL custom-time lever).
+    const shimPaths = winShimPaths(timeShimWinDir(ctx));
+    const ctlPath = winFakeTimeCtlPath();
+    // The pebble invocation. When the time shim has self-tested ready (set by
+    // driver.ensureTimeShim() in emu:start, BEFORE start()), route qemu through
+    // launcher.exe via PEBBLE_QEMU_PATH and hand it the DLL + control-file env, so
+    // the boot's qemu loads the shim. Read lazily per call so it reflects the
+    // post-ensureTimeShim state. Mirrors the Linux isShimReady() boot prefix.
+    const pebble = (args: string[]) => {
+      const c = pebbleCmd(args, ctx);
+      if (isWinShimReady()) {
+        c.env = {
+          ...c.env,
+          PEBBLE_QEMU_PATH: shimPaths.launcher,
+          PEBBLE_FAKETIME_REAL_QEMU: qemuExe(ctx),
+          PEBBLE_FAKETIME_DLL: shimPaths.dll,
+          PEBBLE_FAKETIME_FILE: ctlPath,
+        };
+      }
+      return c;
+    };
+    // Spawn the pebble-tool supervisor (emu-control) WITHOUT `detached`. On
+    // Windows `detached: true` sets DETACHED_PROCESS, which conflicts with
+    // windowsHide and leaves the python supervisor with a visible console
+    // window each launch. windowsHide alone gives it a hidden console
+    // (CREATE_NO_WINDOW) that its children inherit — and emu-control's own
+    // children (qemu/pypkjs/websockify) are spawned CREATE_NEW_PROCESS_GROUP by
+    // the patched pebble-tool, so they already survive the supervisor exiting;
+    // on Windows a non-detached child also outlives the parent (no cascade
+    // kill), and teardown is by PID via killAll. unref() keeps Node's event
+    // loop from waiting on it. (Job Object assignment is a later increment.)
+    const detachSpawn = async (cmd: string, args: string[], env?: Record<string, string>): Promise<void> => {
+      const child = spawn(cmd, args, { windowsHide: true, stdio: "ignore", env: { ...process.env, ...env } });
       child.unref();
       child.on("error", () => { /* readiness is checked via ports/state file */ });
     };
-    const winDeps = makeWinBootDeps({ run: spawnRunner, detachSpawn });
+    const winDeps = makeWinBootDeps({ run: spawnRunner, detachSpawn, pebble });
+    // Deploy the persistent input helper and wire it to the bundled interpreter.
+    // The input channel removes the per-press `pebble emu-button` spawn latency.
+    const pyExe = pebblePyExe(ctx);
+    const { inputHelperPath } = deployWinHelpers(pathJoin(ctx.userDataDir, "helpers"));
+    const emuInfoPath = winHostPaths().emuInfo;
+    const inputChannel = new WinInputChannel({
+      helper: { pythonExe: pyExe, helperPath: inputHelperPath },
+      readPort: () => readPypkjsPort(emuInfoPath),
+    });
     driver = new WindowsNativeDriver({
       run: spawnRunner,
+      pebble,
       boot: (id, token, onStep) => bootEmulator(id, winDeps, token, onStep),
       stop: () => stopEmulator({ killAll: winDeps.killAll }),
+      inputChannel,
+      timeShim: { paths: shimPaths, ctlPath },
     });
   } else if (kind === "native") {
     driver = new NativeDriver({ run: spawnRunner }); // native default boot/stop

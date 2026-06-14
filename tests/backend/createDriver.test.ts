@@ -2,10 +2,17 @@ import { describe, it, expect } from "vitest";
 import { createDriver } from "../../src/main/backend/createDriver.js";
 
 describe("createDriver", () => {
-  it("returns kind 'native' on this linux dev machine (pebble + sdk qemu present)", async () => {
-    const { kind } = await createDriver();
-    expect(kind).toBe("native");
-  });
+  // Linux-dev-machine assertion: createDriver()'s win32 path builds a prod ctx via
+  // defaultCtx(), which requires the electron runtime (absent under vitest), so it can
+  // only run on the POSIX dev host. The win32 selection logic is covered by
+  // winRuntime.test.ts.
+  it.skipIf(process.platform === "win32")(
+    "returns kind 'native' on this linux dev machine (pebble + sdk qemu present)",
+    async () => {
+      const { kind } = await createDriver();
+      expect(kind).toBe("native");
+    },
+  );
 });
 
 describe("createDriver windows-native construction", () => {

@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""Apply the native-Windows POSIX-ism patches to an installed pebble-tool + pypkjs.
+
+Usage:  python apply-pebble-tool-patches.py <site-packages-dir>
+
+Idempotent: re-running is a no-op. Fails loudly if an expected anchor is missing
+(so a pebble-tool version bump can't silently skip a patch). See
+docs/build/pebble-tool-windows-patches.md for the rationale of each patch.
+
+Covers (validated Phase 1b, 2026-06-13/14):
+  1+2  emulator.py  - liveness via tasklist; SIGKILL/os.kill via taskkill shim
+  4    manager.py   - SDKs/current symlink -> directory junction
+  7    websocket.py - NamedTemporaryFile re-open (close before re-open) + import os
+  8    sdk/__init__.py - add_tools_to_path: no /var/tmp symlink on win; os.pathsep
+  9    emulator.py  - spawn qemu/pypkjs/websockify with CREATE_NO_WINDOW (no stray
+                     terminal windows) instead of the POSIX-only start_new_session
+  10   emulator.py  - bind qemu serial/gdb/monitor/vnc + websockify to 127.0.0.1
+  11   websocket.py - bind the pypkjs WSGIServer to 127.0.0.1
+(Patches 9-11 remove the Windows Defender firewall prompts for qemu-pebble.exe and
+ python.exe, and the trio of console windows, by keeping every emulator listener on
+ loopback and every child windowless. readline is handled by installing pyreadline3.)
+"""
+import sys, os
+
+def patch_file(path, replacements):
+    with open(path, "r", encoding="utf-8") as f:
+        src = f.read()
+    orig = src
+    for name, old, new, sentinel in replacements:
+        if sentinel in src:
+            print(f"  [skip] {name} (already applied)")
+            continue
+        if old not in src:
+            raise SystemExit(f"ERROR: anchor for '{name}' not found in {path}. "
+                             f"pebble-tool layout changed; update the patch.")
+        src = src.replace(old, new)
+        print(f"  [apply] {name}")
+    if src != orig:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(src)
+
+def main(sp):
+    emulator = os.path.join(sp, "pebble_tool", "sdk", "emulator.py")
+    manager  = os.path.join(sp, "pebble_tool", "sdk", "manager.py")
+    sdkinit  = os.path.join(sp, "pebble_tool", "sdk", "__init__.py")
+    wsock    = os.path.join(sp, "pypkjs", "runner", "websocket.py")
+    browser  = os.path.join(sp, "pebble_tool", "util", "browser.py")
+
+    print(f"emulator.py:")
+    patch_file(emulator, [
+        ("emulator.py shim",
+         'logger = logging.getLogger("pebble_tool.sdk.emulator")',
+         'logger = logging.getLogger("pebble_tool.sdk.emulator")\n'
+         '\n'
+         '# --- Native-Windows compat (Pebble Studio win port) ---\n'
+         'if sys.platform == "win32":\n'
+         '    if not hasattr(signal, "SIGKILL"):\n'
+         '        signal.SIGKILL = signal.SIGTERM\n'
+         '    def _win_os_kill(pid, sig):\n'
+         '        if sig == 0:\n'
+         '            return\n'
+         '        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],\n'
+         '                       capture_output=True)\n'
+         '    os.kill = _win_os_kill\n'
+         '# ------------------------------------------------------',
+         "_win_os_kill"),
+        ("emulator.py _is_pid_running (both)",
+         '        try:\n'
+         '            os.kill(pid, 0)\n'
+         '        except OSError as e:\n'
+         '            if e.errno == 3:\n'
+         '                return False\n'
+         '            else:\n'
+         '                raise\n'
+         '        return True',
+         '        if sys.platform == "win32":\n'
+         '            out = subprocess.run(\n'
+         '                ["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"],\n'
+         '                capture_output=True, text=True,\n'
+         '            ).stdout\n'
+         '            return (\'"%d"\' % pid) in out\n'
+         '        try:\n'
+         '            os.kill(pid, 0)\n'
+         '        except OSError as e:\n'
+         '            if e.errno == 3:\n'
+         '                return False\n'
+         '            else:\n'
+         '                raise\n'
+         '        return True',
+         'tasklist'),
+        # Patch 9 — windowless child spawns. Extend the win-compat shim with a
+        # _CHILD_POPEN_KW that uses CREATE_NO_WINDOW (+ CREATE_NEW_PROCESS_GROUP)
+        # on Windows, else start_new_session=True. Anchored to the end of the
+        # shim block inserted by the first patch above (so order matters).
+        ("emulator.py child popen flags",
+         '    os.kill = _win_os_kill\n'
+         '# ------------------------------------------------------',
+         '    os.kill = _win_os_kill\n'
+         '    # Spawn the emulator children (qemu, pypkjs, websockify) WITHOUT a\n'
+         '    # console window. start_new_session is a POSIX no-op here, so without\n'
+         '    # this each console-subsystem child pops its own terminal when the\n'
+         '    # launching python has no console. CREATE_NO_WINDOW gives the child a\n'
+         '    # hidden console (inherited by its children); CREATE_NEW_PROCESS_GROUP\n'
+         '    # keeps a stray Ctrl+C aimed at the parent from tearing it down.\n'
+         '    _CHILD_POPEN_KW = {\n'
+         '        "creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,\n'
+         '    }\n'
+         'else:\n'
+         '    _CHILD_POPEN_KW = {"start_new_session": True}\n'
+         '# ------------------------------------------------------',
+         "_CHILD_POPEN_KW"),
+        # Patch 9 (cont.) — route every child spawn through _CHILD_POPEN_KW.
+        ("emulator.py start_new_session -> _CHILD_POPEN_KW",
+         'start_new_session=True)',
+         '**_CHILD_POPEN_KW)',
+         "**_CHILD_POPEN_KW)"),
+        # Patch 10 — keep qemu's listeners on loopback (no firewall prompt). Use
+        # "localhost" (dual-stack 127.0.0.1 + ::1), NOT the "127.0.0.1" literal:
+        # pebble-tool connects to these via ('localhost', port), and on Windows
+        # localhost resolves to ::1 first; an IPv4-only bind makes that connect
+        # fall back after ~2s, so _wait_for_qemu misses the firmware's one-shot
+        # boot marker and the boot stalls forever.
+        ("emulator.py qemu tcp loopback",
+         '"tcp::{},{}".format(',
+         '"tcp:localhost:{},{}".format(',
+         "tcp:localhost:"),
+        # Loopback VNC. NOTE: this qemu-pebble build rejects the IPv4-literal
+        # form `-vnc 127.0.0.1:1` ("Failed to find an available port") but
+        # accepts `localhost:1`, which binds display 1 (port 5901) on both
+        # 127.0.0.1 and [::1] — what websockify (localhost:5901) proxies to.
+        ("emulator.py qemu vnc loopback",
+         'command.extend(["-vnc", ":1"])',
+         'command.extend(["-vnc", "localhost:1"])',
+         '"-vnc", "localhost:1"'),
+        # Patch 10 (cont.) — websockify listens on loopback only.
+        ("emulator.py websockify loopback",
+         "'6080',",
+         "'127.0.0.1:6080',",
+         "'127.0.0.1:6080'"),
+    ])
+
+    print(f"manager.py:")
+    patch_file(manager, [
+        ("manager.py set_current_sdk junction",
+         '        try:\n'
+         '            os.unlink(self._current_path)\n'
+         '        except (OSError, TypeError):\n'
+         '            pass\n'
+         '        os.symlink(path, self._current_path)',
+         '        link = self._current_path\n'
+         '        if sys.platform == "win32":\n'
+         '            try:\n'
+         '                if os.path.isdir(link):\n'
+         '                    os.rmdir(link)\n'
+         '                elif os.path.lexists(link):\n'
+         '                    os.unlink(link)\n'
+         '            except OSError:\n'
+         '                pass\n'
+         '            import _winapi\n'
+         '            _winapi.CreateJunction(path, link)\n'
+         '            return\n'
+         '        try:\n'
+         '            os.unlink(link)\n'
+         '        except (OSError, TypeError):\n'
+         '            pass\n'
+         '        os.symlink(path, link)',
+         "_winapi.CreateJunction"),
+    ])
+
+    print(f"sdk/__init__.py:")
+    patch_file(sdkinit, [
+        ("sdk/__init__.py import sys",
+         "__author__ = 'katharine'\n\nimport os\n",
+         "__author__ = 'katharine'\n\nimport os\nimport sys\n",
+         "import sys"),
+        ("sdk/__init__.py add_tools_to_path",
+         '        os.environ[\'PATH\'] = "{}:{}".format(os.path.join(get_persist_dir(), "SDKs", sdk_version(), "toolchain", "arm-none-eabi", "bin"), os.environ[\'PATH\'])\n'
+         '\n'
+         '        # Create symlink from /tmp/pebble-sdk to persist directory\n'
+         '        tmp_link = "/var/tmp/pebble-sdk"\n'
+         '        target = get_persist_dir()\n'
+         '        if not (os.path.islink(tmp_link) and os.readlink(tmp_link) == target):\n'
+         '            if os.path.lexists(tmp_link):\n'
+         '                os.unlink(tmp_link)\n'
+         '            os.symlink(target, tmp_link)\n'
+         '\n'
+         '        os.environ[\'PATH\'] = "{}:{}".format(os.path.join(tmp_link, "SDKs", sdk_version(), "toolchain", "moddable-tools"), os.environ[\'PATH\'])\n'
+         '        os.environ[\'MODDABLE\'] = os.path.join(tmp_link, "SDKs", sdk_version(), "toolchain", "moddable")\n'
+         '        extra_path = os.environ.get(\'PEBBLE_EXTRA_PATH\')\n'
+         '        if extra_path:\n'
+         '            os.environ[\'PATH\'] = "{}:{}".format(extra_path, os.environ[\'PATH\'])',
+         '        sep = os.pathsep\n'
+         '        os.environ[\'PATH\'] = "{}{}{}".format(os.path.join(get_persist_dir(), "SDKs", sdk_version(), "toolchain", "arm-none-eabi", "bin"), sep, os.environ[\'PATH\'])\n'
+         '\n'
+         '        if sys.platform == "win32":\n'
+         '            base = get_persist_dir()\n'
+         '        else:\n'
+         '            tmp_link = "/var/tmp/pebble-sdk"\n'
+         '            target = get_persist_dir()\n'
+         '            if not (os.path.islink(tmp_link) and os.readlink(tmp_link) == target):\n'
+         '                if os.path.lexists(tmp_link):\n'
+         '                    os.unlink(tmp_link)\n'
+         '                os.symlink(target, tmp_link)\n'
+         '            base = tmp_link\n'
+         '\n'
+         '        os.environ[\'PATH\'] = "{}{}{}".format(os.path.join(base, "SDKs", sdk_version(), "toolchain", "moddable-tools"), sep, os.environ[\'PATH\'])\n'
+         '        os.environ[\'MODDABLE\'] = os.path.join(base, "SDKs", sdk_version(), "toolchain", "moddable")\n'
+         '        extra_path = os.environ.get(\'PEBBLE_EXTRA_PATH\')\n'
+         '        if extra_path:\n'
+         '            os.environ[\'PATH\'] = "{}{}{}".format(extra_path, sep, os.environ[\'PATH\'])',
+         "sep = os.pathsep"),
+    ])
+
+    print(f"pypkjs/runner/websocket.py:")
+    patch_file(wsock, [
+        ("websocket.py import os",
+         "import argparse\nimport json\nimport logging\nimport ssl",
+         "import argparse\nimport json\nimport logging\nimport os\nimport ssl",
+         "\nimport os\nimport ssl"),
+        ("websocket.py NamedTemporaryFile",
+         '        def go_do_install():\n'
+         '            with tempfile.NamedTemporaryFile() as f:\n'
+         '                f.write(message)\n'
+         '                f.flush()\n'
+         '                try:\n'
+         '                    self.load_pbws([f.name], cache=True)\n'
+         '                    AppInstaller(self.pebble.pebble, f.name, blobdb_client=self.pebble.blobdb).install()\n'
+         '                except:\n'
+         '                    try:\n'
+         '                        ws.send(bytearray([0x05, 0x00, 0x00, 0x00, 0x01]))\n'
+         '                    except WebSocketError:\n'
+         '                        pass\n'
+         '                    raise\n'
+         '                else:\n'
+         '                    try:\n'
+         '                        ws.send(bytearray([0x05, 0x00, 0x00, 0x00, 0x00]))\n'
+         '                    except WebSocketError:\n'
+         '                        pass',
+         '        def go_do_install():\n'
+         '            f = tempfile.NamedTemporaryFile(delete=False)\n'
+         '            try:\n'
+         '                f.write(message)\n'
+         '                f.flush()\n'
+         '                f.close()\n'
+         '                try:\n'
+         '                    self.load_pbws([f.name], cache=True)\n'
+         '                    AppInstaller(self.pebble.pebble, f.name, blobdb_client=self.pebble.blobdb).install()\n'
+         '                except:\n'
+         '                    try:\n'
+         '                        ws.send(bytearray([0x05, 0x00, 0x00, 0x00, 0x01]))\n'
+         '                    except WebSocketError:\n'
+         '                        pass\n'
+         '                    raise\n'
+         '                else:\n'
+         '                    try:\n'
+         '                        ws.send(bytearray([0x05, 0x00, 0x00, 0x00, 0x00]))\n'
+         '                    except WebSocketError:\n'
+         '                        pass\n'
+         '            finally:\n'
+         '                try:\n'
+         '                    os.unlink(f.name)\n'
+         '                except OSError:\n'
+         '                    pass',
+         "delete=False"),
+        # Patch 11 — bind the pypkjs phone websocket to loopback only. The app
+        # connects via ws://localhost; a 0.0.0.0 bind makes Windows Defender
+        # prompt to allow python.exe on the network.
+        ("websocket.py WSGIServer loopback",
+         'pywsgi.WSGIServer(("", self.port)',
+         'pywsgi.WSGIServer(("127.0.0.1", self.port)',
+         '("127.0.0.1", self.port)'),
+    ])
+
+    print("util/browser.py:")
+    # Patch 12 — emu-control starts a sensor-page HTTP server (and the app-config
+    # command an HTTPServer) bound to ('', port) = all interfaces, which is the
+    # remaining Windows Defender prompt for python.exe. Bind both to loopback;
+    # Pebble Studio reaches them via localhost and does not use the phone/QR LAN path.
+    patch_file(browser, [
+        ("browser.py sensor-page loopback",
+         "BaseHTTPServer.HTTPServer(('', self.port), SensorPageHandler)",
+         "BaseHTTPServer.HTTPServer(('127.0.0.1', self.port), SensorPageHandler)",
+         "('127.0.0.1', self.port), SensorPageHandler"),
+        ("browser.py app-config loopback",
+         "BaseHTTPServer.HTTPServer(('', port), AppConfigHandler)",
+         "BaseHTTPServer.HTTPServer(('127.0.0.1', port), AppConfigHandler)",
+         "('127.0.0.1', port), AppConfigHandler"),
+    ])
+    print("All patches applied/verified.")
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: apply-pebble-tool-patches.py <site-packages-dir>")
+    main(sys.argv[1])
