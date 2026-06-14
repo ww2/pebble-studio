@@ -56,6 +56,7 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps {
   const run = impl.run;
   const readFile = impl.readFile ?? (async (p: string) => fsReadFile(p, "utf8").catch(() => ""));
   const rm = impl.rm ?? (async (p: string) => { await fsRm(p, { force: true }).catch(() => {}); });
+  // no real default — the production caller (createDriver) MUST provide this; the real impl needs detached-spawn + Job Object wiring.
   const detachSpawn = impl.detachSpawn ?? (async () => { throw new Error("detachSpawn not provided"); });
   const paths = impl.paths ?? winHostPaths();
   const checkPortOpen = impl.portOpen ?? portOpen;
@@ -63,12 +64,11 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps {
   const diagnose = async (): Promise<BootProbe> => {
     const tl = await run("tasklist", tasklistArgs("qemu-pebble.exe")).catch(() => ({ code: 1, stdout: "", stderr: "" }));
     const stateRaw = await readFile(paths.emuInfo);
-    return {
-      qemuAlive: parseTasklistAlive(tl.stdout),
-      stateFile: stateRaw.trim().length > 0,
-      rfbOpen: await checkPortOpen("127.0.0.1", VNC_RFB_PORT),
-      wsOpen: await checkPortOpen("127.0.0.1", WS_PORT),
-    };
+    const [rfbOpen, wsOpen] = await Promise.all([
+      checkPortOpen("127.0.0.1", VNC_RFB_PORT),
+      checkPortOpen("127.0.0.1", WS_PORT),
+    ]);
+    return { qemuAlive: parseTasklistAlive(tl.stdout), stateFile: stateRaw.trim().length > 0, rfbOpen, wsOpen };
   };
 
   const waitForEmuInfo = async (id: PlatformId, timeoutMs: number, token?: BootToken): Promise<void> => {
@@ -79,6 +79,7 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps {
       if (raw.trim() && stateHasLivePid(raw, id)) return;
       if (Date.now() > deadline) throw new Error(`timeout waiting for emulator info for ${id}`);
       await new Promise((r) => setTimeout(r, 300));
+      if (token?.cancelled) throw new BootAborted();
     }
   };
 
@@ -89,9 +90,9 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps {
         if (token?.cancelled) return reject(new BootAborted());
         if (await checkPortOpen(host, port)) return resolve();
         if (Date.now() > deadline) return reject(new Error(`timeout waiting for ${host}:${port}`));
-        setTimeout(attempt, 300);
+        setTimeout(() => { void attempt().catch(reject); }, 300);
       };
-      void attempt();
+      void attempt().catch(reject);
     });
   };
 
@@ -99,6 +100,7 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps {
     await run("taskkill", taskkillByImageArgs("qemu-pebble.exe")).catch(() => ({ code: 0, stdout: "", stderr: "" }));
     await run("taskkill", taskkillByImageArgs("websockify.exe")).catch(() => ({ code: 0, stdout: "", stderr: "" }));
     await rm(paths.emuInfo);
+    // taskkill /F is async; we settle on ports free as a proxy for exit (port is released on process exit on Windows). TODO(Phase-2): also confirm qemu-pebble.exe has exited via tasklist, analogous to waitUntilDead.
     // Settle: poll the ports free (best-effort; never hang).
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
@@ -110,6 +112,7 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps {
   const ensureKeymap = async (): Promise<void> => {
     const dir = `${paths.sdkRoot}\\toolchain\\lib\\pc-bios\\keymaps`;
     await mkdir(dir, { recursive: true }).catch(() => {});
+    // NOTE: no-op until the Windows SDK ships en-us at the pc-bios root (or a seeding step is added, analogous to the POSIX time-shim stub).
     // Best-effort: a stub en-us keymap; the real qemu build ships its own.
     await copyFile(`${dir}\\..\\en-us`, `${dir}\\en-us`).catch(() => {});
   };

@@ -48,4 +48,31 @@ describe("makeWinBootDeps", () => {
     expect(calls.some((a) => a.includes("qemu-pebble.exe") && a.includes("/F"))).toBe(true);
     expect(d.rm).toHaveBeenCalled();
   });
+
+  it("waitForEmuInfo throws on timeout when the state file never has a live pid", async () => {
+    const b = makeWinBootDeps(deps({ readFile: vi.fn(async () => "") }));
+    await expect(b.waitForEmuInfo("basalt", 1)).rejects.toThrow(/timeout/i);
+  });
+
+  it("waitForEmuInfo aborts promptly when the token is cancelled", async () => {
+    const token = { cancelled: true };
+    const b = makeWinBootDeps(deps({ readFile: vi.fn(async () => "") }));
+    await expect(b.waitForEmuInfo("basalt", 10_000, token)).rejects.toThrow(/abort/i);
+  });
+
+  it("waitForPort rejects on timeout when the port never opens", async () => {
+    const b = makeWinBootDeps(deps({ portOpen: vi.fn(async () => false) }));
+    await expect(b.waitForPort("127.0.0.1", 5901, 1)).rejects.toThrow(/timeout/i);
+  });
+
+  it("diagnose reports qemuAlive=false for the 'No tasks' tasklist banner", async () => {
+    const b = makeWinBootDeps(deps({
+      run: vi.fn(async () => ({ code: 0, stdout: "INFO: No tasks are running which match the specified criteria.\r\n", stderr: "" })),
+      readFile: vi.fn(async () => ""),
+      portOpen: vi.fn(async () => false),
+    }));
+    const probe = await b.diagnose();
+    expect(probe.qemuAlive).toBe(false);
+    expect(probe.stateFile).toBe(false);
+  });
 });
