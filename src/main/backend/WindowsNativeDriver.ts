@@ -48,7 +48,11 @@ export class WindowsNativeDriver implements BackendDriver {
   setPlatform(id: PlatformId): void { this.inner.setPlatform(id); }
 
   async start(id: PlatformId, token?: BootToken, onStep?: OnStep): Promise<VncEndpoint> {
-    return this.inner.start(id, token, onStep);
+    // qemu-pebble binds to 127.0.0.1 on the Windows host; enforce localhost so
+    // callers don't depend on whatever makeWinBootDeps' boot fn returns (mirrors
+    // WslDriver, where WSL2 also forwards to the Windows loopback).
+    const endpoint = await this.inner.start(id, token, onStep);
+    return { ...endpoint, host: "localhost" };
   }
 
   async stop(): Promise<void> { return this.inner.stop(); }
@@ -77,6 +81,9 @@ export class WindowsNativeDriver implements BackendDriver {
   async timeFormat(hour24: boolean): Promise<void> { return this.inner.timeFormat(hour24); }
   async bluetooth(connected: boolean): Promise<void> { return this.inner.bluetooth(connected); }
   async battery(percent: number, charging: boolean): Promise<void> { return this.inner.battery(percent, charging); }
+  // winPath canonicalizes backslash/forward-slash; outPath is already a Windows
+  // path (app-constructed), so this is a no-op slash normalization kept for
+  // symmetry with install.
   async screenshot(outPath: string): Promise<void> { return this.inner.screenshot(winPath(outPath)); }
   async wipe(): Promise<void> { return this.inner.wipe(); }
   async timelineQuickView(on: boolean): Promise<void> { return this.inner.timelineQuickView(on); }

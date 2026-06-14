@@ -67,4 +67,13 @@ describe("WindowsNativeDriver", () => {
     await d.start("basalt", token, step);
     expect(boot).toHaveBeenCalledWith("basalt", token, step);
   });
+
+  it("forces the VNC endpoint host to localhost regardless of the boot fn", async () => {
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const boot = vi.fn(async () => ({ host: "192.168.1.50", port: 6080, wsPath: "/" }));
+    const d = new WindowsNativeDriver({ run, boot, stop: async () => {} });
+    const result = await d.start("basalt", { cancelled: false });
+    expect(result.host).toBe("localhost");
+    expect(result.port).toBe(6080);
+  });
 });
