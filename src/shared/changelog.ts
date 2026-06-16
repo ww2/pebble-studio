@@ -13,6 +13,39 @@ export interface ChangelogEntry {
 export const CHANGELOG: ChangelogEntry[] = [
   // The 2.x line is the native-Windows track (no WSL); the 1.x line is the
   // WSL-connected track. 2.0.1 is the first native release.
+  { version: "2.1.12", date: "2026-06-15", changes: [
+    "The newer watches — Pebble Time 2 (emery), Pebble Round 2 (gabbro), and Pebble 2 Duo (flint) — now open the full watch menu (Settings, Music, Notifications, Alarms, Watchfaces) when you press Select, instead of just a watchface picker. This is now built in, so it survives updates and works on a fresh install.",
+  ]},
+  { version: "2.1.11", date: "2026-06-15", changes: [
+    "Fixed a stray outline that stuck to the last on-screen watch button you clicked with the mouse and then showed when you pressed an arrow key.",
+  ]},
+  { version: "2.1.10", date: "2026-06-15", changes: [
+    "Custom time is now set with simple dropdowns (hour / minute, plus AM·PM in 12-hour mode) instead of typing the digits and \"AM\"/\"PM\" — the 24-hour toggle still switches the hour range and AM·PM on or off.",
+    "Screenshots try a new backlight-free capture (no display flash); if it isn't available they fall back automatically to the previous method, so saving a shot always works.",
+  ]},
+  { version: "2.1.9", date: "2026-06-15", changes: [
+    "The \"Run custom time\" button now clearly highlights (accent fill) while you have unsaved date/time/rate edits — so it's obvious that changing a control doesn't take effect until you press it.",
+    "On-screen watch buttons now light up on every keyboard press (Back/Up/Select/Down), confirming each keystroke registered — not just on mouse clicks.",
+  ]},
+  { version: "2.1.8", date: "2026-06-15", changes: [
+    "Custom time rate (2×/4×/10×) and Frozen now work on the newer watches — Pebble Time 2 (emery), Pebble Round 2 (gabbro), and Pebble 2 Duo (flint). Their emulator was following the real PC clock and ignoring your custom time, freeze, and rate; it now honors them like the other watches do.",
+  ]},
+  { version: "2.1.7", date: "2026-06-15", changes: [
+    "Custom time now holds reliably on native Windows: 1× and 10× hold the time you set and tick forward, and Frozen holds your chosen time instead of snapping back to the real clock. (Root cause: the bundled pebble-tool was pushing the PC's real time to the watch on every connection; it now honors the emulator's fake clock, mirroring the Linux build.)",
+    "Known issue: in Frozen mode the watchface still replays its time-change animation. A deeper emulator/firmware fix for that is in progress; 1×/10× are unaffected.",
+  ]},
+  { version: "2.1.6", date: "2026-06-14", changes: [
+    "Custom time now actually applies and HOLDS on native Windows — set any date (1970–2099), Freeze, or run 2×/4×/10× and the watch goes there and stays. (v2.1.5 built the fix into the emulator but a Windows file-timestamp quirk meant the emulator never noticed when you changed the time after boot; it now re-reads your setting reliably.)",
+  ]},
+  { version: "2.1.4", date: "2026-06-14", changes: [
+    "Fixed the backlight keepalive, the capture backlight (auto-on while taking a screenshot/GIF), and the Backlight pulse button on native Windows — they read the emulator's monitor port the wrong way and silently did nothing. (The custom-time revert is still under investigation; the diagnostics now point to needing a rebuilt emulator binary.)",
+  ]},
+  { version: "2.1.3", date: "2026-06-14", changes: [
+    "Custom time fix attempt: the diagnostics pinned the revert to the emulator reading the clock through a lower-level Windows path than before, so this build also intercepts that path (ntdll). If custom/frozen time now holds, we found it; if not, the logs will confirm we need a rebuilt emulator.",
+  ]},
+  { version: "2.1.2", date: "2026-06-14", changes: [
+    "Diagnostic build: custom time still reverts to system time on some setups, so this build adds internal logging (written to your TEMP folder) to pin down exactly where it slips. No behavior change — the fix comes next, once the logs confirm the cause.",
+  ]},
   { version: "2.1.1", date: "2026-06-14", changes: [
     "Fixed custom time snapping back to system time a few seconds after being set — the emulator was re-reading the real clock through a code path the time shim wasn't covering yet.",
   ]},
