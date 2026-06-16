@@ -37,6 +37,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
 
 /* 100ns ticks between 1601-01-01 (FILETIME epoch) and 1970-01-01 (unix epoch). */
 #define EPOCH_DIFF_100NS 116444736000000000LL
@@ -53,6 +55,48 @@ static double   g_rate        = 1.0;
 static char     g_ctlPath[MAX_PATH] = {0};
 static int64_t  g_ctlMtime    = 0;   /* last seen ctl mtime (FILETIME) */
 static int64_t  g_lastCheckQpc = 0;
+
+/* -------------------------------------------------------------------------
+ * DIAGNOSTIC INSTRUMENTATION (session 7 — "custom time reverts" investigation)
+ * Behind PEBBLE_FAKETIME_DEBUG (default ON in this diagnostic build; set "0" to
+ * silence). Appends to PEBBLE_FAKETIME_LOG, else %TEMP%\pb-faketime-dll.log.
+ * Purpose: bisect WHERE the watch reverts — is the ctl being clobbered (TS
+ * write-log shows it), or does qemu keep calling our hooks yet the watch still
+ * snaps to real time (→ an UNHOOKED clock source)? The heartbeat below logs the
+ * fake time we'd return + per-hook call counts once/sec, so a frozen counter or
+ * a still-custom fake-time-vs-reverted-watch is directly visible.
+ * REMOVE / gate-off before shipping a release build.
+ * ------------------------------------------------------------------------- */
+static int      g_debug       = 0;
+static char     g_logPath[MAX_PATH] = {0};
+static int64_t  g_lastHbQpc   = 0;
+static volatile LONG64 g_cnt_gstaft  = 0;  /* GetSystemTimeAsFileTime calls */
+static volatile LONG64 g_cnt_precise = 0;  /* GetSystemTimePreciseAsFileTime calls */
+static volatile LONG64 g_cnt_t64     = 0;  /* _time64 calls */
+static volatile LONG64 g_cnt_t32     = 0;  /* _time32 calls */
+static volatile LONG64 g_cnt_ntqst   = 0;  /* ntdll NtQuerySystemTime calls */
+static volatile LONG64 g_cnt_rtlprec = 0;  /* ntdll RtlGetSystemTimePrecise calls */
+
+/* Append one preformatted line to the debug log. Open/append/close per line so
+ * the main process (TS writer) and qemu (this DLL) never share a handle, and a
+ * crash can't lose buffered data. No-op unless g_debug && g_logPath set. */
+static void dbg_log(const char *fmt, ...) {
+    if (!g_debug || !g_logPath[0]) return;
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if (n > (int)sizeof(line)) n = (int)sizeof(line);
+    HANDLE h = CreateFileA(g_logPath, FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    WriteFile(h, line, (DWORD)n, &wrote, NULL);
+    CloseHandle(h);
+}
 
 /* Pointers to the real exports (kept only so we can read the true time ONCE at
  * load, before the inline patch is installed). Not called afterwards. */
@@ -86,6 +130,21 @@ static int64_t fake_now_locked(int64_t real) {
 static void check_ctl_file(int64_t real) {
     if (!g_ctlPath[0]) return;
     int64_t mono = qpc_now();
+
+    /* DIAG heartbeat (~1s): the fake time we'd serve right now + how many times
+     * each hooked source has been called. If the watch reverts while this keeps
+     * logging a CUSTOM fake_unix with RISING counts → qemu is reading an UNHOOKED
+     * source. If a counter stops rising → qemu stopped calling that hook. */
+    if (g_debug && (mono - g_lastHbQpc) >= g_qpcFreq) {
+        g_lastHbQpc = mono;
+        int64_t fu = (fake_now_locked(real) - EPOCH_DIFF_100NS) / TEN_MILLION;
+        dbg_log("[hb] fake_unix=%lld rate=%.3f calls gstaft=%lld precise=%lld t64=%lld t32=%lld ntqst=%lld rtlprec=%lld\r\n",
+                (long long)fu, g_rate,
+                (long long)g_cnt_gstaft, (long long)g_cnt_precise,
+                (long long)g_cnt_t64, (long long)g_cnt_t32,
+                (long long)g_cnt_ntqst, (long long)g_cnt_rtlprec);
+    }
+
     if ((mono - g_lastCheckQpc) < (g_qpcFreq / 5)) return; /* 200ms */
     g_lastCheckQpc = mono;
 
@@ -119,6 +178,10 @@ static void check_ctl_file(int64_t real) {
             g_anchorFake = unix_s * TEN_MILLION + EPOCH_DIFF_100NS;
         }
         g_rate = r;
+        /* DIAG: the ctl file changed (mtime moved) and we re-read it. Shows WHEN
+         * the control value flips and to WHAT — e.g. a stray System "<now> 1"
+         * write a few seconds after a custom set would appear here. */
+        dbg_log("[ctl] reread tgt=%s rate=%.3f\r\n", tgt, r);
     }
 }
 
@@ -142,8 +205,8 @@ static int64_t fake_unix_seconds(void) {
 }
 
 /* Replacement KERNEL32 exports — same signature as the originals (return void). */
-static void WINAPI Fake_GetSystemTimeAsFileTime(LPFILETIME ft) { if (ft) fill_fake(ft); }
-static void WINAPI Fake_GetSystemTimePreciseAsFileTime(LPFILETIME ft) { if (ft) fill_fake(ft); }
+static void WINAPI Fake_GetSystemTimeAsFileTime(LPFILETIME ft) { InterlockedIncrement64(&g_cnt_gstaft); if (ft) fill_fake(ft); }
+static void WINAPI Fake_GetSystemTimePreciseAsFileTime(LPFILETIME ft) { InterlockedIncrement64(&g_cnt_precise); if (ft) fill_fake(ft); }
 
 /* Replacement msvcrt time sources. qemu-pebble imports _time64 + _time32 and
  * calls them (via time()) to re-jam the firmware RTC; on Windows the CRT reads
@@ -151,14 +214,38 @@ static void WINAPI Fake_GetSystemTimePreciseAsFileTime(LPFILETIME ft) { if (ft) 
  * WITHOUT faking them the watch snapped back to real time a few seconds after a
  * custom set. __cdecl (one x64 convention); time_t* in/out like the originals. */
 static long long __cdecl Fake_time64(long long *t) {
+    InterlockedIncrement64(&g_cnt_t64);
     long long s = (long long)fake_unix_seconds();
     if (t) *t = s;
     return s;
 }
 static long __cdecl Fake_time32(long *t) {
+    InterlockedIncrement64(&g_cnt_t32);
     long s = (long)fake_unix_seconds();
     if (t) *t = s;
     return s;
+}
+
+/* ntdll layer — the source BELOW the KERNEL32 exports. v2.1.2 logs proved every
+ * imported KERNEL32/msvcrt/glib wall-clock path is hooked + frozen yet the guest
+ * RTC still reverts, so the firmware re-jam must read host time via a DIRECT
+ * ntdll call (NtQuerySystemTime[Precise]) that bypasses our export patches.
+ * Both fill a LARGE_INTEGER with 100ns-since-1601 (identical units to FILETIME /
+ * our fake_100ns) and return STATUS_SUCCESS. Trampoline-free: we never call the
+ * originals (real time is synthesized from QPC). NTSTATUS=LONG; x64 has a single
+ * calling convention so the __stdcall tag is cosmetic. */
+static long __stdcall Fake_NtQuerySystemTime(LARGE_INTEGER *t) {
+    InterlockedIncrement64(&g_cnt_ntqst);
+    if (t) t->QuadPart = fake_100ns();
+    return 0; /* STATUS_SUCCESS */
+}
+/* RtlGetSystemTimePrecise (Win8+) is the precise wall-clock primitive — it
+ * RETURNS the 100ns-since-1601 value (in RAX), it does NOT take an out-pointer.
+ * GetSystemTimePreciseAsFileTime bottoms out here; a direct caller would bypass
+ * our kernel32 patch, so we fake it too. */
+static long long __stdcall Fake_RtlGetSystemTimePrecise(void) {
+    InterlockedIncrement64(&g_cnt_rtlprec);
+    return (long long)fake_100ns();
 }
 
 /* Overwrite the first 14 bytes of `target` with an absolute jmp to `hook`:
@@ -205,23 +292,61 @@ static void init_once(void) {
         g_rate = atof(env);
     GetEnvironmentVariableA("PEBBLE_FAKETIME_FILE", g_ctlPath, sizeof(g_ctlPath));
 
+    /* DIAG: default ON in this diagnostic build (set PEBBLE_FAKETIME_DEBUG=0 to
+     * silence). Log path: PEBBLE_FAKETIME_LOG, else %TEMP%\pb-faketime-dll.log. */
+    char dbgEnv[8] = {0};
+    GetEnvironmentVariableA("PEBBLE_FAKETIME_DEBUG", dbgEnv, sizeof(dbgEnv));
+    g_debug = (dbgEnv[0] != '0');
+    if (!GetEnvironmentVariableA("PEBBLE_FAKETIME_LOG", g_logPath, sizeof(g_logPath))) {
+        char tmp[MAX_PATH] = {0};
+        DWORD tn = GetEnvironmentVariableA("TEMP", tmp, sizeof(tmp));
+        if (tn == 0 || tn >= sizeof(tmp)) GetEnvironmentVariableA("TMP", tmp, sizeof(tmp));
+        _snprintf(g_logPath, sizeof(g_logPath), "%s\\pb-faketime-dll.log", tmp);
+    }
+
     g_anchorReal = g_realFT0;
     g_anchorFake = g_realFT0 + off * TEN_MILLION;
     g_ready = 1;
 
-    install_jmp((void *)realGetTime, (void *)Fake_GetSystemTimeAsFileTime);
+    int ok_gstaft = install_jmp((void *)realGetTime, (void *)Fake_GetSystemTimeAsFileTime);
+    int ok_precise = 0;
     if (realPrecise)
-        install_jmp(realPrecise, (void *)Fake_GetSystemTimePreciseAsFileTime);
+        ok_precise = install_jmp(realPrecise, (void *)Fake_GetSystemTimePreciseAsFileTime);
 
     /* Also hook the CRT time() sources qemu imports from msvcrt. msvcrt is mapped
      * by the time we run (our own DLL imports it), so GetModuleHandle succeeds. */
+    int ok_t64 = 0, ok_t32 = 0;
     HMODULE crt = GetModuleHandleW(L"msvcrt.dll");
+    void *t64 = NULL, *t32 = NULL;
     if (crt) {
-        void *t64 = (void *)GetProcAddress(crt, "_time64");
-        void *t32 = (void *)GetProcAddress(crt, "_time32");
-        if (t64) install_jmp(t64, (void *)Fake_time64);
-        if (t32) install_jmp(t32, (void *)Fake_time32);
+        t64 = (void *)GetProcAddress(crt, "_time64");
+        t32 = (void *)GetProcAddress(crt, "_time32");
+        if (t64) ok_t64 = install_jmp(t64, (void *)Fake_time64);
+        if (t32) ok_t32 = install_jmp(t32, (void *)Fake_time32);
     }
+
+    /* v2.1.3 FIX ATTEMPT #3: hook the ntdll layer below KERNEL32. ntdll is always
+     * mapped. NtQuerySystemTimePrecise exists on Win8+; NtQuerySystemTime is
+     * universal. If the guest RTC reads host time through either, this catches it. */
+    int ok_ntqst = 0, ok_rtlprec = 0;
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    void *p_ntqst = NULL, *p_rtlprec = NULL;
+    if (nt) {
+        p_ntqst   = (void *)GetProcAddress(nt, "NtQuerySystemTime");
+        p_rtlprec = (void *)GetProcAddress(nt, "RtlGetSystemTimePrecise");
+        if (p_ntqst)   ok_ntqst   = install_jmp(p_ntqst,   (void *)Fake_NtQuerySystemTime);
+        if (p_rtlprec) ok_rtlprec = install_jmp(p_rtlprec, (void *)Fake_RtlGetSystemTimePrecise);
+    }
+
+    /* DIAG load marker: proves the DLL actually attached to THIS qemu at REAL
+     * boot, with which hooks live + the ctl path it will watch. Absent from the
+     * log ⇒ injection never happened (AV block / suspended-loader fragility). */
+    dbg_log("[attach] pid=%lu off=%lld rate=%.3f ctl=\"%s\" hooks: "
+            "gstaft=%d precise=%d msvcrt=%d t64=%d t32=%d ntqst=%d rtlprec=%d\r\n",
+            (unsigned long)GetCurrentProcessId(), (long long)off, g_rate, g_ctlPath,
+            ok_gstaft, ok_precise, crt ? 1 : 0,
+            t64 ? ok_t64 : -1, t32 ? ok_t32 : -1,
+            p_ntqst ? ok_ntqst : -1, p_rtlprec ? ok_rtlprec : -1);
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {

@@ -14,6 +14,22 @@ function makeFakeChild() {
   return { child, writes, isKilled: () => killed, die: () => { alive = false; } };
 }
 
+/** A fake InputChild that ALSO supports the stdout line reader (onLine), used by
+ * the framebuffer screenshot path. `emit` feeds a line back as if the helper
+ * printed it; `writes` records stdin commands. */
+function makeShotChild() {
+  const writes: string[] = [];
+  let alive = true;
+  let cb: ((line: string) => void) | null = null;
+  const child: InputChild = {
+    stdinWrite: (line) => { writes.push(line); },
+    kill: () => { alive = false; },
+    alive: () => alive,
+    onLine: (fn) => { cb = fn; },
+  };
+  return { child, writes, emit: (line: string) => cb?.(line), die: () => { alive = false; } };
+}
+
 const HELPER = { pythonExe: "py.exe", helperPath: "C:/h/pb-input-helper.py" };
 
 describe("WinInputChannel", () => {
@@ -108,6 +124,89 @@ describe("WinInputChannel", () => {
     const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => throwingChild });
 
     expect(ch.send("click select")).toBe(false);
+  });
+});
+
+describe("WinInputChannel.screenshot (framebuffer)", () => {
+  it("writes the screenshot command and resolves true on an OK ack", async () => {
+    const fake = makeShotChild();
+    const spawnChild = vi.fn(() => fake.child);
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild });
+
+    const p = ch.screenshot("C:/caps/shot.png");
+    expect(fake.writes).toEqual(["screenshot C:/caps/shot.png\n"]);
+    fake.emit("OK C:/caps/shot.png");
+    expect(await p).toBe(true);
+  });
+
+  it("resolves false on an ERR ack (caller falls back to canvas)", async () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+
+    const p = ch.screenshot("C:/caps/shot.png");
+    fake.emit("ERR screenshot failed");
+    expect(await p).toBe(false);
+  });
+
+  it("ignores the helper's 'ready' line and other noise while waiting", async () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+
+    const p = ch.screenshot("C:/caps/shot.png");
+    fake.emit("ready");
+    fake.emit("input-helper noise");
+    fake.emit("OK C:/caps/shot.png");
+    expect(await p).toBe(true);
+  });
+
+  it("resolves false on timeout when the helper never acks", async () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+
+    const p = ch.screenshot("C:/caps/shot.png", 5);
+    expect(await p).toBe(false);
+  });
+
+  it("returns false when not booted (no port)", async () => {
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => null, spawnChild: vi.fn() });
+    expect(await ch.screenshot("C:/caps/shot.png")).toBe(false);
+  });
+
+  it("returns false when the child can't read stdout (no onLine)", async () => {
+    // The bare input fake has no onLine, so acks can't arrive → fall back.
+    const fake = makeFakeChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+    expect(await ch.screenshot("C:/caps/shot.png")).toBe(false);
+  });
+
+  it("rejects a second concurrent screenshot while one is pending", async () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+
+    const p1 = ch.screenshot("C:/caps/a.png");
+    const p2 = ch.screenshot("C:/caps/b.png"); // pending slot busy → immediate false
+    expect(await p2).toBe(false);
+    fake.emit("OK C:/caps/a.png");
+    expect(await p1).toBe(true);
+  });
+
+  it("does not disturb the fire-and-forget input path", () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+
+    // Buttons still go through as plain stdin writes; the screenshot ack reader is
+    // wired but only resolves OK/ERR (input emits nothing on stdout here).
+    expect(ch.send("click select")).toBe(true);
+    expect(fake.writes).toEqual(["click select\n"]);
+  });
+
+  it("stop() fails an in-flight screenshot so it can't hang", async () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+
+    const p = ch.screenshot("C:/caps/shot.png");
+    ch.stop();
+    expect(await p).toBe(false);
   });
 });
 

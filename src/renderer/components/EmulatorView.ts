@@ -514,6 +514,7 @@ export class EmulatorView {
       case "up":
       case "select":
       case "down":
+        this.flashButton(action);
         void window.studio.button(action);
         break;
       case "tap":
@@ -528,6 +529,24 @@ export class EmulatorView {
         void window.studio.backlightPulse();
         break;
     }
+  }
+
+  /** Per-button flash timers, so a held key (keydown auto-repeat) keeps the nub
+   * lit instead of flickering — each repeat re-arms the same timer. */
+  private readonly flashTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /** 4c: briefly light the on-screen watch button for a keyboard-driven press,
+   * since key presses (unlike mouse clicks) never trigger the :active style. */
+  private flashButton(id: ButtonId): void {
+    const el = this.buttonEls.find((b) => b.dataset.button === id);
+    if (!el) return;
+    el.classList.add("emu-hit--pressed");
+    const prev = this.flashTimers.get(id);
+    if (prev) clearTimeout(prev);
+    this.flashTimers.set(id, setTimeout(() => {
+      el.classList.remove("emu-hit--pressed");
+      this.flashTimers.delete(id);
+    }, 140));
   }
 
   /** Coerce a stored zoom string to a valid ZoomLevel, defaulting to "1". */
@@ -1361,6 +1380,11 @@ export class EmulatorView {
       el.className = `emu-hit emu-hit--${id}`;
       el.dataset.button = id;
       el.title = id;
+      // Don't let a mouse click leave the nub focused — otherwise the next arrow
+      // key flips Chromium into :focus-visible and draws a ring on the last-
+      // clicked nub. The buttons are operated by the global key handler, so they
+      // never need to hold focus.
+      el.addEventListener("mousedown", (e) => e.preventDefault());
       el.addEventListener("click", () => void window.studio.button(id));
       this.buttonsOverlay.appendChild(el);
       this.buttonEls.push(el);

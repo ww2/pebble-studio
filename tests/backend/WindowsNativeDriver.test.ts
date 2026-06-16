@@ -3,7 +3,6 @@ import { readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WindowsNativeDriver } from "../../src/main/backend/WindowsNativeDriver.js";
-import { _resetWinShimState } from "../../src/main/backend/winTimeShim.js";
 
 const ep = { host: "localhost", port: 6080, wsPath: "/" };
 
@@ -61,28 +60,26 @@ describe("WindowsNativeDriver", () => {
     expect(run).not.toHaveBeenCalled();
   });
 
-  describe("with the injected-DLL time shim wired", () => {
-    beforeEach(() => _resetWinShimState());
-
-    it("ensureTimeShim is false when the bundled shim files are absent (graceful)", async () => {
+  describe("with the custom-time control file wired", () => {
+    // Custom time is built into the bundled qemu-pebble.exe (the Pebble RTC reads
+    // the control file directly), so it's ALWAYS available when a ctlPath is wired
+    // — no DLL files to probe, no self-test, no AV-blockable injection.
+    it("ensureTimeShim is true whenever a control file is wired", async () => {
       const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
       const d = new WindowsNativeDriver({
         run, boot: async () => ep, stop: async () => {},
-        timeShim: {
-          paths: { dll: "C:\\nope\\timeshim-win.dll", launcher: "C:\\nope\\launcher.exe", probe: "C:\\nope\\probe.exe" },
-          ctlPath: join(tmpdir(), "pb-faketime-test.ctl"),
-        },
+        timeShim: { ctlPath: join(tmpdir(), "pb-faketime-test.ctl") },
       });
-      expect(await d.ensureTimeShim()).toBe(false);
+      expect(await d.ensureTimeShim()).toBe(true);
     });
 
-    it("setFakeTime writes the control file the DLL reads ('<target> <rate>')", async () => {
+    it("setFakeTime writes the control file qemu reads ('<target> <rate>')", async () => {
       const ctlPath = join(tmpdir(), `pb-faketime-${process.pid}.ctl`);
       await rm(ctlPath, { force: true });
       const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
       const d = new WindowsNativeDriver({
         run, boot: async () => ep, stop: async () => {},
-        timeShim: { paths: { dll: "d", launcher: "l", probe: "p" }, ctlPath },
+        timeShim: { ctlPath },
       });
       await d.setFakeTime(1577836800, 0); // freeze at 2020-01-01
       expect(await readFile(ctlPath, "utf8")).toBe("1577836800 0");
@@ -128,5 +125,28 @@ describe("WindowsNativeDriver", () => {
     const result = await d.start("basalt", { cancelled: false });
     expect(result.host).toBe("localhost");
     expect(result.port).toBe(6080);
+  });
+
+  it("delegates screenshotFramebuffer to the input channel (winPath-normalized)", async () => {
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const screenshot = vi.fn(async () => true);
+    const inputChannel = { screenshot } as unknown as import("../../src/main/backend/winInputChannel.js").WinInputChannel;
+    const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {}, inputChannel });
+    expect(await d.screenshotFramebuffer("C:/caps/My Shot.png")).toBe(true);
+    expect(screenshot).toHaveBeenCalledWith("C:\\caps\\My Shot.png");
+  });
+
+  it("screenshotFramebuffer returns false when no input channel is wired (canvas fallback)", async () => {
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {} });
+    expect(await d.screenshotFramebuffer("C:/caps/shot.png")).toBe(false);
+  });
+
+  it("screenshotFramebuffer swallows an input-channel rejection and returns false", async () => {
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const screenshot = vi.fn(async () => { throw new Error("boom"); });
+    const inputChannel = { screenshot } as unknown as import("../../src/main/backend/winInputChannel.js").WinInputChannel;
+    const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {}, inputChannel });
+    expect(await d.screenshotFramebuffer("C:/caps/shot.png")).toBe(false);
   });
 });

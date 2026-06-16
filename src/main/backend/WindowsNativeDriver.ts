@@ -6,7 +6,7 @@ import type { PebbleCmdBuilder } from "./winBootDeps.js";
 import { winPath } from "./winPath.js";
 import { winSetTzOffsetArgv } from "./pebbleCli.js";
 import type { WinInputChannel } from "./winInputChannel.js";
-import { ensureWinTimeShim, writeWinFakeTime, type WinShimPaths } from "./winTimeShim.js";
+import { writeWinFakeTime } from "./winTimeShim.js";
 
 export interface WinTimeHelper {
   /** Python interpreter that has pebble-tool's libpebble2. */
@@ -35,11 +35,11 @@ export interface WindowsNativeDriverDeps {
    * Falls back to the inner CLI path when the channel is unavailable (not booted,
    * helper died). Absent → always uses the CLI path (legacy behavior). */
   inputChannel?: WinInputChannel;
-  /** Injected-DLL time shim (the Windows analog of the LD_PRELOAD shim). When set,
-   * ensureTimeShim self-tests the bundled DLL+launcher and setFakeTime writes the
-   * %TEMP% control file. Absent → ensureTimeShim=false + setFakeTime=no-op (no
-   * custom time, same as before this increment). */
-  timeShim?: { paths: WinShimPaths; ctlPath: string };
+  /** Custom-time control file. Custom time is built into the bundled qemu-pebble.exe
+   * (the Pebble RTC reads this file directly), so ensureTimeShim is always ready and
+   * setFakeTime just writes the %TEMP% control file. Absent → ensureTimeShim=false +
+   * setFakeTime=no-op (no custom time). */
+  timeShim?: { ctlPath: string };
 }
 
 /**
@@ -123,20 +123,18 @@ export class WindowsNativeDriver implements BackendDriver {
     if (r.code !== 0) console.warn(`[time] win setTzOffset(${offsetMin}) exit ${r.code}: ${r.stderr || r.stdout}`);
   }
 
-  // Injected-DLL time shim (Windows analog of LD_PRELOAD). ensureTimeShim
-  // self-tests the bundled DLL+launcher (real injection into probe.exe); when it
-  // passes, the native boot routes PEBBLE_QEMU_PATH through the launcher (see
-  // createDriver) so the DLL is active. setFakeTime writes the control file the
-  // DLL reads — connection-free, the entire custom/freeze/rate mechanism. When no
-  // timeShim dep is wired both degrade to the pre-increment no-op behavior.
+  // Custom time is built into the bundled qemu-pebble.exe: the Pebble RTC reads the
+  // control file (PEBBLE_FAKETIME_FILE, set in createDriver) directly, applying a
+  // fake base + freeze/rate — the in-qemu analog of the Linux LD_PRELOAD shim.
+  // It's therefore ALWAYS available (no DLL injection / self-test / AV concern):
+  // ensureTimeShim just reports ready, and setFakeTime writes the control file the
+  // emulator reads — connection-free, the entire custom/freeze/rate mechanism.
   async ensureTimeShim(): Promise<boolean> {
-    const ts = this.deps.timeShim;
-    if (!ts) return false;
-    return ensureWinTimeShim(ts.paths);
+    return this.deps.timeShim ? true : false;
   }
   async setFakeTime(targetUnix: number | null, rate: number): Promise<void> {
     const ts = this.deps.timeShim;
-    if (!ts) return; // no shim wired — legacy/no-op
+    if (!ts) return; // no control file wired — no-op
     await writeWinFakeTime(ts.ctlPath, targetUnix, rate);
   }
 
@@ -147,6 +145,14 @@ export class WindowsNativeDriver implements BackendDriver {
   // path (app-constructed), so this is a no-op slash normalization kept for
   // symmetry with install.
   async screenshot(outPath: string): Promise<void> { return this.inner.screenshot(winPath(outPath)); }
+  // Backlight-free framebuffer grab via the persistent input helper's pypkjs
+  // socket. Delegates to the input channel when wired; false (caller falls back
+  // to the canvas grab) when absent or the channel is unavailable. Never throws.
+  async screenshotFramebuffer(outPath: string): Promise<boolean> {
+    const ch = this.deps.inputChannel;
+    if (!ch) return false;
+    return ch.screenshot(winPath(outPath)).catch(() => false);
+  }
   async wipe(): Promise<void> { return this.inner.wipe(); }
   async timelineQuickView(on: boolean): Promise<void> { return this.inner.timelineQuickView(on); }
 }

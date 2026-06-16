@@ -94,6 +94,12 @@ export class NativeDriver implements BackendDriver {
     await this.exec(cli.screenshotCmd(outPath));
   }
 
+  // No persistent pypkjs helper on this driver, so the backlight-free framebuffer
+  // grab isn't available — return false so callers fall back to the canvas grab.
+  async screenshotFramebuffer(_outPath: string): Promise<boolean> {
+    return false;
+  }
+
   async wipe(): Promise<void> {
     // wipeCmd() has no --emulator flag, so withVnc() is a no-op here.
     // We run pebble wipe via the injected runner (not through exec's throw-on-nonzero

@@ -3,7 +3,6 @@ import {
   parseMonitorPort,
   createBacklightController,
 } from "../../src/main/backend/backlight.js";
-import type { Shell } from "../../src/main/backend/bootEmulator.js";
 
 /**
  * parseMonitorPort is the pure helper behind the backlight keepalive: it extracts
@@ -56,30 +55,26 @@ describe("parseMonitorPort", () => {
 
 /**
  * The controller drives the keepalive. Its `method` selects WHAT a fire does:
- *   back   → read the qemu monitor port (via the shell) and send a Back key,
+ *   back   → read the qemu monitor port (injected reader) and send a Back key,
  *   motion → call the injected sendMotion() (accel tap), no monitor read,
  *   off    → do nothing (and the interval is never running).
- * We inject a fake Shell (so the monitor "read" is observable without touching
- * the filesystem) and a sendMotion spy. The fake shell returns no monitor port
- * (code !== 0), so the `back` path stops after the read and never opens a real
- * TCP socket — keeping these tests hermetic. `pulseOnce()` fires exactly once
- * for the current method regardless of always/captureHold.
+ * We inject a `readMonitorPort` spy (so a monitor "read" is observable) and a
+ * sendMotion spy. The reader returns null (no port), so the `back` path stops
+ * after the read and never opens a real TCP socket — keeping these tests
+ * hermetic. `pulseOnce()` fires exactly once for the current method regardless
+ * of always/captureHold.
  */
 describe("createBacklightController", () => {
-  let shellRun: ReturnType<typeof vi.fn>;
-  let shell: Shell;
+  let readPort: ReturnType<typeof vi.fn>;
   let sendMotion: ReturnType<typeof vi.fn>;
 
-  /** The fake shell answers the monitor-read `cat` with "no file" (code 1). */
+  /** The injected reader answers "no monitor port" (null), so the "back" path
+   * stops after the read and never opens a real TCP socket — keeping these tests
+   * hermetic while still observing whether a read was attempted. */
   function makeController() {
-    shellRun = vi.fn(async () => ({ code: 1, stdout: "", stderr: "" }));
-    shell = { run: shellRun, spawnDetached: vi.fn(async () => {}) } as unknown as Shell;
+    readPort = vi.fn(async () => null);
     sendMotion = vi.fn(async () => {});
-    return createBacklightController(
-      () => "native",
-      sendMotion,
-      () => shell,
-    );
+    return createBacklightController(() => "native", sendMotion, readPort);
   }
 
   beforeEach(() => {
@@ -94,7 +89,7 @@ describe("createBacklightController", () => {
     const ctrl = makeController();
     ctrl.setAlways(true); // sync() fires once immediately (back is the default)
     await vi.advanceTimersByTimeAsync(0);
-    expect(shellRun).toHaveBeenCalled();
+    expect(readPort).toHaveBeenCalled();
     // The read returned no port, so motion was never used.
     expect(sendMotion).not.toHaveBeenCalled();
   });
@@ -104,12 +99,12 @@ describe("createBacklightController", () => {
     ctrl.setMethod("off");
     ctrl.setAlways(true);
     await vi.advanceTimersByTimeAsync(2000); // advance past several would-be ticks
-    expect(shellRun).not.toHaveBeenCalled();
+    expect(readPort).not.toHaveBeenCalled();
     expect(sendMotion).not.toHaveBeenCalled();
     // pulseOnce is also a no-op when off.
     ctrl.pulseOnce();
     await vi.advanceTimersByTimeAsync(0);
-    expect(shellRun).not.toHaveBeenCalled();
+    expect(readPort).not.toHaveBeenCalled();
     expect(sendMotion).not.toHaveBeenCalled();
   });
 
@@ -119,7 +114,7 @@ describe("createBacklightController", () => {
     ctrl.setAlways(true); // sync() fires once immediately
     await vi.advanceTimersByTimeAsync(0);
     expect(sendMotion).toHaveBeenCalledTimes(1);
-    expect(shellRun).not.toHaveBeenCalled();
+    expect(readPort).not.toHaveBeenCalled();
   });
 
   it("pulseOnce() fires exactly one keepalive for the current method", async () => {
@@ -139,11 +134,11 @@ describe("createBacklightController", () => {
     const ctrl = makeController();
     ctrl.setAlways(true);
     await vi.advanceTimersByTimeAsync(0);
-    expect(shellRun).toHaveBeenCalled();
-    shellRun.mockClear();
+    expect(readPort).toHaveBeenCalled();
+    readPort.mockClear();
     ctrl.setMethod("off"); // must stop the interval
     await vi.advanceTimersByTimeAsync(5000);
-    expect(shellRun).not.toHaveBeenCalled();
+    expect(readPort).not.toHaveBeenCalled();
   });
 
   // v0.0.13.5: capture-hold must light the screen during a screenshot/GIF even
@@ -158,7 +153,7 @@ describe("createBacklightController", () => {
     ctrl.setMethod("off");
     ctrl.setCaptureHold(true); // an explicit capture — must wake despite "off"
     await vi.advanceTimersByTimeAsync(0);
-    expect(shellRun).toHaveBeenCalled(); // Back-press path reads the monitor port
+    expect(readPort).toHaveBeenCalled(); // Back-press path reads the monitor port
     expect(sendMotion).not.toHaveBeenCalled();
   });
 
@@ -168,7 +163,7 @@ describe("createBacklightController", () => {
     ctrl.setCaptureHold(true);
     await vi.advanceTimersByTimeAsync(0);
     expect(sendMotion).toHaveBeenCalledTimes(1);
-    expect(shellRun).not.toHaveBeenCalled();
+    expect(readPort).not.toHaveBeenCalled();
   });
 
   it("releasing captureHold stops the interval when method is 'off'", async () => {
@@ -176,11 +171,11 @@ describe("createBacklightController", () => {
     ctrl.setMethod("off");
     ctrl.setCaptureHold(true);
     await vi.advanceTimersByTimeAsync(0);
-    expect(shellRun).toHaveBeenCalled();
-    shellRun.mockClear();
+    expect(readPort).toHaveBeenCalled();
+    readPort.mockClear();
     ctrl.setCaptureHold(false); // capture done — interval must stop
     await vi.advanceTimersByTimeAsync(5000);
-    expect(shellRun).not.toHaveBeenCalled();
+    expect(readPort).not.toHaveBeenCalled();
   });
 
   it("always=true with method 'off' stays inactive (only captureHold forces it)", async () => {
@@ -188,7 +183,7 @@ describe("createBacklightController", () => {
     ctrl.setMethod("off");
     ctrl.setAlways(true); // the always-on keepalive still respects "off"
     await vi.advanceTimersByTimeAsync(2000);
-    expect(shellRun).not.toHaveBeenCalled();
+    expect(readPort).not.toHaveBeenCalled();
     expect(sendMotion).not.toHaveBeenCalled();
   });
 });

@@ -50,8 +50,12 @@ export function parseMonitorPort(jsonText: string): number | null {
   return null;
 }
 
-/** Read the emulator state file through the shell and parse the monitor port. */
-async function readMonitorPort(shell: Shell): Promise<number | null> {
+/** Read the emulator state file through the shell and parse the monitor port.
+ * Correct for wsl / native-Linux. NOT for a Windows host: there `bash` is the WSL
+ * launcher, so this reads WSL's /tmp and never finds the native state file — the
+ * windows-native wiring injects a Node-fs reader instead (see createBacklightController
+ * caller in ipc.ts; same fix class as the Clay gear + bridge-health monitor). */
+async function readPortViaShell(shell: Shell): Promise<number | null> {
   const { code, stdout } = await shell.run(`cat ${EMU_INFO_PATH} 2>/dev/null`);
   if (code !== 0 || !stdout.trim()) return null;
   return parseMonitorPort(stdout);
@@ -109,12 +113,17 @@ export interface BacklightController {
  * `sendMotion` is the accel-tap injector (the real wiring passes
  * `() => driver!.accelTap()`); it's used by the "motion" method.
  *
- * `shellFor` is injectable for tests; it defaults to the real native/wsl shells.
+ * `readMonitorPort` returns the qemu HMP monitor port for the "back" method (null
+ * when unavailable). The caller injects a driver-aware reader (Node fs on %TEMP%
+ * for windows-native; the shell `cat` for wsl / native-Linux). It defaults to the
+ * shell reader — correct off-Windows, but the windows-native caller MUST override
+ * it (a Windows-host `bash` is the WSL launcher and would read the wrong /tmp).
  */
 export function createBacklightController(
   getKind: () => DriverKind | null,
   sendMotion: () => Promise<void>,
-  shellFor: (kind: DriverKind) => Shell = defaultShellFor,
+  readMonitorPort: () => Promise<number | null> =
+    () => readPortViaShell(defaultShellFor(getKind() ?? "native")),
 ): BacklightController {
   let always = false;
   let captureHold = false;
@@ -149,11 +158,9 @@ export function createBacklightController(
       }
       return;
     }
-    // "back": read the monitor port through the shell, send a Back key.
-    const kind = getKind();
-    if (!kind) return; // backend not initialized yet — skip
-    const port = await readMonitorPort(shellFor(kind));
-    if (port == null) return; // json/monitor missing — skip silently
+    // "back": read the qemu HMP monitor port (driver-aware), send a Back key.
+    const port = await readMonitorPort();
+    if (port == null) return; // backend not up / json/monitor missing — skip silently
     await sendBackKey(port);
   }
 

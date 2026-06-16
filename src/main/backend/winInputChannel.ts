@@ -27,6 +27,12 @@ export interface InputHelperPaths {
   helperPath: string;
 }
 
+/** Default timeout (ms) for a framebuffer screenshot before the channel gives up
+ * and the caller falls back to the canvas grab. Sized comfortably above the
+ * helper's own 8s grab watchdog so the helper's `ERR timed out` wins the race
+ * (a clean failure) rather than this outer cutoff firing first. */
+const SCREENSHOT_TIMEOUT_MS = 10_000;
+
 /** Minimal child surface the channel needs (injectable for tests). */
 export interface InputChild {
   /** Write a line (already newline-terminated) to the helper's stdin. */
@@ -35,6 +41,11 @@ export interface InputChild {
   kill(): void;
   /** Whether the helper is still running. */
   alive(): boolean;
+  /** Subscribe to the helper's stdout, delivered as whole newline-terminated
+   * lines. Used ONLY by the framebuffer screenshot path to resolve `OK`/`ERR`
+   * acks; the input path never reads stdout (it stays fire-and-forget). Optional
+   * so existing test fakes that only drive input need not implement it. */
+  onLine?(cb: (line: string) => void): void;
 }
 
 export interface WinInputChannelDeps {
@@ -46,9 +57,10 @@ export interface WinInputChannelDeps {
 }
 
 function defaultSpawnChild(pythonExe: string, args: string[]): InputChild {
-  // windowsHide so the helper never flashes a console; stdin piped, stdout/stderr
-  // ignored (we don't read acks — a press is fire-and-forget for latency).
-  const c = nodeSpawn(pythonExe, args, { windowsHide: true, stdio: ["pipe", "ignore", "ignore"] });
+  // windowsHide so the helper never flashes a console; stdin piped. stdout is
+  // piped (not ignored) so the framebuffer screenshot path can read `OK`/`ERR`
+  // acks — input remains fire-and-forget regardless. stderr stays ignored.
+  const c = nodeSpawn(pythonExe, args, { windowsHide: true, stdio: ["pipe", "pipe", "ignore"] });
   let dead = false;
   c.on("error", () => { dead = true; });
   c.on("exit", () => { dead = true; });
@@ -56,6 +68,19 @@ function defaultSpawnChild(pythonExe: string, args: string[]): InputChild {
     stdinWrite: (line) => { c.stdin?.write(line); },
     kill: () => { try { c.kill(); } catch { /* already gone */ } },
     alive: () => !dead && c.exitCode === null && !c.killed,
+    onLine: (cb) => {
+      let buf = "";
+      c.stdout?.setEncoding("utf8");
+      c.stdout?.on("data", (chunk: string) => {
+        buf += chunk;
+        let nl = buf.indexOf("\n");
+        while (nl >= 0) {
+          cb(buf.slice(0, nl));
+          buf = buf.slice(nl + 1);
+          nl = buf.indexOf("\n");
+        }
+      });
+    },
   };
 }
 
@@ -63,6 +88,10 @@ export class WinInputChannel {
   private child: InputChild | null = null;
   private port: number | null = null;
   private readonly spawnChild: (pythonExe: string, args: string[]) => InputChild;
+  /** Resolver for an in-flight screenshot request, set while one is pending. The
+   * helper emits exactly one `OK`/`ERR` line per `screenshot` command, so a
+   * single pending slot suffices (the screenshot button can't fire concurrently). */
+  private pendingShot: ((ok: boolean) => void) | null = null;
 
   constructor(private readonly deps: WinInputChannelDeps) {
     this.spawnChild = deps.spawnChild ?? defaultSpawnChild;
@@ -77,7 +106,61 @@ export class WinInputChannel {
     this.stop();
     this.child = this.spawnChild(this.deps.helper.pythonExe, [this.deps.helper.helperPath, String(port)]);
     this.port = port;
+    // Wire stdout acks for the framebuffer screenshot path. The input path never
+    // reads stdout, so this never affects button/tap latency. The `ready` line
+    // and any stray output are ignored; only `OK`/`ERR` resolve a pending shot.
+    this.child.onLine?.((line) => {
+      const tok = line.trim().split(/\s+/, 1)[0];
+      if (tok === "OK" || tok === "ERR") this.resolveShot(tok === "OK");
+    });
     return true;
+  }
+
+  /** Resolve the in-flight screenshot request (if any) and clear the slot. */
+  private resolveShot(ok: boolean): void {
+    const r = this.pendingShot;
+    this.pendingShot = null;
+    if (r) r(ok);
+  }
+
+  /**
+   * Take a BACKLIGHT-FREE framebuffer screenshot via the persistent helper,
+   * writing a PNG to `outPath`. Resolves true when the helper acks `OK`, false on
+   * `ERR`, timeout, or an unavailable channel (caller falls back to the VNC-canvas
+   * grab). Robust by design: any failure resolves false rather than throwing.
+   *
+   * NOTE: the underlying framebuffer grab is UNVERIFIED LIVE — see winHelpers.ts.
+   */
+  screenshot(outPath: string, timeoutMs = SCREENSHOT_TIMEOUT_MS): Promise<boolean> {
+    if (!this.ensure() || !this.child || !this.child.onLine) return Promise.resolve(false);
+    // Only one screenshot in flight at a time; if somehow one is pending, fail
+    // the new request fast rather than racing two acks onto one slot.
+    if (this.pendingShot) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      let done = false;
+      const finish = (ok: boolean): void => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(ok);
+      };
+      const timer = setTimeout(() => {
+        // Helper didn't ack in time — clear the slot and fall back.
+        if (this.pendingShot === settle) this.pendingShot = null;
+        finish(false);
+      }, timeoutMs);
+      const settle = (ok: boolean): void => finish(ok);
+      this.pendingShot = settle;
+      try {
+        this.child!.stdinWrite(`screenshot ${outPath}\n`);
+      } catch {
+        // Broken pipe — drop the child so the next op respawns it, and fall back.
+        this.child = null;
+        this.port = null;
+        if (this.pendingShot === settle) this.pendingShot = null;
+        finish(false);
+      }
+    });
   }
 
   /**
@@ -105,6 +188,8 @@ export class WinInputChannel {
       this.child = null;
     }
     this.port = null;
+    // Fail any in-flight screenshot so its promise can't hang past teardown.
+    this.resolveShot(false);
   }
 }
 

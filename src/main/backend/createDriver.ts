@@ -7,8 +7,8 @@ import { WslDriver } from "./WslDriver.js";
 import { WindowsNativeDriver } from "./WindowsNativeDriver.js";
 import { bootEmulator, stopEmulator, makeWslBootDeps } from "./bootEmulator.js";
 import { makeWinBootDeps } from "./winBootDeps.js";
-import { defaultCtx, pebbleCmd, bundledToolsPresent, pebblePyExe, qemuExe, timeShimWinDir } from "./winRuntime.js";
-import { winShimPaths, winFakeTimeCtlPath, isWinShimReady } from "./winTimeShim.js";
+import { defaultCtx, pebbleCmd, bundledToolsPresent, pebblePyExe } from "./winRuntime.js";
+import { winFakeTimeCtlPath, winQemuFakeTimeLogPath } from "./winTimeShim.js";
 import { winHostPaths } from "./hostPaths.js";
 import { deployWinHelpers } from "./winHelpers.js";
 import { WinInputChannel, readPypkjsPort } from "./winInputChannel.js";
@@ -102,25 +102,23 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
   if (kind === "windows-native") {
     // windows-native is only selectable on win32, so winCtx is non-null here.
     const ctx = winCtx!;
-    // Time-shim artifacts + control file (the injected-DLL custom-time lever).
-    const shimPaths = winShimPaths(timeShimWinDir(ctx));
+    // Custom-time control file. Custom time / freeze / rate is now built INTO the
+    // bundled qemu-pebble.exe: the Pebble RTC reads PEBBLE_FAKETIME_FILE directly
+    // (qemu hw/timer/stm32_pebble_rtc.c → pebble_faketime_us()). This replaced the
+    // injected-DLL shim (which could not reach the host-clock path mingw's
+    // gettimeofday() actually uses, so custom time reverted to real time). Custom
+    // time is therefore ALWAYS available natively — no DLL injection, no
+    // launcher.exe, no AV-blockable CreateRemoteThread.
     const ctlPath = winFakeTimeCtlPath();
-    // The pebble invocation. When the time shim has self-tested ready (set by
-    // driver.ensureTimeShim() in emu:start, BEFORE start()), route qemu through
-    // launcher.exe via PEBBLE_QEMU_PATH and hand it the DLL + control-file env, so
-    // the boot's qemu loads the shim. Read lazily per call so it reflects the
-    // post-ensureTimeShim state. Mirrors the Linux isShimReady() boot prefix.
+    // The pebble invocation: pebbleCmd already points PEBBLE_QEMU_PATH at the
+    // bundled qemu; we just hand qemu the control-file path. System time writes
+    // "<now> 1" to it; an absent/empty file is treated as real time by qemu.
+    const ftLogPath = winQemuFakeTimeLogPath();
     const pebble = (args: string[]) => {
       const c = pebbleCmd(args, ctx);
-      if (isWinShimReady()) {
-        c.env = {
-          ...c.env,
-          PEBBLE_QEMU_PATH: shimPaths.launcher,
-          PEBBLE_FAKETIME_REAL_QEMU: qemuExe(ctx),
-          PEBBLE_FAKETIME_DLL: shimPaths.dll,
-          PEBBLE_FAKETIME_FILE: ctlPath,
-        };
-      }
+      // PEBBLE_FAKETIME_LOG: qemu records (to %TEMP%) that the control file arrived
+      // and what time it serves — readable to confirm/diagnose custom time.
+      c.env = { ...c.env, PEBBLE_FAKETIME_FILE: ctlPath, PEBBLE_FAKETIME_LOG: ftLogPath };
       return c;
     };
     // Spawn the pebble-tool supervisor (emu-control) WITHOUT `detached`. On
@@ -154,7 +152,7 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
       boot: (id, token, onStep) => bootEmulator(id, winDeps, token, onStep),
       stop: () => stopEmulator({ killAll: winDeps.killAll }),
       inputChannel,
-      timeShim: { paths: shimPaths, ctlPath },
+      timeShim: { ctlPath },
     });
   } else if (kind === "native") {
     driver = new NativeDriver({ run: spawnRunner }); // native default boot/stop

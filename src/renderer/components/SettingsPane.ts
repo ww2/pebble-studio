@@ -15,7 +15,7 @@ import {
   type TimeConfig,
   type Rate,
 } from "../../main/backend/timeController.js";
-import { formatTimeDisplay, parseTimeInput, timePlaceholder } from "../timeFormat.js";
+import { parseTimeInput, to12h, from12h } from "../timeFormat.js";
 
 type ThemeChoice = "light" | "dark";
 type BootMode = "auto" | "manual";
@@ -123,7 +123,13 @@ export class SettingsPane {
 
   // ── Time section controls (explicit edit-then-apply) ────────────────────
   private dateInput!: HTMLInputElement;
-  private timeInput!: HTMLInputElement;
+  // Custom time is set via no-typing dropdowns: hour + minute (+ AM/PM in 12h
+  // mode). They read/write `customTime24` — see readSelectsToCanon /
+  // writeCanonToSelects. The hour select's option set swaps between the 0..23
+  // and 12,1..11 ranges when the 24-hour toggle flips (writeCanonToSelects).
+  private hourSelect!: HTMLSelectElement;
+  private minuteSelect!: HTMLSelectElement;
+  private ampmSelect!: HTMLSelectElement;
   private rateSelect!: HTMLSelectElement;
   private sourceSelect!: HTMLSelectElement;
   private runBtn!: HTMLButtonElement;
@@ -337,20 +343,51 @@ export class SettingsPane {
     this.dateInput.max = "2099-12-31";
     dateControl.append(dateLabel, this.dateInput);
 
-    // Custom time input (enabled only when source === "custom").
-    const timeControl = document.createElement("label");
+    // Custom time input (enabled only when source === "custom"). No typing: an
+    // hour + minute (+ AM/PM in 12h mode) trio of dropdowns. We avoid a native
+    // <input type="time"> because Chromium renders its 12h/24h purely from the
+    // OS locale and ignores our toggle; these selects let the 24-hour-clock
+    // switch control the format. They read/write the canonical `customTime24`
+    // (see readSelectsToCanon / writeCanonToSelects); the hour-option set + the
+    // AM/PM visibility are rebuilt for the active mode in writeCanonToSelects.
+    const timeControl = document.createElement("div");
     timeControl.className = "settings-watch-control";
     const timeInputLabel = document.createElement("span");
     timeInputLabel.className = "settings-watch-label type-body";
     timeInputLabel.textContent = "Custom time";
-    // Plain text input (NOT type=time): Chromium's native time picker renders
-    // 12h/24h from the OS locale and ignores our toggle, so we format/parse it
-    // ourselves (see timeFormat.ts) to honor the 24-hour-clock switch.
-    this.timeInput = document.createElement("input");
-    this.timeInput.type = "text";
-    this.timeInput.className = "settings-watch-select";
-    this.timeInput.autocomplete = "off";
-    timeControl.append(timeInputLabel, this.timeInput);
+
+    // Row holding the hour/minute/AM-PM selects side-by-side (right-aligned to
+    // match the single control they replace).
+    const timeSelects = document.createElement("div");
+    timeSelects.className = "settings-time-selects";
+
+    this.hourSelect = document.createElement("select");
+    this.hourSelect.className = "settings-watch-select";
+    this.hourSelect.setAttribute("aria-label", "Hour");
+    // Options are populated by writeCanonToSelects (24h: 00..23; 12h: 12,1..11).
+
+    this.minuteSelect = document.createElement("select");
+    this.minuteSelect.className = "settings-watch-select";
+    this.minuteSelect.setAttribute("aria-label", "Minute");
+    for (let mi = 0; mi < 60; mi++) {
+      const opt = document.createElement("option");
+      opt.value = String(mi);
+      opt.textContent = String(mi).padStart(2, "0");
+      this.minuteSelect.appendChild(opt);
+    }
+
+    this.ampmSelect = document.createElement("select");
+    this.ampmSelect.className = "settings-watch-select";
+    this.ampmSelect.setAttribute("aria-label", "AM or PM");
+    for (const value of ["AM", "PM"]) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = value;
+      this.ampmSelect.appendChild(opt);
+    }
+
+    timeSelects.append(this.hourSelect, this.minuteSelect, this.ampmSelect);
+    timeControl.append(timeInputLabel, timeSelects);
 
     // Rate dropdown (Custom only): Frozen / 1× / 2× / 4× / 10×. Rates drive the
     // emulator's clock shim — exact multipliers, and Frozen stops seconds too
@@ -380,7 +417,9 @@ export class SettingsPane {
       (on) => {
         this.hour24 = on;
         localStorage.setItem(TIME_HOUR24_KEY, on ? "true" : "false");
-        this.applyHour24ToInput();
+        // Swap the hour-select range (0..23 ↔ 12,1..11) + AM/PM visibility and
+        // reselect the SAME instant — convert via customTime24, don't lose it.
+        this.writeCanonToSelects(this.customTime24);
         // The 12/24h format is independent of the time offset, so toggling it
         // must push to the watch RIGHT NOW (re-applying the active config so the
         // emu-time-format command actually fires) — not wait for a later "Run".
@@ -437,16 +476,16 @@ export class SettingsPane {
       localStorage.setItem(TIME_CUSTOM_DATE_KEY, this.dateInput.value);
       markDirty();
     });
-    this.timeInput.addEventListener("change", () => {
-      const parsed = parseTimeInput(this.timeInput.value);
-      if (parsed === null) {
-        // Unparseable — restore the last good value rather than store garbage.
-        this.applyHour24ToInput();
-        return;
-      }
-      this.setCustomTime24(parsed); // also normalizes the displayed text
+    // Any of the three selects changing rebuilds the canonical 24h value from
+    // the current (hour, minute, AM/PM + mode) and stages it. No text to
+    // re-render, so setCustomTime24(canon, false) just persists.
+    const onTimeSelectChange = (): void => {
+      this.setCustomTime24(this.readSelectsToCanon(), false);
       markDirty();
-    });
+    };
+    this.hourSelect.addEventListener("change", onTimeSelectChange);
+    this.minuteSelect.addEventListener("change", onTimeSelectChange);
+    this.ampmSelect.addEventListener("change", onTimeSelectChange);
     this.rateSelect.addEventListener("change", () => {
       localStorage.setItem(TIME_RATE_KEY, this.rateSelect.value);
       markDirty();
@@ -667,7 +706,7 @@ export class SettingsPane {
       this.customTime24 = parseTimeInput(localStorage.getItem(TIME_CUSTOM_TIME_KEY) ?? "") ?? stored.time;
       this.rateSelect.value = localStorage.getItem(TIME_RATE_KEY) ?? "1x";
       this.hour24 = localStorage.getItem(TIME_HOUR24_KEY) === "true"; // default OFF (12h)
-      this.applyHour24ToInput();
+      this.writeCanonToSelects(this.customTime24);
       // Time source always starts at System on launch — a persisted Custom time
       // (often a now-stale timestamp) shouldn't silently drive the watch across
       // restarts. The custom field values above stay populated so switching to
@@ -690,21 +729,66 @@ export class SettingsPane {
     return this.hour24;
   }
 
-  /** Re-render the custom-time text input from the canonical value in the format
-   * the toggle selects (24h "HH:MM" or 12h "h:mm AM/PM"), and update the example
-   * placeholder. Called whenever hour24 or the canonical value changes. */
-  private applyHour24ToInput(): void {
-    this.timeInput.value = formatTimeDisplay(this.customTime24, this.hour24);
-    this.timeInput.placeholder = timePlaceholder(this.hour24);
+  /** Read the three custom-time selects and fold them back into the canonical
+   * 24h "HH:MM". In 24h mode the hour select already holds 0..23 (AM/PM hidden +
+   * ignored); in 12h mode it holds 1..12 and we combine it with AM/PM. */
+  private readSelectsToCanon(): string {
+    const minute = +this.minuteSelect.value;
+    if (this.hour24) {
+      const pad = (n: number): string => String(n).padStart(2, "0");
+      return `${pad(+this.hourSelect.value)}:${pad(minute)}`;
+    }
+    return from12h(+this.hourSelect.value, minute, this.ampmSelect.value as "AM" | "PM");
   }
 
-  /** Set the canonical custom time (24h "HH:MM"), persist it, and re-render the
-   * input. `display` controls whether the visible input is refreshed (skip while
-   * the user is mid-edit so we don't fight their typing). */
+  /** Rebuild the hour-select option set + AM/PM visibility for the current
+   * `hour24`, then set all three selects from the canonical value (converting
+   * 24h→12h when needed). This is the selects' analogue of the old text-input
+   * refresh: called whenever hour24 or the canonical value changes. */
+  private writeCanonToSelects(canon: string): void {
+    // (a) Rebuild the hour options for the active mode: 24h → 00..23 (value ==
+    //     label); 12h → 12 first, then 1..11 (value is the 1..12 hour).
+    this.hourSelect.replaceChildren();
+    if (this.hour24) {
+      for (let h = 0; h < 24; h++) {
+        const opt = document.createElement("option");
+        opt.value = String(h);
+        opt.textContent = String(h).padStart(2, "0");
+        this.hourSelect.appendChild(opt);
+      }
+    } else {
+      for (const h of [12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]) {
+        const opt = document.createElement("option");
+        opt.value = String(h);
+        opt.textContent = String(h);
+        this.hourSelect.appendChild(opt);
+      }
+    }
+    // AM/PM only makes sense (and is only visible) in 12-hour mode.
+    this.ampmSelect.hidden = this.hour24;
+
+    // (b) Select the values matching the canonical time for this mode.
+    const m = /^(\d{1,2}):(\d{2})$/.exec(canon.trim());
+    const h24 = m ? +m[1] : 0;
+    const minute = m ? +m[2] : 0;
+    if (this.hour24) {
+      this.hourSelect.value = String(h24);
+    } else {
+      const { hour, ampm } = to12h(canon);
+      this.hourSelect.value = String(hour);
+      this.ampmSelect.value = ampm;
+    }
+    this.minuteSelect.value = String(minute);
+  }
+
+  /** Set the canonical custom time (24h "HH:MM"), persist it, and (when
+   * `display`) refresh the selects from it. `display` is false on a change that
+   * originated FROM the selects (nothing to re-render); true when the value
+   * changes underneath them (prefill / programmatic set). */
   private setCustomTime24(canon: string, display = true): void {
     this.customTime24 = canon;
     localStorage.setItem(TIME_CUSTOM_TIME_KEY, canon);
-    if (display) this.applyHour24ToInput();
+    if (display) this.writeCanonToSelects(canon);
   }
 
   /**
@@ -716,7 +800,9 @@ export class SettingsPane {
   private syncTimeEnabled(): void {
     const custom = this.sourceSelect.value === "custom";
     this.dateInput.disabled = !custom;
-    this.timeInput.disabled = !custom;
+    this.hourSelect.disabled = !custom;
+    this.minuteSelect.disabled = !custom;
+    this.ampmSelect.disabled = !custom;
     this.rateSelect.disabled = !custom;
     this.runBtn.disabled = !custom;
     // Contextual buttons: Run + Reset only in Custom; hidden in System.
@@ -809,6 +895,14 @@ export class SettingsPane {
   private renderTimeStatus(): void {
     const el = this.timeStatusEl;
     const mode = this.sourceSelect.value;
+    // Highlight the apply button whenever a staged custom config (date, time, or
+    // rate) hasn't been pushed to the watch yet, so it's obvious that editing a
+    // control — e.g. switching the rate to 2×/4×/10× — does nothing until "Run
+    // custom time" is pressed. Platform-agnostic: the apply model is shared.
+    this.runBtn.classList.toggle(
+      "lib-pick-btn--needs-apply",
+      mode === "custom" && this.timeDirty,
+    );
     if (mode !== "custom") {
       el.textContent = "";
       el.classList.remove("settings-time-status--edited", "settings-time-status--running");

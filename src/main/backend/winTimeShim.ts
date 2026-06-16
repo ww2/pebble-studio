@@ -17,7 +17,7 @@
  * rest of the windows-native driver. Pure/injectable so it unit-tests on Linux.
  */
 import { spawn } from "node:child_process";
-import { writeFile as fsWriteFile } from "node:fs/promises";
+import { writeFile as fsWriteFile, appendFile as fsAppendFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { win32 as winPath } from "node:path";
 
@@ -43,6 +43,54 @@ export function winShimPaths(dir: string): WinShimPaths {
 export function winFakeTimeCtlPath(env: Record<string, string | undefined> = process.env): string {
   const temp = env.TEMP || env.TMP || "C:\\Windows\\Temp";
   return winPath.join(temp, "pb-faketime.ctl");
+}
+
+/** Where the patched qemu writes its fake-time diagnostic log (`%TEMP%\pb-qemu-ft.log`),
+ * passed to qemu as PEBBLE_FAKETIME_LOG. Confirms the control file is reaching qemu
+ * and what time it serves. Pure (env injectable). */
+export function winQemuFakeTimeLogPath(env: Record<string, string | undefined> = process.env): string {
+  const temp = env.TEMP || env.TMP || "C:\\Windows\\Temp";
+  return winPath.join(temp, "pb-qemu-ft.log");
+}
+
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC INSTRUMENTATION (session 7 — "custom time reverts" investigation)
+// ---------------------------------------------------------------------------
+
+/** Where the injected DLL appends its load-marker / ctl-reread / heartbeat lines
+ * (`%TEMP%\pb-faketime-dll.log`). Passed to the launcher env so the path is
+ * explicit + matches the user-collection instructions. Pure (env injectable). */
+export function winFakeTimeDllLogPath(env: Record<string, string | undefined> = process.env): string {
+  const temp = env.TEMP || env.TMP || "C:\\Windows\\Temp";
+  return winPath.join(temp, "pb-faketime-dll.log");
+}
+
+/** Where the main process logs every ctl write (`%TEMP%\pb-faketime-ts.log`).
+ * Correlate its timestamps with the DLL log to bisect TS-clobber vs unhooked
+ * clock source. Pure (env injectable). */
+export function winFakeTimeTsLogPath(env: Record<string, string | undefined> = process.env): string {
+  const temp = env.TEMP || env.TMP || "C:\\Windows\\Temp";
+  return winPath.join(temp, "pb-faketime-ts.log");
+}
+
+/** Append one line recording a ctl write: timestamp, target, rate, and the
+ * caller chain (so a stray System `<now> 1` write after a custom set is visible
+ * WITH who triggered it). Best-effort — never throws. */
+export async function logWinFakeTimeWrite(
+  targetUnix: number | null,
+  rate: number,
+  stack: string | undefined,
+  nowIso: string,
+  logPath: string = winFakeTimeTsLogPath(),
+  append: (p: string, data: string) => Promise<void> = (p, d) => fsAppendFile(p, d, "utf8"),
+): Promise<void> {
+  // Drop the Error() + this-frame lines; keep the meaningful caller chain.
+  const frames = (stack ?? "").split("\n").slice(2, 7).map((s) => s.trim()).join(" <- ");
+  try {
+    await append(logPath, `[${nowIso}] setFakeTime tgt=${targetUnix} rate=${rate} :: ${frames}\n`);
+  } catch {
+    /* logging must never break time control */
+  }
 }
 
 /**

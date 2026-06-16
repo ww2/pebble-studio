@@ -286,7 +286,93 @@ def main(sp):
          "BaseHTTPServer.HTTPServer(('127.0.0.1', port), AppConfigHandler)",
          "('127.0.0.1', port), AppConfigHandler"),
     ])
+    print("sitecustomize.py (fake-time shim):")
+    write_sitecustomize(sp)
+
     print("All patches applied/verified.")
+
+
+# Patch 13 — native-Windows fake-time shim for pebble-tool. The WSL track fakes
+# the clock for the whole process tree via LD_PRELOAD; on native Windows only qemu
+# reads PEBBLE_FAKETIME_FILE, so pebble-tool's post_connect would push the host's
+# REAL time via SetUTC and fight qemu's custom clock (modern fw: time-change
+# animation loops + reverts). This sitecustomize makes pebble-tool's clock track
+# the SAME fake time, so post_connect/emucontrol/screenshot push the custom time.
+# See docs + memory custom-time-revert-postconnect-clobber.
+_SITECUSTOMIZE = '''\
+# sitecustomize.py — Pebble Studio native-Windows fake-time shim for pebble-tool.
+# Windows analog of vendor/timeshim/timeshim.c. When PEBBLE_FAKETIME_FILE is set,
+# monkeypatch time.time/localtime/gmtime to track the fake clock qemu serves so
+# pebble-tool's SetUTC pushes the CUSTOM time, not the host's real time.
+#   control file (one line):  <target_unix_seconds|-> <rate>
+#   fake = anchor_fake + (real_now - anchor_real) * rate
+import os
+import time as _time
+
+_ctl = os.environ.get("PEBBLE_FAKETIME_FILE")
+if _ctl:
+    _real_time = _time.time
+    _real_monotonic = _time.monotonic
+    _real_localtime = _time.localtime
+    _real_gmtime = _time.gmtime
+    _st = {"anchor_real": _real_time(), "anchor_fake": _real_time(),
+           "rate": 1.0, "mtime": None, "last_check": 0.0}
+
+    def _refresh():
+        mono = _real_monotonic()
+        if mono - _st["last_check"] < 0.2:
+            return
+        _st["last_check"] = mono
+        try:
+            mtime = os.stat(_ctl).st_mtime
+        except OSError:
+            return
+        if mtime == _st["mtime"]:
+            return
+        _st["mtime"] = mtime
+        try:
+            with open(_ctl, "r") as f:
+                parts = f.read().split()
+        except OSError:
+            return
+        if len(parts) < 2:
+            return
+        tgt, rate_s = parts[0], parts[1]
+        real = _real_time()
+        _st["anchor_real"] = real
+        _st["anchor_fake"] = real if tgt == "-" else float(tgt)
+        try:
+            _st["rate"] = float(rate_s)
+        except ValueError:
+            _st["rate"] = 1.0
+
+    def _fake_time():
+        _refresh()
+        return _st["anchor_fake"] + (_real_time() - _st["anchor_real"]) * _st["rate"]
+
+    def _fake_localtime(secs=None):
+        return _real_localtime(_fake_time() if secs is None else secs)
+
+    def _fake_gmtime(secs=None):
+        return _real_gmtime(_fake_time() if secs is None else secs)
+
+    _time.time = _fake_time
+    _time.localtime = _fake_localtime
+    _time.gmtime = _fake_gmtime
+'''
+
+
+def write_sitecustomize(sp):
+    path = os.path.join(sp, "sitecustomize.py")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            if "PEBBLE_FAKETIME_FILE" in f.read():
+                print("  [skip] sitecustomize.py (already present)")
+                return
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(_SITECUSTOMIZE)
+    print("  [apply] sitecustomize.py")
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:

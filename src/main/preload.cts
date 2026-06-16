@@ -12,6 +12,11 @@ const studio = {
   button: (id: string) => ipcRenderer.invoke("emu:button", id),
   accelTap: () => ipcRenderer.invoke("emu:accelTap"),
   screenshot: (out: string) => ipcRenderer.invoke("emu:screenshot", out),
+  // Backlight-free framebuffer screenshot. Pass a capture filename; resolves with
+  // the saved absolute path, or null on ANY failure (renderer then falls back to
+  // the VNC-canvas + backlight grab).
+  screenshotFramebuffer: (name: string): Promise<string | null> =>
+    ipcRenderer.invoke("emu:screenshotFramebuffer", name),
   libAdd: (pbwPath: string) => ipcRenderer.invoke("lib:add", pbwPath),
   libList: () => ipcRenderer.invoke("lib:list"),
   libRemove: (p: string) => ipcRenderer.invoke("lib:remove", p),

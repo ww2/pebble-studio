@@ -5,8 +5,10 @@
  * WHY this exists: a native `<input type="time">` renders 12h-with-AM/PM or 24h
  * purely from the OS/app LOCALE (en-US → AM/PM, en-GB → 24h) and ignores the
  * element's `lang` attribute in Electron/Chromium — so the in-app "24-hour clock"
- * toggle could not change it (it always showed AM/PM on a US machine). We instead
- * use a plain text input and format/parse it ourselves off the toggle.
+ * toggle could not change it (it always showed AM/PM on a US machine). The custom
+ * time is therefore entered via our own HOUR / MINUTE / AM-PM dropdown selects
+ * (no native time picker, no typing), and these pure helpers convert between the
+ * selects' 12h/24h representation and the canonical store form off the toggle.
  *
  * Canonical storage form is always 24-hour "HH:MM" (zero-padded) so the rest of
  * the time pipeline (customWallMs, the badge) stays unambiguous.
@@ -62,7 +64,31 @@ export function parseTimeInput(raw: string): string | null {
   return null;
 }
 
-/** Placeholder/example for the active mode. */
-export function timePlaceholder(hour24: boolean): string {
-  return hour24 ? "HH:MM (e.g. 14:30)" : "h:mm AM/PM (e.g. 2:30 PM)";
+/**
+ * Split a canonical "HH:MM" (24h) into the 12-hour {hour, ampm} pair the AM/PM
+ * dropdowns show. The 12h hour is always in 1..12 (never 0):
+ *   00:** → 12 AM   01:**..11:** → 1..11 AM
+ *   12:** → 12 PM   13:**..23:** → 1..11 PM
+ * `minute` is passed back as-is (0..59). Invalid input falls back to 12:00 AM so
+ * the selects always land on a real option rather than an empty value.
+ */
+export function to12h(canon: string): { hour: number; minute: number; ampm: "AM" | "PM" } {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(canon.trim());
+  if (!m || +m[1] > 23 || +m[2] > 59) return { hour: 12, minute: 0, ampm: "AM" };
+  const h24 = +m[1];
+  const ampm: "AM" | "PM" = h24 >= 12 ? "PM" : "AM";
+  let h = h24 % 12;
+  if (h === 0) h = 12; // 0→12 AM, 12→12 PM
+  return { hour: h, minute: +m[2], ampm };
+}
+
+/**
+ * Inverse of `to12h`: fold a 12-hour {hour (1..12), ampm} + minute back into the
+ * canonical "HH:MM" (24h). 12 AM → 00, 12 PM → 12, 1..11 PM → 13..23.
+ */
+export function from12h(hour: number, minute: number, ampm: "AM" | "PM"): string {
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  let h = hour % 12;          // 12 → 0, 1..11 unchanged
+  if (ampm === "PM") h += 12; // 0→12 (noon), 1→13 … 11→23
+  return `${pad(h)}:${pad(minute)}`;
 }

@@ -19,6 +19,9 @@ interface StudioApi {
   button(id: string): Promise<unknown>;
   accelTap(): Promise<unknown>;
   screenshot(out: string): Promise<unknown>;
+  // Backlight-free framebuffer screenshot. Resolves with the saved absolute path,
+  // or null on ANY failure (renderer falls back to the canvas + backlight grab).
+  screenshotFramebuffer(name: string): Promise<string | null>;
   pickDirectory(): Promise<string | null>;
   setCaptureDir(dir: string): Promise<void>;
   libAdd(pbwPath: string): Promise<string[]>;

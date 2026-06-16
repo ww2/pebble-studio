@@ -121,6 +121,11 @@ export class WslDriver implements BackendDriver {
     return this.inner.screenshot(outPath);
   }
 
+  // No persistent pypkjs helper on the WSL path — fall back to the canvas grab.
+  async screenshotFramebuffer(outPath: string): Promise<boolean> {
+    return this.inner.screenshotFramebuffer(outPath);
+  }
+
   async wipe(): Promise<void> {
     return this.inner.wipe();
   }

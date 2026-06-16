@@ -7,7 +7,7 @@ import { makeNativeShell, makeWslShell, type BootToken } from "./backend/bootEmu
 import type { DriverKind } from "./backend/driverFactory.js";
 import { EMU_INFO_PATH } from "./backend/hostPaths.js";
 import { openClayWindow, parsePhonesimPort } from "./clayWindow.js";
-import { createBacklightController } from "./backend/backlight.js";
+import { createBacklightController, parseMonitorPort } from "./backend/backlight.js";
 import { makeTimeController, isNonSystemTime, detectHostTimezone, type TimeConfig } from "./backend/timeController.js";
 import { makeBridgeMonitor } from "./backend/bridgeMonitor.js";
 import { buildHealthCommand, interpretHealth } from "./backend/bridgeHealth.js";
@@ -105,10 +105,26 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // repoint it. Resolved here (not at module load) so app paths are ready.
   captureDir = path.resolve(app.getPath("downloads"));
 
-  // Backlight keepalive (Task K). It reads the qemu monitor port through the
-  // Shell matching the active driver kind (recorded at backend:init), so it works
-  // on a Windows+WSL host too.
-  const backlight = createBacklightController(() => driverKind, () => driver!.accelTap());
+  // Backlight keepalive (Task K). The "back" wake reads the qemu HMP monitor port
+  // from the emulator state file. windows-native MUST read %TEMP% via Node fs: a
+  // Windows-host `bash` is the WSL launcher, so a shell `cat /tmp/...` reads WSL's
+  // /tmp and never finds the native state file → no port → the keepalive, capture
+  // backlight, and Backlight-pulse button all silently no-op. (Same native-Windows
+  // shell-reads-WSL bug fixed for the Clay gear + bridge-health monitor.) wsl /
+  // native-Linux keep using the matching shell.
+  const backlight = createBacklightController(
+    () => driverKind,
+    () => driver!.accelTap(),
+    async () => {
+      if (driverKind === "windows-native") {
+        const raw = await fs.readFile(winHostPaths().emuInfo, "utf8").catch(() => "");
+        return raw.trim() ? parseMonitorPort(raw) : null;
+      }
+      const shell = driverKind === "wsl" ? makeWslShell() : makeNativeShell();
+      const { code, stdout } = await shell.run(`cat ${EMU_INFO_PATH} 2>/dev/null`);
+      return code === 0 && stdout.trim() ? parseMonitorPort(stdout) : null;
+    },
+  );
 
   // Time controller (Task 5). Uses a getter so it always references the current driver.
   const time = makeTimeController(() => driver);
@@ -322,6 +338,30 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     reassertTime();
   });
   ipcMain.handle("emu:screenshot", async (_e, out: string) => driver!.screenshot(out));
+  // Backlight-free framebuffer screenshot (over the watch protocol). The renderer
+  // passes a capture filename; main resolves it under the configured capture dir
+  // (same whitelist/traversal guard as capture:save), asks the driver to write the
+  // PNG there, and returns the saved absolute path — or null on ANY failure, which
+  // tells the renderer to fall back to the VNC-canvas + backlight grab. Never
+  // throws (a thrown handler would surface as a renderer rejection, defeating the
+  // graceful fallback). The framebuffer path is unverified-live; see winHelpers.ts.
+  ipcMain.handle("emu:screenshotFramebuffer", async (_e, name: string): Promise<string | null> => {
+    if (!driver) return null;
+    try {
+      const dir = captureDir ?? path.resolve(app.getPath("downloads"));
+      const out = resolveCapturePath(dir, name);
+      const ok = await driver.screenshotFramebuffer(out);
+      if (!ok) return null;
+      // Confirm the file actually landed before claiming success.
+      const stat = await fs.stat(out).catch(() => null);
+      if (!stat || !stat.isFile() || stat.size === 0) return null;
+      console.log(`[capture] saved (framebuffer) ${out}`);
+      return out;
+    } catch (e) {
+      console.warn(`[capture] framebuffer screenshot failed (falling back): ${String(e)}`);
+      return null;
+    }
+  });
   ipcMain.handle("emu:timelineQuickView", async (_e, on: boolean) => {
     await driver!.timelineQuickView(on);
     reassertTime();

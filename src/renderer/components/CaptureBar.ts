@@ -46,6 +46,9 @@ export class CaptureBar {
   private recording = false;
   private gif: InstanceType<typeof GIF> | null = null;
   private recTimer: ReturnType<typeof setInterval> | null = null;
+  /** Set once the backlight-free framebuffer screenshot has failed this session,
+   * so later shots skip straight to the canvas path instead of re-timing-out. */
+  private framebufferShotUnavailable = false;
 
   constructor(
     private readonly getHost: () => HTMLElement | null,
@@ -178,6 +181,37 @@ export class CaptureBar {
   private async takeScreenshot(): Promise<void> {
     const host = this.getHost();
     if (!host) { this.status.textContent = "No emulator screen"; return; }
+
+    // Preferred path: a BACKLIGHT-FREE framebuffer grab over the watch protocol
+    // (reads the firmware framebuffer, bright regardless of the LCD backlight), so
+    // no backlight hold is needed. main writes the PNG straight to the capture
+    // file and returns its path. On ANY failure it returns null and we fall back
+    // to the exact canvas + backlight path below. (Framebuffer path is unverified-
+    // live — see winHelpers.ts — hence the robust fallback.)
+    //
+    // The grab can be blocked by the single-client pypkjs bridge (the documented
+    // SetUTC/handshake blocker), in which case it only times out and falls back.
+    // To avoid paying that timeout on EVERY shot, the first failure disables the
+    // framebuffer attempt for the rest of the session — so at most one slow shot,
+    // then straight to canvas.
+    if (!this.framebufferShotUnavailable) {
+      try {
+        const base = `pebble-shot-${this.getPlatformId()}`;
+        const name = await window.studio.nextCaptureName(base, "png");
+        const saved = await window.studio.screenshotFramebuffer(name);
+        if (saved) {
+          this.status.textContent = `Saved: ${saved}`;
+          return;
+        }
+        // Returned null → framebuffer path unavailable here; stop trying it.
+        this.framebufferShotUnavailable = true;
+      } catch (err) {
+        // Never let a framebuffer error abort the shot — drop to the canvas path.
+        this.framebufferShotUnavailable = true;
+        console.warn("[capture] framebuffer screenshot failed (falling back to canvas):", err);
+      }
+    }
+
     try {
       // K: wake the backlight, give it a beat to rise, then grab — so the shot
       // isn't dim. try/finally guarantees the hold is always released.

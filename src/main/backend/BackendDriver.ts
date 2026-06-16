@@ -30,6 +30,14 @@ export interface BackendDriver {
   bluetooth(connected: boolean): Promise<void>;
   battery(percent: number, charging: boolean): Promise<void>;
   screenshot(outPath: string): Promise<void>;
+  /** BACKLIGHT-FREE framebuffer screenshot over the watch protocol (libpebble2
+   * Screenshot service, endpoint 8000 — bright regardless of the LCD backlight),
+   * written to `outPath` as PNG. Resolves true on success, false on ANY failure
+   * (unsupported driver, no emulator, helper/grab error, timeout) so the caller
+   * can fall back to the VNC-canvas + backlight grab. Only the windows-native
+   * driver implements it (reusing the persistent input helper's pypkjs socket);
+   * the others return false. */
+  screenshotFramebuffer(outPath: string): Promise<boolean>;
   /** Wipe all emulator data for the current SDK version. The emulator cannot
    * survive a wipe; caller must reboot afterward. */
   wipe(): Promise<void>;
