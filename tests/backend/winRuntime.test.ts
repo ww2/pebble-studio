@@ -14,7 +14,7 @@ const packaged: WinRuntimeCtx = {
   packaged: true,
   resourcesPath: "C:\\Program Files\\Pebble Studio\\resources",
   repoRoot: "C:\\repo",
-  userDataDir: "C:\\Users\\Jason Lin\\AppData\\Roaming\\Pebble Studio",
+  userDataDir: "C:\\Users\\TestUser\\AppData\\Roaming\\Pebble Studio",
   exists: () => true,
 };
 
@@ -67,7 +67,7 @@ describe("winRuntime path resolution", () => {
 
   it("pebbleDataDir is the writable app-data persist root under userData", () => {
     expect(pebbleDataDir(packaged)).toBe(
-      "C:\\Users\\Jason Lin\\AppData\\Roaming\\Pebble Studio\\pebble-data",
+      "C:\\Users\\TestUser\\AppData\\Roaming\\Pebble Studio\\pebble-data",
     );
   });
 });
@@ -107,7 +107,7 @@ describe("winRuntime pebbleCmd invocation contract", () => {
       "C:\\Program Files\\Pebble Studio\\resources\\qemu-pebble-win\\qemu-pebble.exe",
     );
     expect(c.env?.XDG_DATA_HOME).toBe(
-      "C:\\Users\\Jason Lin\\AppData\\Roaming\\Pebble Studio\\pebble-data",
+      "C:\\Users\\TestUser\\AppData\\Roaming\\Pebble Studio\\pebble-data",
     );
   });
 });

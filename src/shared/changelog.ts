@@ -12,7 +12,11 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   // The 2.x line is the native-Windows track (no WSL); the 1.x line is the
-  // WSL-connected track. 2.0.1 is the first native release.
+  // WSL-connected track. 2.0.1 is the first native release. 3.0.0 is the first
+  // public open-source release.
+  { version: "3.0.0", date: "2026-06-15", changes: [
+    "First public open-source release. Pebble Studio is now available on GitHub under the MIT license.",
+  ]},
   { version: "2.1.12", date: "2026-06-15", changes: [
     "The newer watches — Pebble Time 2 (emery), Pebble Round 2 (gabbro), and Pebble 2 Duo (flint) — now open the full watch menu (Settings, Music, Notifications, Alarms, Watchfaces) when you press Select, instead of just a watchface picker. This is now built in, so it survives updates and works on a fresh install.",
   ]},

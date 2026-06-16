@@ -17,7 +17,7 @@ const packaged: WinRuntimeCtx = {
   packaged: true,
   resourcesPath: "C:\\Program Files\\Pebble Studio\\resources",
   repoRoot: "C:\\repo",
-  userDataDir: "C:\\Users\\Jason Lin\\AppData\\Roaming\\Pebble Studio",
+  userDataDir: "C:\\Users\\TestUser\\AppData\\Roaming\\Pebble Studio",
   exists: () => true,
 };
 
@@ -99,7 +99,7 @@ describe("planWinSdkProvision", () => {
   });
 
   it("targets the WRITABLE persist dir (XDG_DATA_HOME = userData\\pebble-data)", () => {
-    const base = "C:\\Users\\Jason Lin\\AppData\\Roaming\\Pebble Studio\\pebble-data\\pebble-sdk\\SDKs";
+    const base = "C:\\Users\\TestUser\\AppData\\Roaming\\Pebble Studio\\pebble-data\\pebble-sdk\\SDKs";
     expect(p.persistSdks).toBe(base);
     expect(p.targetVersionDir).toBe(`${base}\\4.9.169`);
     expect(p.targetSdkCore).toBe(`${base}\\4.9.169\\sdk-core`);
