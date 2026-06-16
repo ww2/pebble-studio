@@ -29,6 +29,7 @@ import {
   mkdir,
   readdir,
   readFile,
+  writeFile,
   cp,
   copyFile,
   symlink,
@@ -45,6 +46,18 @@ import { sdkBundleRoot, qemuExe, pebbleDataDir } from "./winRuntime.js";
 
 /** Matches a bare SDK version dir name like `4.9.169` or `4.9`. */
 const VERSION_RE = /^\d+(\.\d+)+$/;
+
+/**
+ * Boards whose emulator firmware blobs are versioned by the sdk-core `.fw-rev`
+ * marker — the Cortex-M4 (stm32f4) watches whose qemu flash images we patched,
+ * plus the Cortex-M33 watches (emery/gabbro/flint) whose firmware we swapped to
+ * the full PebbleOS launcher. Listed as a constant so adding a board to the
+ * fw-refresh is a one-line change.
+ */
+export const FW_REFRESH_BOARDS = ["basalt", "chalk", "diorite", "emery", "gabbro", "flint"] as const;
+
+/** The two per-board qemu firmware blobs the `.fw-rev` marker versions. */
+export const FW_REFRESH_BLOBS = ["qemu_micro_flash.bin", "qemu_spi_flash.bin.bz2"] as const;
 
 function compareVersions(a: string, b: string): number {
   const pa = a.split(".").map(Number);
@@ -101,6 +114,15 @@ export interface WinSdkPaths {
   targetKeymaps: string;
   /** `<persist>\pebble-sdk\SDKs\current` (junction → targetVersionDir). */
   currentLink: string;
+  /** Bundle (read-only) firmware-revision marker `<bundleSdkCore>\.fw-rev`. */
+  bundleFwRev: string;
+  /** Target (writable) firmware-revision marker `<targetSdkCore>\.fw-rev`. */
+  targetFwRev: string;
+  /**
+   * pebble-tool's get_persist_dir() = `<persist>\pebble-sdk` — the root under
+   * which it decompresses each board's spi flash to `<ver>\<board>\qemu_spi_flash.bin`.
+   */
+  persistSdkRoot: string;
 }
 
 /**
@@ -111,12 +133,14 @@ export function planWinSdkProvision(ctx: WinRuntimeCtx, version: string): WinSdk
   const bundleRoot = sdkBundleRoot(ctx);
   const qemuBundleDir = winPath.dirname(qemuExe(ctx));
   const persist = pebbleDataDir(ctx);
-  const persistSdks = winPath.join(persist, "pebble-sdk", "SDKs");
+  const persistSdkRoot = winPath.join(persist, "pebble-sdk");
+  const persistSdks = winPath.join(persistSdkRoot, "SDKs");
   const targetVersionDir = winPath.join(persistSdks, version);
   const targetSdkCore = winPath.join(targetVersionDir, "sdk-core");
+  const bundleSdkCore = winPath.join(bundleRoot, "SDKs", version, "sdk-core");
   return {
     version,
-    bundleSdkCore: winPath.join(bundleRoot, "SDKs", version, "sdk-core"),
+    bundleSdkCore,
     keymapsSrc: winPath.join(qemuBundleDir, "pc-bios", "keymaps"),
     persistSdks,
     targetVersionDir,
@@ -124,6 +148,9 @@ export function planWinSdkProvision(ctx: WinRuntimeCtx, version: string): WinSdk
     targetManifest: winPath.join(targetSdkCore, "manifest.json"),
     targetKeymaps: winPath.join(targetVersionDir, "toolchain", "lib", "pc-bios", "keymaps"),
     currentLink: winPath.join(persistSdks, "current"),
+    bundleFwRev: winPath.join(bundleSdkCore, ".fw-rev"),
+    targetFwRev: winPath.join(targetSdkCore, ".fw-rev"),
+    persistSdkRoot,
   };
 }
 
@@ -137,6 +164,10 @@ export interface ProvisionFs {
   exists(p: string): Promise<boolean>;
   /** Read a text file; resolve "" if missing. */
   readText(p: string): Promise<string>;
+  /** Write a text file (creating/overwriting); parent dir must already exist. */
+  writeText(p: string, content: string): Promise<void>;
+  /** Delete a file (or tree); a no-op when the path is absent. */
+  remove(p: string): Promise<void>;
   /** List a directory's entries; resolve [] if missing. */
   list(p: string): Promise<string[]>;
   /** mkdir -p. */
@@ -163,7 +194,13 @@ export interface ProvisionResult {
   persistDir: string;
   sdkCoreDir: string;
   /** What actually ran this launch (for logging/tests). */
-  actions: { copiedSdkCore: boolean; seededKeymaps: boolean; refreshedJunction: boolean };
+  actions: {
+    copiedSdkCore: boolean;
+    seededKeymaps: boolean;
+    refreshedJunction: boolean;
+    /** True when the fw-rev marker differed and per-board firmware was re-copied. */
+    refreshedFirmware: boolean;
+  };
 }
 
 /** Real fs implementation of ProvisionFs (used in production). */
@@ -179,6 +216,12 @@ export function realProvisionFs(): ProvisionFs {
   return {
     exists,
     readText: async (p) => readFile(p, "utf8").catch(() => ""),
+    writeText: async (p, content) => {
+      await writeFile(p, content);
+    },
+    remove: async (p) => {
+      await rm(p, { recursive: true, force: true }).catch(() => {});
+    },
     list: async (p) => readdir(p).catch(() => [] as string[]),
     mkdirp: async (p) => {
       await mkdir(p, { recursive: true });
@@ -202,6 +245,71 @@ export function realProvisionFs(): ProvisionFs {
       await symlink(target, link, "junction");
     },
   };
+}
+
+/**
+ * Refresh the per-board emulator firmware in an ALREADY-provisioned target when
+ * the bundled firmware changes, keyed on the `sdk-core\.fw-rev` marker.
+ *
+ * Provisioning only re-copies the whole sdk-core tree when the manifest is
+ * missing/invalid, so an existing install keeps stale qemu flash images even
+ * after we ship patched firmware. This compares the bundle's `.fw-rev` content
+ * to the target's; when they DIFFER (target missing counts as different) it
+ * re-copies each affected board's `qemu_micro_flash.bin` + `qemu_spi_flash.bin.bz2`
+ * and deletes the stale DECOMPRESSED spi (`get_persist_dir()\<ver>\<board>\
+ * qemu_spi_flash.bin`) so pebble-tool regenerates it from the new template on the
+ * next emulator launch. Finally it stamps the bundle's marker onto the target.
+ *
+ * Gated + resilient:
+ *  - skips entirely when the bundle has no `.fw-rev` (nothing versions the fw);
+ *  - no-op when bundle marker == target marker (the common steady-state case);
+ *  - skips `alreadyCopiedFresh` runs (the full sdk-core copy already brought the
+ *    new blobs + the new marker, so there is nothing to refresh);
+ *  - skips a board whose bundle blob is missing rather than throwing.
+ *
+ * Returns true iff firmware was actually re-copied. Never throws for an expected
+ * cause; the caller additionally wraps this so a refresh failure can't break boot.
+ */
+export async function refreshWinSdkFirmware(
+  fs: ProvisionFs,
+  p: WinSdkPaths,
+  alreadyCopiedFresh: boolean,
+  log: (msg: string) => void = () => {},
+): Promise<boolean> {
+  // A fresh full copy this run already carried the new blobs + marker.
+  if (alreadyCopiedFresh) return false;
+
+  const bundleRev = await fs.readText(p.bundleFwRev);
+  // No marker in the bundle → nothing versions the firmware → skip entirely.
+  if (bundleRev === "") return false;
+
+  const targetRev = await fs.readText(p.targetFwRev);
+  // Common case: already on the bundled revision → no-op (normal launches).
+  if (targetRev === bundleRev) return false;
+
+  log(`Refreshing emulator firmware (${targetRev || "none"} → ${bundleRev})…`);
+
+  for (const board of FW_REFRESH_BOARDS) {
+    const bundleQemu = winPath.join(p.bundleSdkCore, "pebble", board, "qemu");
+    // If the bundle lacks this board's blobs, skip it (don't throw).
+    const missing = !(await fs.exists(winPath.join(bundleQemu, FW_REFRESH_BLOBS[0])));
+    if (missing) {
+      log(`  firmware for ${board} missing in bundle — skipping`);
+      continue;
+    }
+
+    const targetQemu = winPath.join(p.targetSdkCore, "pebble", board, "qemu");
+    await fs.mkdirp(targetQemu);
+    for (const blob of FW_REFRESH_BLOBS) {
+      await fs.copyFile(winPath.join(bundleQemu, blob), winPath.join(targetQemu, blob));
+    }
+    // Drop the stale decompressed spi so it regenerates from the new template.
+    await fs.remove(winPath.join(p.persistSdkRoot, p.version, board, "qemu_spi_flash.bin"));
+  }
+
+  // Stamp the bundle's revision onto the target so this is a no-op next launch.
+  await fs.writeText(p.targetFwRev, bundleRev);
+  return true;
 }
 
 /**
@@ -231,7 +339,12 @@ export async function provisionWinSdk(
   }
 
   const p = planWinSdkProvision(ctx, version);
-  const actions = { copiedSdkCore: false, seededKeymaps: false, refreshedJunction: false };
+  const actions = {
+    copiedSdkCore: false,
+    seededKeymaps: false,
+    refreshedJunction: false,
+    refreshedFirmware: false,
+  };
 
   // 1. sdk-core — copy when the target manifest is missing or invalid.
   if (!isSdkCoreManifestValid(await fs.readText(p.targetManifest), version)) {
@@ -266,6 +379,15 @@ export async function provisionWinSdk(
   // 3. `current` junction → the version dir (pebble-tool resolves SDKs\current).
   await fs.ensureJunction(p.targetVersionDir, p.currentLink);
   actions.refreshedJunction = true;
+
+  // 4. firmware refresh — pick up updated emulator firmware for an already-
+  // provisioned install when the bundled `.fw-rev` changed. Gated to a no-op in
+  // the common case; wrapped so a refresh failure can never break provisioning.
+  try {
+    actions.refreshedFirmware = await refreshWinSdkFirmware(fs, p, actions.copiedSdkCore, log);
+  } catch (e) {
+    log(`Firmware refresh skipped (non-fatal): ${(e as Error)?.message ?? e}`);
+  }
 
   log(`Pebble SDK ${version} ready.`);
   return {

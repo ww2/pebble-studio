@@ -4,8 +4,11 @@ import {
   isSdkCoreManifestValid,
   planWinSdkProvision,
   provisionWinSdk,
+  refreshWinSdkFirmware,
   ensureWinSdkProvisioned,
   _resetProvisionState,
+  FW_REFRESH_BOARDS,
+  FW_REFRESH_BLOBS,
   type ProvisionFs,
 } from "../../src/main/backend/winSdkProvision.js";
 import type { WinRuntimeCtx } from "../../src/main/backend/winRuntime.js";
@@ -127,6 +130,17 @@ function makeFakeFs(model: {
     async readText(p) {
       return files[p] ?? "";
     },
+    async writeText(p, content) {
+      calls.push(`writeText ${p}`);
+      files[p] = content;
+      present.add(p);
+    },
+    async remove(p) {
+      calls.push(`remove ${p}`);
+      delete files[p];
+      present.delete(p);
+      delete dirs[p];
+    },
     async list(p) {
       return dirs[p] ?? [];
     },
@@ -167,7 +181,13 @@ describe("provisionWinSdk — clean first run", () => {
     const res = await provisionWinSdk(packaged, { fs });
 
     expect(res.version).toBe("4.9.169");
-    expect(res.actions).toEqual({ copiedSdkCore: true, seededKeymaps: true, refreshedJunction: true });
+    expect(res.actions).toEqual({
+      copiedSdkCore: true,
+      seededKeymaps: true,
+      refreshedJunction: true,
+      // A fresh full copy already carries the new blobs + marker → no extra refresh.
+      refreshedFirmware: false,
+    });
 
     const p = planWinSdkProvision(packaged, "4.9.169");
     expect(fs.calls).toContain(`copyTree ${p.bundleSdkCore} -> ${p.targetSdkCore}`);
@@ -252,5 +272,142 @@ describe("ensureWinSdkProvisioned — process cache", () => {
     });
     const res = await ensureWinSdkProvisioned(packaged, { fs: healthy });
     expect(res.version).toBe("4.9.169");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// refreshWinSdkFirmware (fw-rev–gated firmware refresh)
+// ---------------------------------------------------------------------------
+
+describe("refreshWinSdkFirmware", () => {
+  const p = planWinSdkProvision(packaged, "4.9.169");
+
+  /** Bundle qemu dir for a board. */
+  const bundleQemu = (board: string) => `${p.bundleSdkCore}\\pebble\\${board}\\qemu`;
+  /** Target qemu dir for a board. */
+  const targetQemu = (board: string) => `${p.targetSdkCore}\\pebble\\${board}\\qemu`;
+  /** Decompressed spi for a board under the persist root. */
+  const decompressedSpi = (board: string) =>
+    `${p.persistSdkRoot}\\${p.version}\\${board}\\qemu_spi_flash.bin`;
+
+  /** A fake fs whose bundle carries `.fw-rev` + every board's blobs. */
+  function bundleWithFw(rev: string, boards: readonly string[] = FW_REFRESH_BOARDS) {
+    const files: Record<string, string> = { [p.bundleFwRev]: rev };
+    for (const board of boards) {
+      for (const blob of FW_REFRESH_BLOBS) files[`${bundleQemu(board)}\\${blob}`] = "fw";
+    }
+    return makeFakeFs({ files });
+  }
+
+  it("(a) marker equal → no refresh, no fs writes", async () => {
+    const fs = bundleWithFw("freeze-fix-1");
+    // Target already stamped with the same rev.
+    await fs.writeText(p.targetFwRev, "freeze-fix-1");
+    fs.calls.length = 0;
+
+    const refreshed = await refreshWinSdkFirmware(fs, p, false);
+    expect(refreshed).toBe(false);
+    expect(fs.calls).toEqual([]);
+  });
+
+  it("(b) marker differs → copies the 3 boards' blobs, deletes decompressed spi, writes new marker", async () => {
+    const fs = bundleWithFw("freeze-fix-1");
+    await fs.writeText(p.targetFwRev, "freeze-fix-0"); // stale rev present
+    fs.calls.length = 0;
+
+    const refreshed = await refreshWinSdkFirmware(fs, p, false);
+    expect(refreshed).toBe(true);
+
+    for (const board of FW_REFRESH_BOARDS) {
+      for (const blob of FW_REFRESH_BLOBS) {
+        expect(fs.calls).toContain(`copyFile ${bundleQemu(board)}\\${blob} -> ${targetQemu(board)}\\${blob}`);
+      }
+      expect(fs.calls).toContain(`remove ${decompressedSpi(board)}`);
+    }
+    // Exactly 2 blobs × 3 boards copied.
+    expect(fs.calls.filter((c) => c.startsWith("copyFile")).length).toBe(FW_REFRESH_BOARDS.length * FW_REFRESH_BLOBS.length);
+    // New marker stamped last.
+    expect(fs.calls).toContain(`writeText ${p.targetFwRev}`);
+    expect(await fs.readText(p.targetFwRev)).toBe("freeze-fix-1");
+  });
+
+  it("(c) target marker missing → treated as differ → refresh runs", async () => {
+    const fs = bundleWithFw("freeze-fix-1"); // no target .fw-rev written
+    fs.calls.length = 0;
+
+    const refreshed = await refreshWinSdkFirmware(fs, p, false);
+    expect(refreshed).toBe(true);
+    expect(fs.calls.filter((c) => c.startsWith("copyFile")).length).toBe(FW_REFRESH_BOARDS.length * FW_REFRESH_BLOBS.length);
+    expect(await fs.readText(p.targetFwRev)).toBe("freeze-fix-1");
+  });
+
+  it("(d) bundle marker missing → skip entirely (no-op)", async () => {
+    // Bundle has board blobs but no .fw-rev marker.
+    const files: Record<string, string> = {};
+    for (const board of FW_REFRESH_BOARDS) {
+      for (const blob of FW_REFRESH_BLOBS) files[`${bundleQemu(board)}\\${blob}`] = "fw";
+    }
+    const fs = makeFakeFs({ files });
+    fs.calls.length = 0;
+
+    const refreshed = await refreshWinSdkFirmware(fs, p, false);
+    expect(refreshed).toBe(false);
+    expect(fs.calls).toEqual([]);
+  });
+
+  it("(e) fresh full copy this run → don't double-refresh", async () => {
+    const fs = bundleWithFw("freeze-fix-1"); // would otherwise differ (no target rev)
+    fs.calls.length = 0;
+
+    const refreshed = await refreshWinSdkFirmware(fs, p, /* alreadyCopiedFresh */ true);
+    expect(refreshed).toBe(false);
+    expect(fs.calls).toEqual([]);
+  });
+
+  it("(f) a board's blob missing in bundle → skip that board without throwing", async () => {
+    // chalk has no blobs in the bundle; basalt + diorite do.
+    const fs = bundleWithFw("freeze-fix-1", ["basalt", "diorite"]);
+    await fs.writeText(p.targetFwRev, "freeze-fix-0");
+    fs.calls.length = 0;
+
+    const refreshed = await refreshWinSdkFirmware(fs, p, false);
+    expect(refreshed).toBe(true);
+
+    // chalk skipped — no copies for it.
+    expect(fs.calls.some((c) => c.includes(`\\chalk\\`))).toBe(false);
+    // basalt + diorite refreshed: 2 boards × 2 blobs.
+    expect(fs.calls.filter((c) => c.startsWith("copyFile")).length).toBe(2 * FW_REFRESH_BLOBS.length);
+    // Marker still advanced.
+    expect(await fs.readText(p.targetFwRev)).toBe("freeze-fix-1");
+  });
+
+  it("is wired into provisionWinSdk: an existing install with a stale fw-rev gets refreshed", async () => {
+    _resetProvisionState();
+    const files: Record<string, string> = {
+      // already-provisioned (valid manifest + keymaps) so no full copy happens
+      [p.targetManifest]: JSON.stringify({ type: "sdk-core", version: "4.9.169" }),
+      [`${p.targetKeymaps}\\en-us`]: "x",
+      // bundle ships a newer fw-rev than the target
+      [p.bundleFwRev]: "freeze-fix-1",
+      [p.targetFwRev]: "freeze-fix-0",
+    };
+    for (const board of FW_REFRESH_BOARDS) {
+      for (const blob of FW_REFRESH_BLOBS) files[`${bundleQemu(board)}\\${blob}`] = "fw";
+    }
+    const fs = makeFakeFs({
+      files,
+      dirs: { [BUNDLE_SDKS]: ["4.9.169", "current"], [KEYMAPS_SRC]: ["en-us"] },
+    });
+
+    const res = await provisionWinSdk(packaged, { fs });
+    expect(res.actions.copiedSdkCore).toBe(false);
+    expect(res.actions.refreshedFirmware).toBe(true);
+    expect(await fs.readText(p.targetFwRev)).toBe("freeze-fix-1");
+  });
+
+  it("FW_REFRESH_BOARDS covers the stm32f4 trio AND the M33 full-launcher trio", () => {
+    for (const board of ["basalt", "chalk", "diorite", "emery", "gabbro", "flint"]) {
+      expect(FW_REFRESH_BOARDS).toContain(board);
+    }
   });
 });
