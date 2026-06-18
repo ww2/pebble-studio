@@ -9,6 +9,7 @@ import { bootEmulator, stopEmulator, makeWslBootDeps } from "./bootEmulator.js";
 import { makeWinBootDeps } from "./winBootDeps.js";
 import { defaultCtx, pebbleCmd, bundledToolsPresent, pebblePyExe } from "./winRuntime.js";
 import { winFakeTimeCtlPath, winQemuFakeTimeLogPath } from "./winTimeShim.js";
+import { simEnvPath } from "./simEnv.js";
 import { winHostPaths } from "./hostPaths.js";
 import { deployWinHelpers } from "./winHelpers.js";
 import { WinInputChannel, readPypkjsPort } from "./winInputChannel.js";
@@ -118,7 +119,15 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
       const c = pebbleCmd(args, ctx);
       // PEBBLE_FAKETIME_LOG: qemu records (to %TEMP%) that the control file arrived
       // and what time it serves — readable to confirm/diagnose custom time.
-      c.env = { ...c.env, PEBBLE_FAKETIME_FILE: ctlPath, PEBBLE_FAKETIME_LOG: ftLogPath };
+      c.env = {
+        ...c.env,
+        PEBBLE_FAKETIME_FILE: ctlPath,
+        PEBBLE_FAKETIME_LOG: ftLogPath,
+        // Path to the simulated location/weather control file, read by the bundled
+        // python's sitecustomize -> pebble_studio_sim. Always set; the file's
+        // presence + `enabled` flag decide whether interception is active.
+        PEBBLE_SIM_ENV_FILE: simEnvPath(ctx.userDataDir),
+      };
       return c;
     };
     // Spawn the pebble-tool supervisor (emu-control) WITHOUT `detached`. On

@@ -36,6 +36,9 @@ const BACKLIGHT_ACTIVATION_KEY = "pebble-studio:backlight-activation";
 /** The two ways the Backlight button can wake the screen. */
 export type BacklightActivation = "shake" | "back";
 
+/** Emulator lifecycle state for the live preview. */
+export type EmuState = "stopped" | "booting" | "live" | "stopping" | "unresponsive";
+
 /**
  * Map the persisted backlight-activation setting to a concrete action. Only the
  * exact string "shake" selects the motion nudge; everything else (null, unknown,
@@ -43,6 +46,27 @@ export type BacklightActivation = "shake" | "back";
  */
 export function backlightActivationFromSetting(raw: string | null): BacklightActivation {
   return raw === "shake" ? "shake" : "back";
+}
+
+/**
+ * Decide whether reconnectAfterClear should actually rewire the VNC canvas.
+ * Pure + unit-tested.
+ *   - Always need a current platform (nothing to reconnect to otherwise).
+ *   - If WE drove the reboot externally (weather refresh), bridge-dead was
+ *     suppressed for its duration, so `state` stayed "live" and we reconnect
+ *     regardless of the exact state — guarding against a stray transition that
+ *     would otherwise leave the canvas black.
+ *   - Otherwise (the "Clear emulator" path) only reconnect a live/unresponsive
+ *     emulator; a stopped/booting one is mid-lifecycle and owns its own canvas.
+ */
+export function shouldReconnectAfterReboot(
+  wasExternalReboot: boolean,
+  state: EmuState,
+  hasCurrentPlatform: boolean,
+): boolean {
+  if (!hasCurrentPlatform) return false;
+  if (wasExternalReboot) return true;
+  return state === "live" || state === "unresponsive";
 }
 
 /**
@@ -174,7 +198,7 @@ export class EmulatorView {
    * `booting` = a start() is in flight; `live` = VNC connected; `stopping` =
    * a stop/abort is in flight. Drives button labels/enablement and gates IPC.
    */
-  private state: "stopped" | "booting" | "live" | "stopping" | "unresponsive" = "stopped";
+  private state: EmuState = "stopped";
   /**
    * Monotonic boot generation. Each boot captures the current gen; force-close
    * (and each new boot) increments it. A boot's start() goes `live` ONLY if its
@@ -209,6 +233,18 @@ export class EmulatorView {
   private bootProgressDispose: (() => void) | null = null;
   /** Disposer for the bridge-dead subscription (always active). */
   private bridgeDeadDispose: (() => void) | null = null;
+  /**
+   * Count of externally-driven reboots (the weather-refresh flow, which
+   * stops+reboots the emulator entirely in the main process) currently in
+   * flight. The renderer's state machine isn't driving those reboots, so the
+   * bridge-health monitor will briefly see the emulator vanish and come back.
+   * While this is > 0 we suppress the crash / auto-relaunch path so it can't
+   * (a) flip the canvas to "unresponsive" mid-refresh or (b) kick off a second,
+   * colliding reboot. A COUNT (not a bool) so overlapping applies — e.g. two
+   * quick clicks of Apply — stay suppressed until the LAST one settles.
+   * Incremented by beginExternalReboot(), decremented by endExternalReboot().
+   */
+  private externalRebootDepth = 0;
   /** Consecutive auto-relaunches since the last sustained-healthy run (cap guard). */
   private autoRelaunchCount = 0;
   /** Timer that resets autoRelaunchCount once a run has stayed live long enough. */
@@ -363,9 +399,20 @@ export class EmulatorView {
     });
     this.timelineBtn.addEventListener("click", () => {
       if (this.state !== "live") return;
-      this.timelinePeek = !this.timelinePeek;
-      this.timelineBtn.classList.toggle("emu-action--on", this.timelinePeek);
-      void window.studio.timelineQuickView(this.timelinePeek).catch(() => {});
+      const next = !this.timelinePeek;
+      // Optimistic toggle for instant feedback; confirm or revert on the result.
+      this.timelinePeek = next;
+      this.timelineBtn.classList.toggle("emu-action--on", next);
+      window.studio.timelineQuickView(next)
+        .then(() => {
+          this.status.textContent = next ? "Timeline peek on — sample pin added" : "Timeline peek off";
+        })
+        .catch((e: unknown) => {
+          // Roll back the optimistic toggle and surface why.
+          this.timelinePeek = !next;
+          this.timelineBtn.classList.toggle("emu-action--on", !next);
+          this.status.textContent = `Timeline peek failed: ${e instanceof Error ? e.message : String(e)}`;
+        });
     });
     // Backlight — wake the screen once. The activation method (Back-button press
     // vs accelerometer shake) is chosen in Settings; we read it fresh on each
@@ -447,6 +494,10 @@ export class EmulatorView {
     // H4: subscribe to bridge-dead notifications from the main-process health
     // monitor. Only transition when live — ignore if already stopping/booting.
     this.bridgeDeadDispose = studioBootProgress().onBridgeDead((reason) => {
+      // An external reboot (weather refresh) is tearing the emulator down and
+      // back up in the main process; the monitor naturally sees it disappear.
+      // Ignore — that flow owns the lifecycle and reconnects when it's done.
+      if (this.externalRebootDepth > 0) return;
       if (this.state !== "live") return;
       // A run just ended — cancel the pending "recovered" reset so a crash
       // before the healthy window elapses still counts toward the cap.
@@ -838,6 +889,11 @@ export class EmulatorView {
     const caret = this.diagToggle.querySelector(".emu-diag-caret");
     if (caret) caret.textContent = expanded ? "▾" : "▸";
     if (expanded) this.renderDiag();
+    // Toggling the diag body resizes a sibling inside `.stage-col`, not the
+    // column's own box, so the fit ResizeObserver doesn't fire. Recompute "fit"
+    // here so collapsing restores the full fit scale (was stuck small until a
+    // window resize).
+    if (this.zoom === "fit") this.applyFitScale();
   }
 
   /**
@@ -1054,6 +1110,32 @@ export class EmulatorView {
     // so a "loads then crashes" sequence shows the boot + the crash together).
     this.logEvent("live", "● Live");
 
+    // Activate Pebble Health on boot BEFORE installing user apps, so a misbehaving/
+    // crashing watchface can never prevent health activation (health is a system-level
+    // BlobDB pref and doesn't need any app installed). Awaited so the BlobDB write
+    // lands on the fresh, healthy emulator before any user app runs.
+    //
+    // The modern boards (emery/gabbro/flint) always get health on — they ship with it
+    // enabled by default; the "Activate Pebble Health on boot" toggle only governs the
+    // legacy boards whose stock firmware relies on this runtime injection.
+    const MODERN_HEALTH_BOARDS = new Set<PlatformId>(["emery", "gabbro", "flint"]);
+    const healthOnBoot =
+      (this.currentPlatform != null && MODERN_HEALTH_BOARDS.has(this.currentPlatform)) ||
+      localStorage.getItem("pebble-studio:health-activate-on-boot") !== "false";
+    if (healthOnBoot) {
+      try {
+        const r = await window.studio.activateHealth();
+        if (r.ok) this.logEvent("live", "● Pebble Health activated");
+        // A real (non-success) status code is worth surfacing; a null status means
+        // the runtime probe couldn't confirm (state file / pypkjs not reachable in
+        // time) — NOT that Health is off, since the modern boards ship with it on and
+        // the legacy boards have it seeded in firmware. Don't cry "not activated".
+        else if (r.status != null) this.logEvent("info", `Pebble Health activation returned status ${r.status}`);
+        else this.logEvent("info", "Pebble Health: activation not confirmed (may already be enabled on this board)");
+      } catch (e) {
+        console.warn("[health] activate failed", e);
+      }
+    }
     // Re-install library apps after boot so a platform switch picks them up.
     try {
       await window.studio.libInstallAll();
@@ -1343,13 +1425,40 @@ export class EmulatorView {
   }
 
   /**
+   * Arm bridge-dead suppression ahead of a reboot driven entirely by the main
+   * process (the weather-refresh flow). Must be called BEFORE the round-trip
+   * that triggers the reboot, because the health monitor can emit bridge-dead
+   * while the emulator is mid-restart. MUST be paired 1:1 with endExternalReboot
+   * (call it from a `finally` so every begin is balanced on every exit path).
+   */
+  beginExternalReboot(): void {
+    this.externalRebootDepth++;
+  }
+
+  /**
+   * Balance one beginExternalReboot(). Suppression lifts only when the last
+   * in-flight external reboot ends, so overlapping applies stay covered. Floored
+   * at 0 so an unbalanced extra call can't wrap into a stuck-suppressed state.
+   */
+  endExternalReboot(): void {
+    this.externalRebootDepth = Math.max(0, this.externalRebootDepth - 1);
+  }
+
+  /**
    * Reconnect VNC to the already-running emulator after a wipe+reboot triggered
-   * externally (e.g. "Clear emulator"). Unlike `show()` / `boot()`, this
-   * does NOT call `start()` (the emulator is already booted) and does NOT call
-   * `libInstallAll()` (the whole point of Clear is to leave it empty).
+   * externally (e.g. "Clear emulator", or applying simulated weather). Unlike
+   * `show()` / `boot()`, this does NOT call `start()` (the emulator is already
+   * booted) and does NOT call `libInstallAll()` (Clear leaves it empty; the
+   * weather flow reinstalls in the main process).
    */
   async reconnectAfterClear(platformId: PlatformId): Promise<void> {
-    if ((this.state !== "live" && this.state !== "unresponsive") || !this.currentPlatform) return;
+    // If we drove an external reboot, bridge-dead was suppressed throughout so
+    // `state` stayed "live"; accept that case explicitly rather than depending on
+    // the live/unresponsive guard, which a stray transition could otherwise have
+    // tripped (black canvas). We only READ the depth here — the caller's `finally`
+    // balances the begin/end, so suppression survives until the reconnect is done.
+    const wasExternalReboot = this.externalRebootDepth > 0;
+    if (!shouldReconnectAfterReboot(wasExternalReboot, this.state, !!this.currentPlatform)) return;
     const info = getPlatform(platformId);
     this.disconnectVnc();
     this.state = "live";
@@ -1380,12 +1489,19 @@ export class EmulatorView {
       el.className = `emu-hit emu-hit--${id}`;
       el.dataset.button = id;
       el.title = id;
-      // Don't let a mouse click leave the nub focused — otherwise the next arrow
-      // key flips Chromium into :focus-visible and draws a ring on the last-
-      // clicked nub. The buttons are operated by the global key handler, so they
-      // never need to hold focus.
-      el.addEventListener("mousedown", (e) => e.preventDefault());
-      el.addEventListener("click", () => void window.studio.button(id));
+      let pressed = false;
+      el.addEventListener("mousedown", (e) => {
+        e.preventDefault(); // don't leave the nub focused (avoids a stray focus ring)
+        pressed = true;
+        void window.studio.button(id, "hold");
+      });
+      const release = (): void => {
+        if (!pressed) return;
+        pressed = false;
+        void window.studio.button(id, "release");
+      };
+      el.addEventListener("mouseup", release);
+      el.addEventListener("mouseleave", release); // dragging off the nub releases
       this.buttonsOverlay.appendChild(el);
       this.buttonEls.push(el);
     }

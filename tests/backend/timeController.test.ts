@@ -88,7 +88,6 @@ function fakeDriver(opts: { shim?: boolean } = {}) {
 
 describe("makeTimeController — shim-backed (primary path)", () => {
   const t0 = WINTER.getTime();
-  const t0Sec = Math.trunc(t0 / 1000);
   const deps = { now: () => t0, hostTz: () => HOST };
 
   it("applyAll with no driver is a no-op", async () => {
@@ -139,12 +138,15 @@ describe("makeTimeController — shim-backed (primary path)", () => {
     tc.stop();
   });
 
-  it("system after custom: setFakeTime(nowSec, 1) returns the fake clock to real time", async () => {
+  it("system after custom: setFakeTime(null, 1) returns the fake clock to real time", async () => {
     const d = fakeDriver();
     const tc = makeTimeController(() => d, deps);
     await tc.setConfig(cfg({ source: "custom", rate: "frozen", customWallMs: t0 }));
     await tc.setConfig(cfg({ source: "system", timezone: HOST }));
-    expect(d.fake[d.fake.length - 1]).toEqual([t0Sec, 1]);
+    // System writes a RELATIVE "-" anchor (null target), not an absolute "<now> 1":
+    // a relative anchor reads as real time whenever qemu reads it, so the f2xx RTC
+    // boot-seed is never one-boot stale (the ~1-min-behind bug). See timeController.apply.
+    expect(d.fake[d.fake.length - 1]).toEqual([null, 1]);
     tc.stop();
   });
 
@@ -277,5 +279,48 @@ describe("makeTimeController — legacy fallback (shim unavailable)", () => {
     await vi.advanceTimersByTimeAsync(5000);
     expect(d.tz.length).toBe(count);
     tc.stop();
+  });
+});
+
+describe("currentWatchUnix", () => {
+  // A driver whose shim is ready, so apply() takes the shim (primary) path.
+  const shimDriver = () => ({
+    setTzOffset: async () => {},
+    setFakeTime: async () => {},
+    ensureTimeShim: async () => true,
+    timeFormat: async () => {},
+  });
+  const HOSTZ = "America/Los_Angeles";
+  // Winter instant so the host offset is a stable PST −480 (no DST ambiguity).
+  const T0 = new Date("2026-01-15T20:00:00Z").getTime();
+
+  it("system mode tracks real time from the apply instant", async () => {
+    let nowMs = T0;
+    const c = makeTimeController(shimDriver, { now: () => nowMs, hostTz: () => HOSTZ });
+    await c.setConfig({ ...DEFAULT_TIME_CONFIG, source: "system", rate: "1x", timezone: HOSTZ });
+    expect(c.currentWatchUnix()).toBe(Math.trunc(T0 / 1000));
+    nowMs = T0 + 30_000; // 30s later
+    expect(c.currentWatchUnix()).toBe(Math.trunc(T0 / 1000) + 30);
+  });
+
+  it("custom frozen holds the entered target", async () => {
+    let nowMs = T0;
+    const wall = Date.UTC(2020, 0, 1, 9, 0, 0); // entered 2020-01-01 09:00 local
+    const c = makeTimeController(shimDriver, { now: () => nowMs, hostTz: () => HOSTZ });
+    await c.setConfig({ ...DEFAULT_TIME_CONFIG, source: "custom", rate: "frozen", customWallMs: wall, timezone: HOSTZ });
+    const target = fakeTargetUnix(wall, HOSTZ, T0);
+    expect(c.currentWatchUnix()).toBe(target);
+    nowMs = T0 + 120_000; // 2 min later — frozen → unchanged
+    expect(c.currentWatchUnix()).toBe(target);
+  });
+
+  it("custom 10x advances at the rate", async () => {
+    let nowMs = T0;
+    const wall = Date.UTC(2020, 0, 1, 9, 0, 0);
+    const c = makeTimeController(shimDriver, { now: () => nowMs, hostTz: () => HOSTZ });
+    await c.setConfig({ ...DEFAULT_TIME_CONFIG, source: "custom", rate: "10x", customWallMs: wall, timezone: HOSTZ });
+    const target = fakeTargetUnix(wall, HOSTZ, T0);
+    nowMs = T0 + 10_000; // 10 real s → 100 watch s at 10x
+    expect(c.currentWatchUnix()).toBe(target + 100);
   });
 });

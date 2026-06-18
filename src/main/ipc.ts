@@ -9,6 +9,7 @@ import { EMU_INFO_PATH } from "./backend/hostPaths.js";
 import { openClayWindow, parsePhonesimPort } from "./clayWindow.js";
 import { createBacklightController, parseMonitorPort } from "./backend/backlight.js";
 import { makeTimeController, isNonSystemTime, detectHostTimezone, type TimeConfig } from "./backend/timeController.js";
+import { makeBatteryController } from "./backend/batteryController.js";
 import { makeBridgeMonitor } from "./backend/bridgeMonitor.js";
 import { buildHealthCommand, interpretHealth } from "./backend/bridgeHealth.js";
 import { makeNativeHealthCheck } from "./backend/winBridgeHealth.js";
@@ -16,7 +17,11 @@ import { winHostPaths } from "./backend/hostPaths.js";
 import { readPypkjsPort } from "./backend/winInputChannel.js";
 import { defaultCtx } from "./backend/winRuntime.js";
 import { ensureWinSdkProvisioned } from "./backend/winSdkProvision.js";
-import type { PlatformId, ButtonId } from "../shared/types.js";
+import { readSimEnv, writeSimEnv } from "./backend/simEnv.js";
+import { clearWeatherCacheArgv, refreshWeatherAfterSimChange } from "./backend/weatherCacheRefresh.js";
+import { spawnRunner } from "./backend/spawnRunner.js";
+import type { PlatformId, ButtonId, ButtonAction } from "../shared/types.js";
+import type { SimEnvConfig } from "../shared/simEnv.js";
 import { LibraryStore } from "./library.js";
 
 let driver: BackendDriver | null = null;
@@ -129,6 +134,12 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // Time controller (Task 5). Uses a getter so it always references the current driver.
   const time = makeTimeController(() => driver);
 
+  // Battery controller (feat/battery-and-health). Remembers the user's chosen
+  // simulated level and re-asserts it after every reboot — a fresh boot reverts
+  // to the firmware default (emery 100%, basalt 80%), so the sim-weather refresh,
+  // "Clear emulator", or a model relaunch would otherwise silently drop it.
+  const battery = makeBatteryController(() => driver);
+
   // Every `pebble` command re-syncs HOST time to the watch on connect (pebble-tool
   // commands/base.py post_connect). Since v0.0.13 that clobber only matters for
   // Timezone mode and the legacy offset fallback — shim-backed custom keeps
@@ -138,6 +149,11 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   const reassertTime = (): void => {
     if (isNonSystemTime(time.getConfig(), detectHostTimezone())) void time.reassert();
   };
+
+  /** Seconds ahead of the watch clock to place the demo pin (inside the peek window). */
+  const SAMPLE_PIN_LEAD_SEC = 90;
+  /** Title shown on the demo pin's peek bar. */
+  const SAMPLE_PIN_TITLE = "Sample Pin";
 
   // Bridge-health monitor (Task H4). Polls qemu + pypkjs health after every
   // successful boot; fires "emu:bridge-dead" to the renderer when the bridge dies.
@@ -210,6 +226,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     // 3. Reboot the current platform clean — WITHOUT reinstalling library apps
     //    (that's what "clear" means: the watch starts fresh with no user apps).
     await driver!.start(platformId);
+    await battery.reassert(); // re-assert the chosen battery level on the clear-rebooted emulator (before the time push: emu-battery's connect re-syncs host time)
     void time.applyAll(); // re-assert time settings on the clear-rebooted emulator (fire-and-forget)
     bridgeMonitor.start(platformId);
     // loaded remains empty after the clear reboot.
@@ -273,6 +290,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     // handled by the start() call below, same as before.)
     await driver?.ensureTimeShim().catch(() => false);
     const ep = await driver!.start(id, token, onStep);
+    await battery.reassert(); // re-assert the chosen battery level on the fresh emulator (before the time push, since emu-battery's connect re-syncs host time)
     void time.applyAll(); // re-assert time settings on the fresh emulator (fire-and-forget)
     // Arm the health monitor only if this boot wasn't superseded by a force-close
     // mid-flight: emu:abort/emu:stop flip token.cancelled and call bridgeMonitor.stop(),
@@ -324,18 +342,93 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // Time-shim readiness ({shim:boolean}) — the Settings note shows the legacy
   // offset-fallback limits when false.
   ipcMain.handle("time:status", async () => time.getStatus());
+  // Simulated location & weather control file (read by the bundled python's
+  // sitecustomize). sim:get hydrates the Settings UI; sim:set persists changes,
+  // which the emulator picks up live (sitecustomize re-reads on mtime change).
+  ipcMain.handle("sim:get", async (): Promise<SimEnvConfig> =>
+    readSimEnv(app.getPath("userData")));
+  ipcMain.handle("sim:set", async (_e, cfg: SimEnvConfig): Promise<{ rebooted: boolean }> => {
+    await writeSimEnv(app.getPath("userData"), cfg);
+    // Make weather watchfaces reflect the new values NOW rather than waiting out
+    // their internal fetch throttle (faces commonly cache their last fetch for
+    // some minutes, keyed on a localStorage epoch-ms timestamp). We clear those
+    // throttle stamps from on-disk localStorage; if an emulator is live, we reboot
+    // and relaunch the face so it refetches the new weather on its launch handshake.
+    // Windows-native only (the bundled python hosts the helper). Never fatal —
+    // sim-env.json is already written, so a refresh failure just defers the change
+    // to the next natural launch.
+    try {
+      // Windows-native only (the bundled python hosts the helper); skip the
+      // win32-only defaultCtx() entirely on other stacks where it would throw.
+      const isNative = driverKind === "windows-native";
+      const ctx = isNative ? await defaultCtx() : null;
+      const { rebooted } = await refreshWeatherAfterSimChange({
+        enabled: isNative,
+        isLive: async () =>
+          currentPlatform != null && readPypkjsPort(winHostPaths().emuInfo) != null,
+        clearCache: async () => {
+          const { cmd, args, env } = clearWeatherCacheArgv(ctx!);
+          const r = await spawnRunner(cmd, args, env);
+          if (r.code !== 0) console.error(`[sim] clearcache exited ${r.code}: ${r.stderr.trim()}`);
+          else if (r.stdout.trim()) console.log(`[sim] ${r.stdout.trim()}`);
+        },
+        stop: async () => {
+          // Mirror emu:stop: quiesce the keepalive/time/bridge timers so they
+          // don't poll the dead emulator during the reboot window.
+          backlight.stop();
+          time.stop();
+          bridgeMonitor.stop();
+          try { await driver!.stop(); } catch { /* may already be stopped */ }
+        },
+        start: async () => {
+          // Fresh token stored as current so a force-close during the refresh
+          // reboot cancels the boot's wait loops promptly (mirrors emu:start).
+          const token: BootToken = { cancelled: false };
+          currentBootToken = token;
+          await driver!.start(currentPlatform!, token);
+          void time.applyAll();
+          if (!token.cancelled) bridgeMonitor.start(currentPlatform!);
+        },
+        reinstall: async () => {
+          for (const p of library.list()) { await driver!.install(p); loaded.add(p); }
+          // Re-assert the chosen battery level so a weather change doesn't revert it
+          // to the firmware default. Before reassertTime() because emu-battery's
+          // pebble connect re-syncs host time, so the time push must run last.
+          await battery.reassert();
+          reassertTime();
+        },
+      });
+      if (rebooted) console.log("[sim] rebooted emulator to refresh weather");
+      return { rebooted };
+    } catch (e) {
+      console.error(`[sim] weather refresh failed: ${e instanceof Error ? e.message : String(e)}`);
+      return { rebooted: false };
+    }
+  });
   ipcMain.handle("emu:install", async (_e, pbwPath: string) => {
     await driver!.install(pbwPath);
     loaded.add(pbwPath);
     reassertTime();
   });
-  ipcMain.handle("emu:button", async (_e, id: ButtonId) => {
-    await driver!.button(id, "press");
+  ipcMain.handle("emu:button", async (_e, id: ButtonId, action?: ButtonAction) => {
+    await driver!.button(id, action ?? "press");
     reassertTime();
   });
   ipcMain.handle("emu:accelTap", async () => {
     await driver!.accelTap();
     reassertTime();
+  });
+  ipcMain.handle("emu:battery", async (_e, percent: number, charging: boolean) => {
+    // Remember the level (battery.set) so reboots can re-assert it; emu-battery's
+    // pebble connect re-syncs host time on post_connect, hence the reassertTime().
+    await battery.set(percent, charging);
+    reassertTime();
+  });
+  ipcMain.handle("emu:activateHealth", async () => {
+    if (!driver) return { ok: false, status: null, detail: "no emulator" };
+    const r = await driver.activateHealth();
+    console.log(`[health] activate: ok=${r.ok} status=${r.status} ${r.detail}`);
+    return r;
   });
   ipcMain.handle("emu:screenshot", async (_e, out: string) => driver!.screenshot(out));
   // Backlight-free framebuffer screenshot (over the watch protocol). The renderer
@@ -363,7 +456,18 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     }
   });
   ipcMain.handle("emu:timelineQuickView", async (_e, on: boolean) => {
-    await driver!.timelineQuickView(on);
+    // Insert a demo pin BEFORE enabling the peek so the bar has something to show;
+    // on disable, drop the peek first then remove the pin. The pin methods are
+    // optional (windows-native only) — without them this is just the peek toggle.
+    if (on) {
+      if (driver!.insertSamplePin) {
+        await driver!.insertSamplePin(time.currentWatchUnix() + SAMPLE_PIN_LEAD_SEC, SAMPLE_PIN_TITLE);
+      }
+      await driver!.timelineQuickView(true);
+    } else {
+      await driver!.timelineQuickView(false);
+      if (driver!.deleteSamplePin) await driver!.deleteSamplePin();
+    }
     reassertTime();
   });
 

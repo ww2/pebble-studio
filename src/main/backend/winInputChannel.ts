@@ -33,6 +33,11 @@ export interface InputHelperPaths {
  * (a clean failure) rather than this outer cutoff firing first. */
 const SCREENSHOT_TIMEOUT_MS = 10_000;
 
+/** Allowed characters for a timeline pin id. The helper parses the id as a single
+ * whitespace-delimited token, so spaces/control chars would break parsing (and a
+ * CR/LF would be a command-injection vector); restrict to a safe slug charset. */
+const PIN_ID_RE = /^[A-Za-z0-9_-]+$/;
+
 /** Minimal child surface the channel needs (injectable for tests). */
 export interface InputChild {
   /** Write a line (already newline-terminated) to the helper's stdin. */
@@ -88,10 +93,10 @@ export class WinInputChannel {
   private child: InputChild | null = null;
   private port: number | null = null;
   private readonly spawnChild: (pythonExe: string, args: string[]) => InputChild;
-  /** Resolver for an in-flight screenshot request, set while one is pending. The
-   * helper emits exactly one `OK`/`ERR` line per `screenshot` command, so a
-   * single pending slot suffices (the screenshot button can't fire concurrently). */
-  private pendingShot: ((ok: boolean) => void) | null = null;
+  /** Resolver for an in-flight ack request (screenshot/pin/unpin). The helper
+   * emits exactly one OK/ERR line per such command, and they can't fire
+   * concurrently, so a single slot suffices. */
+  private pendingAck: ((ok: boolean) => void) | null = null;
 
   constructor(private readonly deps: WinInputChannelDeps) {
     this.spawnChild = deps.spawnChild ?? defaultSpawnChild;
@@ -111,15 +116,15 @@ export class WinInputChannel {
     // and any stray output are ignored; only `OK`/`ERR` resolve a pending shot.
     this.child.onLine?.((line) => {
       const tok = line.trim().split(/\s+/, 1)[0];
-      if (tok === "OK" || tok === "ERR") this.resolveShot(tok === "OK");
+      if (tok === "OK" || tok === "ERR") this.resolveAck(tok === "OK");
     });
     return true;
   }
 
-  /** Resolve the in-flight screenshot request (if any) and clear the slot. */
-  private resolveShot(ok: boolean): void {
-    const r = this.pendingShot;
-    this.pendingShot = null;
+  /** Resolve the in-flight ack request (if any) and clear the slot. */
+  private resolveAck(ok: boolean): void {
+    const r = this.pendingAck;
+    this.pendingAck = null;
     if (r) r(ok);
   }
 
@@ -132,10 +137,21 @@ export class WinInputChannel {
    * NOTE: the underlying framebuffer grab is UNVERIFIED LIVE — see winHelpers.ts.
    */
   screenshot(outPath: string, timeoutMs = SCREENSHOT_TIMEOUT_MS): Promise<boolean> {
+    // Path may contain spaces; the helper takes everything after the verb as the path.
+    return this.awaitAck(`screenshot ${outPath}`, timeoutMs);
+  }
+
+  /** Default ack timeout (ms) for pin insert/delete. */
+  private static readonly ACK_TIMEOUT_MS = 8_000;
+
+  /** Write one command and resolve on the helper's OK/ERR ack (false on timeout,
+   * broken pipe, busy slot, or an unavailable/stdout-less channel). */
+  private awaitAck(line: string, timeoutMs: number): Promise<boolean> {
+    // The helper reads ONE command per stdin line, so an embedded CR/LF would let
+    // a caller's argument inject a second command. Refuse such lines outright.
+    if (/[\r\n]/.test(line)) return Promise.resolve(false);
     if (!this.ensure() || !this.child || !this.child.onLine) return Promise.resolve(false);
-    // Only one screenshot in flight at a time; if somehow one is pending, fail
-    // the new request fast rather than racing two acks onto one slot.
-    if (this.pendingShot) return Promise.resolve(false);
+    if (this.pendingAck) return Promise.resolve(false);
     return new Promise<boolean>((resolve) => {
       let done = false;
       const finish = (ok: boolean): void => {
@@ -145,22 +161,37 @@ export class WinInputChannel {
         resolve(ok);
       };
       const timer = setTimeout(() => {
-        // Helper didn't ack in time — clear the slot and fall back.
-        if (this.pendingShot === settle) this.pendingShot = null;
+        if (this.pendingAck === settle) this.pendingAck = null;
         finish(false);
       }, timeoutMs);
       const settle = (ok: boolean): void => finish(ok);
-      this.pendingShot = settle;
+      this.pendingAck = settle;
       try {
-        this.child!.stdinWrite(`screenshot ${outPath}\n`);
+        this.child!.stdinWrite(line + "\n");
       } catch {
-        // Broken pipe — drop the child so the next op respawns it, and fall back.
         this.child = null;
         this.port = null;
-        if (this.pendingShot === settle) this.pendingShot = null;
+        if (this.pendingAck === settle) this.pendingAck = null;
         finish(false);
       }
     });
+  }
+
+  /** Insert a timeline pin (id, absolute unix time, title) via the helper. The id
+   * is parsed as a single whitespace-delimited token by the helper, so it is
+   * constrained to a safe charset; the title may contain spaces but no control
+   * chars (defense-in-depth — awaitAck also rejects CR/LF). Invalid input → false. */
+  insertPin(id: string, unixTime: number, title: string, timeoutMs = WinInputChannel.ACK_TIMEOUT_MS): Promise<boolean> {
+    if (!PIN_ID_RE.test(id) || !Number.isFinite(unixTime) || /[\x00-\x1f]/.test(title)) {
+      return Promise.resolve(false);
+    }
+    return this.awaitAck(`pin ${id} ${Math.trunc(unixTime)} ${title}`, timeoutMs);
+  }
+
+  /** Delete the timeline pin with the given id (same id constraint as insertPin). */
+  deletePin(id: string, timeoutMs = WinInputChannel.ACK_TIMEOUT_MS): Promise<boolean> {
+    if (!PIN_ID_RE.test(id)) return Promise.resolve(false);
+    return this.awaitAck(`unpin ${id}`, timeoutMs);
   }
 
   /**
@@ -188,8 +219,8 @@ export class WinInputChannel {
       this.child = null;
     }
     this.port = null;
-    // Fail any in-flight screenshot so its promise can't hang past teardown.
-    this.resolveShot(false);
+    // Fail any in-flight ack so its promise can't hang past teardown.
+    this.resolveAck(false);
   }
 }
 

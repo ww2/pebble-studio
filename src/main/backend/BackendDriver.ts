@@ -5,6 +5,10 @@ export interface RunResult { code: number; stdout: string; stderr: string; }
 export type Runner = (cmd: string, args: string[], env?: Record<string, string>) => Promise<RunResult>;
 export interface VncEndpoint { host: string; port: number; wsPath: string; }
 
+/** Result of a health-activation attempt. `status` is the BlobResponse code
+ * (1 === Success); null when the helper produced no parseable status. */
+export interface HealthActivateResult { ok: boolean; status: number | null; detail: string; }
+
 export interface BackendDriver {
   setPlatform(id: PlatformId): void;
   /** Boot the emulator. An optional cancellation token lets an in-flight boot
@@ -29,6 +33,10 @@ export interface BackendDriver {
   timeFormat(hour24: boolean): Promise<void>;
   bluetooth(connected: boolean): Promise<void>;
   battery(percent: number, charging: boolean): Promise<void>;
+  /** Activate Pebble Health on the running emulator (BlobDB Prefs INSERT over
+   * pypkjs). Never throws — returns the BlobResponse status so callers can log/
+   * surface success vs. skip. Safe to call when health is already active. */
+  activateHealth(): Promise<HealthActivateResult>;
   screenshot(outPath: string): Promise<void>;
   /** BACKLIGHT-FREE framebuffer screenshot over the watch protocol (libpebble2
    * Screenshot service, endpoint 8000 — bright regardless of the LCD backlight),
@@ -42,4 +50,10 @@ export interface BackendDriver {
    * survive a wipe; caller must reboot afterward. */
   wipe(): Promise<void>;
   timelineQuickView(on: boolean): Promise<void>;
+  /** Insert a short-lived sample timeline pin so the quick-view peek is visible.
+   * Optional: only the windows-native driver implements it (native/WSL keep the
+   * peek-only behavior). `pinTimeUnix` is absolute watch UTC seconds. */
+  insertSamplePin?(pinTimeUnix: number, title: string): Promise<void>;
+  /** Remove the sample pin inserted by insertSamplePin. Optional (see above). */
+  deleteSamplePin?(): Promise<void>;
 }

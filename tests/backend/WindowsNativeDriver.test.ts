@@ -2,9 +2,16 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { WindowsNativeDriver } from "../../src/main/backend/WindowsNativeDriver.js";
+import {
+  WindowsNativeDriver,
+  healthRetryDecision,
+  HEALTH_ACTIVATE_MAX_ATTEMPTS,
+  HEALTH_ACTIVATE_READY_MS,
+} from "../../src/main/backend/WindowsNativeDriver.js";
 
 const ep = { host: "localhost", port: 6080, wsPath: "/" };
+
+const healthHelper = { pythonExe: "C:\\py\\python.exe", helperPath: join(tmpdir(), "pb-set-tz.py") };
 
 describe("WindowsNativeDriver", () => {
   it("runs discrete pebble commands via a plain runner (no bash wrapping)", async () => {
@@ -108,6 +115,72 @@ describe("WindowsNativeDriver", () => {
     expect(run).not.toHaveBeenCalled();
   });
 
+  describe("activateHealth (readiness-race retry)", () => {
+    it("retries a fast not-ready miss, then reports the eventual success", async () => {
+      let n = 0;
+      const run = vi.fn(async () => {
+        n++;
+        // First two attempts: state file / pypkjs not ready yet (connection refused),
+        // which the helper reports WITHOUT a numeric status. Then it succeeds.
+        return n < 3
+          ? { code: 1, stdout: "health-activate: error [WinError 10061] refused", stderr: "" }
+          : { code: 0, stdout: "health-activate: status=1", stderr: "" };
+      });
+      const d = new WindowsNativeDriver({
+        run, boot: async () => ep, stop: async () => {},
+        timeHelper: healthHelper, sleep: async () => {},
+      });
+      const r = await d.activateHealth();
+      expect(r).toEqual({ ok: true, status: 1, detail: "health-activate: status=1" });
+      expect(run).toHaveBeenCalledTimes(3);
+    });
+
+    it("returns immediately on a definitive (even non-success) status — no retry", async () => {
+      const run = vi.fn(async () => ({ code: 0, stdout: "health-activate: status=8", stderr: "" }));
+      const d = new WindowsNativeDriver({
+        run, boot: async () => ep, stop: async () => {},
+        timeHelper: healthHelper, sleep: async () => {},
+      });
+      const r = await d.activateHealth();
+      expect(r.status).toBe(8);
+      expect(r.ok).toBe(false);
+      expect(run).toHaveBeenCalledTimes(1);
+    });
+
+    it("gives up after the attempt cap when the emulator never becomes ready", async () => {
+      const run = vi.fn(async () => ({ code: 1, stdout: "health-activate: error refused", stderr: "" }));
+      const d = new WindowsNativeDriver({
+        run, boot: async () => ep, stop: async () => {},
+        timeHelper: healthHelper, sleep: async () => {},
+      });
+      const r = await d.activateHealth();
+      expect(r.ok).toBe(false);
+      expect(r.status).toBeNull();
+      expect(run).toHaveBeenCalledTimes(HEALTH_ACTIVATE_MAX_ATTEMPTS);
+    });
+
+    it("is a no-op result when no python helper is provisioned", async () => {
+      const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+      const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {} });
+      const r = await d.activateHealth();
+      expect(r.ok).toBe(false);
+      expect(run).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("healthRetryDecision", () => {
+    it("is done on any numeric status (success or a real code)", () => {
+      expect(healthRetryDecision(1, 5)).toBe("done");
+      expect(healthRetryDecision(8, 5)).toBe("done");
+    });
+    it("retries a fast null (the not-ready race)", () => {
+      expect(healthRetryDecision(null, 10)).toBe("retry");
+    });
+    it("is done on a slow null (connected but unanswered — don't hammer the boot)", () => {
+      expect(healthRetryDecision(null, HEALTH_ACTIVATE_READY_MS)).toBe("done");
+    });
+  });
+
   it("threads the cancellation token + onStep into the injected boot fn", async () => {
     const boot = vi.fn(async (_id: string) => ep);
     const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
@@ -148,5 +221,36 @@ describe("WindowsNativeDriver", () => {
     const inputChannel = { screenshot } as unknown as import("../../src/main/backend/winInputChannel.js").WinInputChannel;
     const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {}, inputChannel });
     expect(await d.screenshotFramebuffer("C:/caps/shot.png")).toBe(false);
+  });
+
+  it("insertSamplePin sends the pin via the input channel", async () => {
+    const insertPin = vi.fn(async () => true);
+    const channel = { insertPin, deletePin: vi.fn(async () => true) } as unknown as import("../../src/main/backend/winInputChannel.js").WinInputChannel;
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {}, inputChannel: channel });
+    await d.insertSamplePin(1781452800, "Sample Pin");
+    expect(insertPin).toHaveBeenCalledWith("studio-sample-pin", 1781452800, "Sample Pin");
+  });
+
+  it("insertSamplePin throws when the channel reports failure (so IPC can revert)", async () => {
+    const channel = { insertPin: vi.fn(async () => false), deletePin: vi.fn(async () => true) } as unknown as import("../../src/main/backend/winInputChannel.js").WinInputChannel;
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {}, inputChannel: channel });
+    await expect(d.insertSamplePin(1781452800, "Sample Pin")).rejects.toThrow(/sample pin/i);
+  });
+
+  it("insertSamplePin throws when no input channel is wired", async () => {
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {} });
+    await expect(d.insertSamplePin(1, "x")).rejects.toThrow();
+  });
+
+  it("deleteSamplePin removes the fixed pin via the channel", async () => {
+    const deletePin = vi.fn(async () => true);
+    const channel = { insertPin: vi.fn(async () => true), deletePin } as unknown as import("../../src/main/backend/winInputChannel.js").WinInputChannel;
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {}, inputChannel: channel });
+    await d.deleteSamplePin();
+    expect(deletePin).toHaveBeenCalledWith("studio-sample-pin");
   });
 });

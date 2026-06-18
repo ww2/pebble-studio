@@ -72,7 +72,7 @@ export class AppLibrary {
     this.clearBtn.type = "button";
     this.clearBtn.textContent = "Clear emulator";
     this.clearBtn.title = "Wipe all user apps from the running emulator (library is preserved)";
-    this.clearBtn.disabled = true;
+    this.clearBtn.disabled = false; // available at all times; handleClear guards double-clicks
 
     this.clearBtn.addEventListener("click", () => void this.handleClear());
 
@@ -224,6 +224,7 @@ export class AppLibrary {
     for (const btn of this.list.querySelectorAll<HTMLButtonElement>(".lib-gear")) {
       btn.disabled = disabled;
     }
+    // Clear stays available at all times (see refresh()); never gate it on liveness.
   }
 
   /**
@@ -275,7 +276,12 @@ export class AppLibrary {
     // (the count used to track a main-process set that outlived removals).
     const count = entries.filter((p) => loadedSet.has(p)).length;
     this.loadedCount.textContent = count > 0 ? `${count} loaded` : "";
-    this.clearBtn.disabled = count === 0;
+    // Clear wipes the whole running emulator (not just tracked apps). Keep it
+    // available at ALL times — even when Studio's loaded view looks empty but stale
+    // apps remain, or liveness tracking is momentarily out of sync. (The "N loaded"
+    // badge above still reflects library∩loaded.) handleClear disables it only for
+    // the duration of the wipe to guard against a double-click.
+    this.clearBtn.disabled = false;
 
     this.list.replaceChildren();
     for (const p of entries) {

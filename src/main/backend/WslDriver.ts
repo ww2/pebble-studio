@@ -1,5 +1,5 @@
 import type { PlatformId, ButtonId, ButtonAction } from "../../shared/types.js";
-import type { BackendDriver, Runner, RunResult, VncEndpoint } from "./BackendDriver.js";
+import type { BackendDriver, HealthActivateResult, Runner, RunResult, VncEndpoint } from "./BackendDriver.js";
 import { NativeDriver, type BootFn, type StopFn } from "./NativeDriver.js";
 import type { BootToken, OnStep } from "./bootEmulator.js";
 import { toWslPath } from "./wslPath.js";
@@ -115,6 +115,10 @@ export class WslDriver implements BackendDriver {
 
   async battery(percent: number, charging: boolean): Promise<void> {
     return this.inner.battery(percent, charging);
+  }
+
+  async activateHealth(): Promise<HealthActivateResult> {
+    return this.inner.activateHealth();
   }
 
   async screenshot(outPath: string): Promise<void> {

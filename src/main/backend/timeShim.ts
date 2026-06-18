@@ -7,7 +7,7 @@
  * custom date, freeze, and time-rate, we LD_PRELOAD a shim that intercepts
  * clock_gettime(CLOCK_REALTIME) and reads a control file at runtime.
  *
- * IRON RULE (cost two releases — see docs/handoff/SESSION-HANDOFF.md §3):
+ * IRON RULE (cost two releases to pin down):
  * Every command string that goes through the app's Shell/Runner crosses
  *   wsl.exe -- bash -lc "..."
  * on Windows. That means ZERO single or double quotes may appear in any
@@ -173,11 +173,15 @@ export function compileShimCmd(): string {
  *   - `rate` N>1          → fast-forward at N×
  *
  * Uses integer arithmetic (Math.trunc) so the value is numeric-only → quote-free.
+ * Both interpolated tokens are coerced to plain integers: TS types are erased at
+ * runtime, so this guarantees the string crossing `wsl.exe -- bash -lc` can never
+ * carry shell metacharacters even if a caller passes a non-numeric value.
  */
 export function setFakeTimeCmd(targetUnix: number | null, rate: number): PebbleCommand {
   const t = targetUnix === null ? "-" : String(Math.trunc(targetUnix));
-  // echo <t> <rate> — all numerics / "-", zero quotes. > not < so no escaping.
-  return { cmd: "bash", args: ["-lc", `echo ${t} ${rate} > ${CTL_PATH}`] };
+  const r = String(Number.isFinite(rate) ? Math.trunc(rate) : 0);
+  // echo <t> <r> — all numerics / "-", zero quotes. > not < so no escaping.
+  return { cmd: "bash", args: ["-lc", `echo ${t} ${r} > ${CTL_PATH}`] };
 }
 
 // ---------------------------------------------------------------------------

@@ -210,6 +210,56 @@ describe("WinInputChannel.screenshot (framebuffer)", () => {
   });
 });
 
+describe("WinInputChannel.insertPin / deletePin", () => {
+  it("writes the pin command (id, unix, title) and resolves true on OK", async () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+    const p = ch.insertPin("studio-sample-pin", 1781452800, "Sample Pin");
+    expect(fake.writes).toEqual(["pin studio-sample-pin 1781452800 Sample Pin\n"]);
+    fake.emit("OK pin studio-sample-pin");
+    expect(await p).toBe(true);
+  });
+
+  it("insertPin resolves false on ERR", async () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+    const p = ch.insertPin("studio-sample-pin", 1781452800, "Sample Pin");
+    fake.emit("ERR boom");
+    expect(await p).toBe(false);
+  });
+
+  it("deletePin writes unpin and resolves true on OK", async () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+    const p = ch.deletePin("studio-sample-pin");
+    expect(fake.writes).toEqual(["unpin studio-sample-pin\n"]);
+    fake.emit("OK unpin");
+    expect(await p).toBe(true);
+  });
+
+  it("insertPin resolves false when not booted (no port)", async () => {
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => null, spawnChild: vi.fn() });
+    expect(await ch.insertPin("studio-sample-pin", 1, "x")).toBe(false);
+  });
+
+  it("insertPin resolves false on timeout when never acked", async () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+    expect(await ch.insertPin("studio-sample-pin", 1, "x", 5)).toBe(false);
+  });
+
+  it("rejects newline/control-char injection in id or title without writing", async () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+    // A title carrying a newline must NOT reach the helper (would inject a 2nd command).
+    expect(await ch.insertPin("studio-sample-pin", 1, "evil\nclick select")).toBe(false);
+    // An id with whitespace/control chars is rejected (helper parses id as one token).
+    expect(await ch.insertPin("bad id", 1, "ok")).toBe(false);
+    expect(await ch.deletePin("bad\nid")).toBe(false);
+    expect(fake.writes).toEqual([]); // nothing written for any rejected call
+  });
+});
+
 describe("readPypkjsPort", () => {
   const STATE = JSON.stringify({
     emery: { "4.9.169": { qemu: { pid: 1, port: 2 }, pypkjs: { pid: 3, port: 57749 }, websockify: { pid: 4 } } },

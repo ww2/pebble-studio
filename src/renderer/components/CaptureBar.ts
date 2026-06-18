@@ -2,6 +2,7 @@ import GIF from "gif.js";
 import { FrameBudget } from "../../capture/gifRecorder.js";
 import { grabUpscaled, rgbaToBlob, applyCircularMask } from "../captureCanvas.js";
 import type { RgbaImage } from "../../capture/upscale.js";
+import { applySunlightLut } from "../sunlightLut.js";
 
 /** Magenta key color used as the transparent index in round GIFs. */
 const GIF_TRANSPARENT_COLOR = 0xff00ff;
@@ -141,6 +142,11 @@ export class CaptureBar {
     return localStorage.getItem(BACKLIGHT_CAPTURE_KEY) !== "false";
   }
 
+  /** Whether to apply the Pebble sunlight color-correction LUT to captures. Default OFF. */
+  private sunlightCorrection(): boolean {
+    return localStorage.getItem("pebble-studio:sunlight-correction") === "true";
+  }
+
   /**
    * K: hold/release the capture backlight, swallowing any failure so a backlight
    * hiccup never breaks the capture itself. No-op when the pref is off.
@@ -194,7 +200,7 @@ export class CaptureBar {
     // To avoid paying that timeout on EVERY shot, the first failure disables the
     // framebuffer attempt for the rest of the session — so at most one slow shot,
     // then straight to canvas.
-    if (!this.framebufferShotUnavailable) {
+    if (this.sunlightCorrection() && !this.framebufferShotUnavailable) {
       try {
         const base = `pebble-shot-${this.getPlatformId()}`;
         const name = await window.studio.nextCaptureName(base, "png");
@@ -221,6 +227,7 @@ export class CaptureBar {
           await new Promise((r) => setTimeout(r, BACKLIGHT_RISE_MS));
         }
         const raw = grabUpscaled(host, this.factor());
+        if (this.sunlightCorrection()) applySunlightLut(raw.data);
         const frame = this.maybeCircularMask(raw);
         const blob = await rgbaToBlob(frame);
         const arrayBuffer = await blob.arrayBuffer();
@@ -270,10 +277,13 @@ export class CaptureBar {
       if (!this.recording) return; // cancelled during pre-roll
     }
 
+    const correct = this.sunlightCorrection();
+
     // Grab a first frame to determine dimensions
     let firstFrame: RgbaImage;
     try {
       firstFrame = grabUpscaled(host, this.factor());
+      if (correct) applySunlightLut(firstFrame.data);
     } catch (err) {
       this.status.textContent = `Grab failed: ${String(err)}`;
       this.recording = false;
@@ -335,6 +345,7 @@ export class CaptureBar {
       }
       try {
         const raw = grabUpscaled(host, this.factor());
+        if (correct) applySunlightLut(raw.data);
         if (budget.tryAdd()) {
           const frame = this.maybeCircularMask(raw, true);
           const canvas = this.imageToCanvas(frame);

@@ -16,7 +16,7 @@ interface StudioApi {
   stop(): Promise<unknown>;
   abort(): Promise<void>;
   install(pbwPath: string): Promise<unknown>;
-  button(id: string): Promise<unknown>;
+  button(id: string, action?: string): Promise<unknown>;
   accelTap(): Promise<unknown>;
   screenshot(out: string): Promise<unknown>;
   // Backlight-free framebuffer screenshot. Resolves with the saved absolute path,
@@ -50,6 +50,13 @@ interface StudioApi {
   setBackgroundThrottling(throttle: boolean): Promise<void>;
   // v0.0.8: timeline quick-view (Task 1).
   timelineQuickView(on: boolean): Promise<void>;
+  // battery control (feat/battery-and-health).
+  setBattery(percent: number, charging: boolean): Promise<void>;
+  // health activation (feat/battery-and-health).
+  activateHealth(): Promise<{ ok: boolean; status: number | null; detail: string }>;
+  // simulated environment (Task 8).
+  simGet(): Promise<import("../shared/simEnv.js").SimEnvConfig>;
+  simSet(cfg: import("../shared/simEnv.js").SimEnvConfig): Promise<{ rebooted: boolean }>;
   // v0.0.13: Clay / per-app config (Task B). clayOpenWindow resolves with the
   // RAW still-percent-encoded close fragment ("" = cancelled).
   clayPhonesimPort(): Promise<number | null>;
@@ -98,11 +105,16 @@ app.innerHTML = `
   </div>
 `;
 
-// Default watch = Pebble Time 2 (emery); restore the last-used watch, falling
-// back to emery on first run / invalid persisted value.
-const storedPlatform = localStorage.getItem("pebble-studio:platform");
+// Startup watch = an explicit, persistent preference (Settings → "Startup watch"),
+// decoupled from the active watch: switching watches via the top combo no longer
+// overwrites it, so the app always boots into the chosen startup watch. Migrate the
+// pre-decoupling key (`pebble-studio:platform`, the last-used watch) as the initial
+// default; fall back to Pebble Time 2 (emery) on first run / invalid value.
+const storedStartup =
+  localStorage.getItem("pebble-studio:startup-watch") ??
+  localStorage.getItem("pebble-studio:platform");
 const initialPlatform: PlatformId =
-  PLATFORMS.some((p) => p.id === storedPlatform) ? (storedPlatform as PlatformId) : "emery";
+  PLATFORMS.some((p) => p.id === storedStartup) ? (storedStartup as PlatformId) : "emery";
 
 // Boot mode: "manual" (default) loads a model's chrome idle with a Launch button;
 // "auto" boots on selection. main.ts owns the live value so selectPlatform() and
@@ -122,13 +134,12 @@ window.addEventListener("pebble-studio:time-changed", (e) => {
   view.setTimeBadge(cfg, hostTz);
 });
 
-// Persist the active platform and keep both the top combo and the Settings
-// "Startup watch" dropdown in sync, regardless of which control changed it.
-// In manual mode this only morphs to the new chrome; in auto mode it boots.
+// Switch the ACTIVE (live) watch via the top combo. This is session-only and
+// intentionally does NOT persist as the startup watch — the next launch still
+// opens the watch chosen in Settings → "Startup watch". In manual mode this only
+// morphs to the new chrome; in auto mode it boots.
 function selectPlatform(id: PlatformId): void {
-  localStorage.setItem("pebble-studio:platform", id);
-  switcher.value = id;        // no-op set when the combo originated the change
-  settings.setPlatform(id);   // no-op set when Settings originated the change
+  switcher.value = id; // no-op set when the combo originated the change
   void view.show(id, { boot: bootMode === "auto" });
 }
 
@@ -155,7 +166,11 @@ const captureBar = new CaptureBar(
   () => getPlatform(switcher.value as PlatformId).round,
   () => switcher.value, // platform id (codename, e.g. "emery") for capture names
 );
-const settings = new SettingsPane(themeMode, initialPlatform, (id: PlatformId) => selectPlatform(id), {
+const settings = new SettingsPane(themeMode, initialPlatform, (id: PlatformId) => {
+  // Settings → "Startup watch": persist the explicit startup preference only.
+  // It does NOT switch the live watch (use the top combo for that).
+  localStorage.setItem("pebble-studio:startup-watch", id);
+}, {
   initialBootMode: bootMode,
   onBootModeChange: (mode: BootMode) => {
     bootMode = mode;
@@ -163,6 +178,14 @@ const settings = new SettingsPane(themeMode, initialPlatform, (id: PlatformId) =
   },
   // Diagnostics toggle (J): flip EmulatorView's overlay live when Settings changes.
   onDiagnosticsChange: (on: boolean) => view.setDiagnostics(on),
+  // Applying sim weather reboots the emulator (to clear watchface fetch caches);
+  // reconnect VNC afterwards, same as "Clear emulator". switcher is the live board.
+  onWeatherRefreshReconnect: () => view.reconnectAfterClear(switcher.value as PlatformId),
+  // Suppress the bridge-dead/auto-relaunch path while that backend reboot runs,
+  // so the expected restart isn't mistaken for a crash (begin) and is re-armed if
+  // no reboot occurred or the apply failed (end).
+  onWeatherRefreshBegin: () => view.beginExternalReboot(),
+  onWeatherRefreshEnd: () => view.endExternalReboot(),
 });
 
 // Command bar: version switcher (Fluent combobox) controls the persistent

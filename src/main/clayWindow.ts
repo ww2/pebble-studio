@@ -78,8 +78,8 @@ const CLAY_BOOTSTRAP_RE = /^https?:\/\/clay\.pebble\.com[./:]/i;
  * Rewrite the broadcast AppConfig URL into the page we actually load, so the
  * config page's Save lands on a URL we can intercept.
  *
- * THE PROBLEM (verified live against ForkliftCertified, 2026-06-12 — see memory
- * `clay-config-return-to-mechanism`): on the pypkjs emulator `pebble-clay`
+ * THE PROBLEM (verified live against a Clay-based watchface): on the pypkjs
+ * emulator `pebble-clay`
  * builds the config URL as
  *   http://clay.pebble.com.s3-website-us-west-2.amazonaws.com/#<encodeURIComponent(HTML)>
  * where the HTML embeds `window.returnTo="$$RETURN_TO$$"` and Saves via

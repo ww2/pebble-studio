@@ -1,12 +1,18 @@
+import { promises as fs } from "node:fs";
 import type { PlatformId, ButtonId, ButtonAction } from "../../shared/types.js";
-import type { BackendDriver, Runner, VncEndpoint } from "./BackendDriver.js";
+import type { BackendDriver, HealthActivateResult, Runner, VncEndpoint } from "./BackendDriver.js";
 import { NativeDriver, type BootFn, type StopFn } from "./NativeDriver.js";
 import type { BootToken, OnStep } from "./bootEmulator.js";
 import type { PebbleCmdBuilder } from "./winBootDeps.js";
 import { winPath } from "./winPath.js";
+import { winHostPaths } from "./hostPaths.js";
 import { winSetTzOffsetArgv } from "./pebbleCli.js";
+import * as cli from "./pebbleCli.js";
 import type { WinInputChannel } from "./winInputChannel.js";
 import { writeWinFakeTime } from "./winTimeShim.js";
+
+/** Fixed id for the demo pin the Timeline button inserts so the peek is visible. */
+const SAMPLE_PIN_ID = "studio-sample-pin";
 
 export interface WinTimeHelper {
   /** Python interpreter that has pebble-tool's libpebble2. */
@@ -40,6 +46,33 @@ export interface WindowsNativeDriverDeps {
    * setFakeTime just writes the %TEMP% control file. Absent → ensureTimeShim=false +
    * setFakeTime=no-op (no custom time). */
   timeShim?: { ctlPath: string };
+  /** Injectable delay (tests pass a no-op so health-activation retries don't wait).
+   * Defaults to a real setTimeout-backed sleep. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Health activation races the emulator's readiness: the helper reads the emulator
+ * state file for the pypkjs port and connects to pypkjs's libpebble2 websocket, but
+ * BOTH can lag the "Live" signal on a slow/retried boot — so a single attempt hits
+ * FileNotFound / connection-refused and reports no status (a false "not activated").
+ * A READY emulator answers in ~10ms and these not-ready failures fail FAST, so we
+ * retry a fast miss a few times. A null result that took longer than the ready
+ * threshold means we connected but the watch never answered (the helper's own 3s
+ * read timeout) — that is NOT a readiness race, so we stop rather than hang the boot.
+ */
+export const HEALTH_ACTIVATE_MAX_ATTEMPTS = 8;
+export const HEALTH_ACTIVATE_RETRY_MS = 400;
+export const HEALTH_ACTIVATE_READY_MS = 1200;
+
+/** Pure retry decision for one activation attempt. Exported for testing. */
+export function healthRetryDecision(
+  status: number | null,
+  elapsedMs: number,
+): "done" | "retry" {
+  if (status !== null) return "done";                  // definitive answer (success or a real code)
+  if (elapsedMs >= HEALTH_ACTIVATE_READY_MS) return "done"; // connected but no ack — don't hammer
+  return "retry";                                      // fast miss = not-ready race → retry
 }
 
 /**
@@ -141,6 +174,42 @@ export class WindowsNativeDriver implements BackendDriver {
   async timeFormat(hour24: boolean): Promise<void> { return this.inner.timeFormat(hour24); }
   async bluetooth(connected: boolean): Promise<void> { return this.inner.bluetooth(connected); }
   async battery(percent: number, charging: boolean): Promise<void> { return this.inner.battery(percent, charging); }
+
+  async activateHealth(): Promise<HealthActivateResult> {
+    const h = this.deps.timeHelper;
+    if (!h) return { ok: false, status: null, detail: "python helper not provisioned" };
+    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    // Re-deploy the helper once (cheap; self-repairs a stale/corrupt copy), mirroring
+    // how the POSIX path re-echoes its base64 helper.
+    const helperPath = h.helperPath.replace(/[^\\/]+$/, "pb-activate-health.py");
+    try {
+      await fs.writeFile(helperPath, cli.activateHealthHelperSource());
+    } catch (e) {
+      return { ok: false, status: null, detail: String(e) };
+    }
+    // The helper reads the emulator state file; on native Windows it lives at
+    // %TEMP%\pb-emulator.json (NOT the helper's /tmp default → C:\tmp, which is
+    // absent and threw FileNotFoundError, so health never activated).
+    const c = cli.winActivateHealthArgv(h.pythonExe, helperPath, winHostPaths().emuInfo);
+    // Retry past the readiness race (state file / pypkjs websocket lagging "Live").
+    // See HEALTH_ACTIVATE_* + healthRetryDecision above.
+    let last: HealthActivateResult = { ok: false, status: null, detail: "not attempted" };
+    for (let attempt = 0; attempt < HEALTH_ACTIVATE_MAX_ATTEMPTS; attempt++) {
+      const t0 = Date.now();
+      let status: number | null = null;
+      try {
+        const r = await this.deps.run(c.cmd, c.args, c.env);
+        status = cli.parseHealthStatus(r.stdout);
+        last = { ok: status === 1, status, detail: (r.stdout || r.stderr || "").trim() };
+      } catch (e) {
+        status = null;
+        last = { ok: false, status: null, detail: String(e) };
+      }
+      if (healthRetryDecision(status, Date.now() - t0) === "done") return last;
+      if (attempt < HEALTH_ACTIVATE_MAX_ATTEMPTS - 1) await sleep(HEALTH_ACTIVATE_RETRY_MS);
+    }
+    return last;
+  }
   // winPath canonicalizes backslash/forward-slash; outPath is already a Windows
   // path (app-constructed), so this is a no-op slash normalization kept for
   // symmetry with install.
@@ -155,4 +224,16 @@ export class WindowsNativeDriver implements BackendDriver {
   }
   async wipe(): Promise<void> { return this.inner.wipe(); }
   async timelineQuickView(on: boolean): Promise<void> { return this.inner.timelineQuickView(on); }
+
+  async insertSamplePin(pinTimeUnix: number, title: string): Promise<void> {
+    const ch = this.deps.inputChannel;
+    if (!ch) throw new Error("input channel unavailable — cannot insert sample pin");
+    const ok = await ch.insertPin(SAMPLE_PIN_ID, pinTimeUnix, title);
+    if (!ok) throw new Error("failed to insert sample pin");
+  }
+
+  async deleteSamplePin(): Promise<void> {
+    // Best-effort: nothing to remove if the channel is gone (emulator stopped).
+    await this.deps.inputChannel?.deletePin(SAMPLE_PIN_ID);
+  }
 }

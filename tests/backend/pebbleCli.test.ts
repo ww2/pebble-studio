@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   installCmd, buttonCmd, accelTapCmd, setTimeCmd, timeFormatCmd, btCmd, batteryCmd, screenshotCmd, bootCmd, wipeCmd, timelineQuickViewCmd, setTzOffsetCmd, winSetTzOffsetArgv,
+  activateHealthCmd, winActivateHealthArgv, parseHealthStatus, activateHealthHelperSource,
 } from "../../src/main/backend/pebbleCli.js";
 
 describe("pebbleCli argv builders", () => {
@@ -125,5 +126,34 @@ describe("winSetTzOffsetArgv", () => {
 
   it("truncates a fractional offset to an integer string", () => {
     expect(winSetTzOffsetArgv({ pythonExe: py, helperPath: helper, offsetMin: 90.7 }).args[1]).toBe("90");
+  });
+});
+
+describe("activateHealth", () => {
+  it("POSIX command is a quote-free bash -lc one-liner that decodes + runs the helper", () => {
+    const c = activateHealthCmd();
+    expect(c.cmd).toBe("bash");
+    expect(c.args[0]).toBe("-lc");
+    expect(c.args[1]).toContain("pb-activate-health.py");
+    expect(c.args[1]).toContain("base64 -d");
+    expect(c.args[1]).not.toMatch(/['"]/); // quote-free rule (v0.0.12)
+  });
+  it("win argv runs the python on the helper path + passes the state-file path", () => {
+    const c = winActivateHealthArgv("C:/py/python.exe", "C:/h/pb-activate-health.py", "C:/Temp/pb-emulator.json");
+    expect(c).toEqual({ cmd: "C:/py/python.exe", args: ["C:/h/pb-activate-health.py", "C:/Temp/pb-emulator.json"] });
+  });
+  it("decoded helper sends a BlobDB Prefs INSERT (activityPreferences, tracking on) + reads state path from argv", () => {
+    const src = activateHealthHelperSource().toString("utf8");
+    expect(src).toContain("activityPreferences");
+    expect(src).toContain("database=7");
+    expect(src).toContain("struct.pack('<hhBBBbb', 1750, 7500, 1, 1, 1, 30, 1)");
+    // The fix: state-file path is argv[1] (default /tmp), so native Windows can pass %TEMP%.
+    expect(src).toContain("statepath = sys.argv[1]");
+    expect(src).toContain("open(statepath)");
+  });
+  it("parses the status line", () => {
+    expect(parseHealthStatus("health-activate: status=1")).toBe(1);
+    expect(parseHealthStatus("health-activate: status=0")).toBe(0);
+    expect(parseHealthStatus("health-activate: no-response")).toBeNull();
   });
 });

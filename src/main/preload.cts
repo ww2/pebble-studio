@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer, webUtils } from "electron";
 // Type-only import — erased at compile time, so the standalone esbuild preload
 // bundle never pulls timeController code in at runtime.
 import type { TimeConfig } from "./backend/timeController.js";
+import type { SimEnvConfig } from "../shared/simEnv.js";
 
 const studio = {
   initBackend: (): Promise<{ kind: string }> => ipcRenderer.invoke("backend:init"),
@@ -9,7 +10,7 @@ const studio = {
   stop: () => ipcRenderer.invoke("emu:stop"),
   abort: (): Promise<void> => ipcRenderer.invoke("emu:abort"),
   install: (pbwPath: string) => ipcRenderer.invoke("emu:install", pbwPath),
-  button: (id: string) => ipcRenderer.invoke("emu:button", id),
+  button: (id: string, action?: string) => ipcRenderer.invoke("emu:button", id, action),
   accelTap: () => ipcRenderer.invoke("emu:accelTap"),
   screenshot: (out: string) => ipcRenderer.invoke("emu:screenshot", out),
   // Backlight-free framebuffer screenshot. Pass a capture filename; resolves with
@@ -45,6 +46,13 @@ const studio = {
   // Time-shim readiness (v0.0.13): false → legacy offset fallback limits apply.
   timeStatus: (): Promise<{ shim: boolean; checked: boolean }> => ipcRenderer.invoke("time:status"),
   timelineQuickView: (on: boolean): Promise<void> => ipcRenderer.invoke("emu:timelineQuickView", on),
+  setBattery: (percent: number, charging: boolean): Promise<void> =>
+    ipcRenderer.invoke("emu:battery", percent, charging),
+  // Simulated location & weather (sim-env control file).
+  simGet: (): Promise<SimEnvConfig> => ipcRenderer.invoke("sim:get"),
+  simSet: (cfg: SimEnvConfig): Promise<{ rebooted: boolean }> => ipcRenderer.invoke("sim:set", cfg),
+  activateHealth: (): Promise<{ ok: boolean; status: number | null; detail: string }> =>
+    ipcRenderer.invoke("emu:activateHealth"),
   // Clay / AppConfig (Task B2). clayOpenWindow resolves with the RAW
   // still-percent-encoded close fragment ("" = cancelled).
   clayPhonesimPort: (): Promise<number | null> => ipcRenderer.invoke("clay:phonesimPort"),

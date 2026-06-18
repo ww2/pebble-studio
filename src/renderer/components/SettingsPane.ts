@@ -16,9 +16,16 @@ import {
   type Rate,
 } from "../../main/backend/timeController.js";
 import { parseTimeInput, to12h, from12h } from "../timeFormat.js";
+import {
+  DEFAULT_SIM_ENV, CONDITION_OPTIONS, PRESET_CITIES,
+  tempInputToC, tempCToDisplay,
+  type SimEnvConfig, type ConditionKey,
+} from "../../shared/simEnv.js";
 
 type ThemeChoice = "light" | "dark";
 type BootMode = "auto" | "manual";
+/** A switch row whose visual/closure state can be set externally without firing its onToggle. */
+type SwitchRow = HTMLElement & { setOn: (on: boolean) => void };
 
 /** Options for the boot-mode + capture-location + diagnostics controls (owned by main.ts). */
 interface SettingsOptions {
@@ -26,10 +33,25 @@ interface SettingsOptions {
   onBootModeChange: (mode: BootMode) => void;
   /** Flip EmulatorView's diagnostics overlay live when the toggle changes (J). */
   onDiagnosticsChange: (on: boolean) => void;
+  /** Applying simulated weather reboots the emulator to clear watchface fetch
+   * caches; the backend reboot leaves the VNC canvas pointing at the dead qemu,
+   * so the renderer must reconnect afterwards (same as "Clear emulator"). Called
+   * only when sim:set reports it rebooted. */
+  onWeatherRefreshReconnect?: () => void | Promise<void>;
+  /** Called BEFORE the sim:set round-trip so the EmulatorView can suppress the
+   * bridge-dead/auto-relaunch path while the backend reboots the emulator (the
+   * monitor would otherwise mistake the expected restart for a crash). Balanced
+   * 1:1 with onWeatherRefreshEnd. */
+  onWeatherRefreshBegin?: () => void;
+  /** Called from a `finally` after the sim:set round-trip settles (reboot,
+   * no-reboot, or failure), so the EmulatorView always balances the suppression
+   * armed by onWeatherRefreshBegin. */
+  onWeatherRefreshEnd?: () => void;
 }
 
 const CAPTURE_DIR_KEY = "pebble-studio:capture-dir";
 const BACKLIGHT_CAPTURE_KEY = "pebble-studio:backlight-capture";
+const SUNLIGHT_KEY = "pebble-studio:sunlight-correction";
 const BACKLIGHT_METHOD_KEY = "pebble-studio:backlight-method";
 /** How the main-page Backlight button wakes the screen (EmulatorView reads this). "back" | "shake". Default "back". */
 const BACKLIGHT_ACTIVATION_KEY = "pebble-studio:backlight-activation";
@@ -42,6 +64,30 @@ const TIME_RATE_KEY = "pebble-studio:time-rate";
 const TIME_HOUR24_KEY = "pebble-studio:time-hour24";
 const TIME_CUSTOM_DATE_KEY = "pebble-studio:time-custom-date"; // YYYY-MM-DD
 const TIME_CUSTOM_TIME_KEY = "pebble-studio:time-custom-time"; // HH:MM
+
+const BAT_PCT_KEY = "pebble-studio:battery-percent";
+const BAT_CHG_KEY = "pebble-studio:battery-charging";
+const HEALTH_BOOT_KEY = "pebble-studio:health-activate-on-boot";
+
+/** Compute the (percent, charging) to push for a "Set battery" click. Percent is
+ * clamped to 0-100; charging reflects the stored toggle. Exported for testing. */
+export function buildBatteryCall(sliderValue: string, chargingStored: string | null): [number, boolean] {
+  const pct = Math.max(0, Math.min(100, Number(sliderValue) || 0));
+  return [pct, chargingStored === "true"];
+}
+
+/** UI state -> persisted SimEnvConfig. tempInput is in `units`; stored as canonical tempC. */
+export function buildSimConfigFromUi(s: {
+  enabled: boolean; lat: number; lon: number; name: string;
+  condition: ConditionKey; tempInput: number; units: "F" | "C"; isDay: boolean;
+}): SimEnvConfig {
+  return {
+    enabled: s.enabled,
+    location: { lat: s.lat, lon: s.lon, name: s.name },
+    weather: { condition: s.condition, tempC: tempInputToC(s.tempInput, s.units), isDay: s.isDay },
+    units: s.units,
+  };
+}
 
 /** Compose date (YYYY-MM-DD) + time (HH:MM) into a UTC-naive epoch ms (Date.UTC,
  * no host offset) — matches timeController's custom anchor contract. */
@@ -88,10 +134,11 @@ function keyLabel(key: string | null): string {
  * preferences:
  *  - Theme toggle — a Fluent switch (pill track + knob, accent when on).
  *    "On" = dark theme. Persists to `pebble-studio:theme`.
- *  - Default watch — a labeled "Startup watch" dropdown listing every platform.
- *    Its value is bound to the persisted platform (`pebble-studio:platform`);
- *    changing it persists the new value and switches the live preview via the
- *    injected `onPlatformChange` callback (the same path the top combo uses).
+ *  - Startup watch — a labeled dropdown listing every platform. It sets an
+ *    explicit, persistent startup preference (persisted by main.ts to
+ *    `pebble-studio:startup-watch` via the injected `onPlatformChange` callback).
+ *    It is DECOUPLED from the active watch: switching watches via the top combo
+ *    does not change it, and changing it here does not switch the live preview.
  *
  * The component owns the theme switch wiring (moved here from the command bar)
  * so theming stays instant via `applyTheme`.
@@ -113,6 +160,9 @@ export class SettingsPane {
   private readonly onBootModeChange: (mode: BootMode) => void;
   /** Flips EmulatorView's diagnostics overlay live (J). */
   private readonly onDiagnosticsChange: (on: boolean) => void;
+  private readonly onWeatherRefreshReconnect?: () => void | Promise<void>;
+  private readonly onWeatherRefreshBegin?: () => void;
+  private readonly onWeatherRefreshEnd?: () => void;
 
   /** Current keybindings (Keyboard section); reloaded on reset/rebind. */
   private bindings: Bindings;
@@ -161,6 +211,9 @@ export class SettingsPane {
     this.bootMode = options.initialBootMode;
     this.onBootModeChange = options.onBootModeChange;
     this.onDiagnosticsChange = options.onDiagnosticsChange;
+    this.onWeatherRefreshReconnect = options.onWeatherRefreshReconnect;
+    this.onWeatherRefreshBegin = options.onWeatherRefreshBegin;
+    this.onWeatherRefreshEnd = options.onWeatherRefreshEnd;
     this.bindings = loadBindings();
     this.keyRowsHost = document.createElement("div");
     this.keyRowsHost.className = "settings-key-rows";
@@ -214,7 +267,8 @@ export class SettingsPane {
 
     const watchDesc = document.createElement("p");
     watchDesc.className = "settings-row-desc type-caption";
-    watchDesc.textContent = "Choose the watch model to boot on launch.";
+    watchDesc.textContent =
+      "Which watch Pebble Studio opens on launch. Switching the active watch from the top bar won't change this.";
 
     // Container hosting the labeled "Startup watch" dropdown.
     this.defaultWatchSlot = document.createElement("div");
@@ -508,6 +562,283 @@ export class SettingsPane {
       hour24Row, timeButtons, this.timeStatusEl, this.timeNoteEl,
     );
 
+    // ── Battery section ───────────────────────────────────────────────────
+    const battery = document.createElement("section");
+    battery.className = "settings-section";
+    const batteryHeading = document.createElement("h3");
+    batteryHeading.className = "settings-section-title type-body-strong";
+    batteryHeading.textContent = "Battery";
+
+    // Persisted UI state only (NOT reapplied to the emulator on boot — one-shot).
+    const rawPct = localStorage.getItem(BAT_PCT_KEY);
+    const startPct = rawPct !== null ? Math.max(0, Math.min(100, Number(rawPct) || 0)) : 80;
+
+    const pctControl = document.createElement("label");
+    pctControl.className = "settings-watch-control";
+    const pctLabel = document.createElement("span");
+    pctLabel.className = "settings-watch-label type-body";
+    pctLabel.textContent = "Level";
+    const pctReadout = document.createElement("span");
+    pctReadout.className = "type-body";
+    pctReadout.textContent = `${startPct}%`;
+    const pctSlider = document.createElement("input");
+    pctSlider.type = "range";
+    pctSlider.min = "0";
+    pctSlider.max = "100";
+    pctSlider.step = "1";
+    pctSlider.value = String(startPct);
+
+    let batteryDirty = false;
+    const batBtn = document.createElement("button");
+    batBtn.type = "button";
+    batBtn.className = "lib-pick-btn";
+    batBtn.textContent = "Set battery";
+    const batStatus = document.createElement("span");
+    batStatus.className = "settings-row-desc type-caption";
+    const markBatteryDirty = (): void => {
+      batteryDirty = true;
+      batBtn.classList.toggle("lib-pick-btn--needs-apply", true);
+    };
+
+    pctSlider.addEventListener("input", () => {
+      pctReadout.textContent = `${pctSlider.value}%`;
+      localStorage.setItem(BAT_PCT_KEY, pctSlider.value);
+      markBatteryDirty();
+    });
+    pctControl.append(pctLabel, pctSlider, pctReadout);
+
+    const chargeRow = this.makeSwitchRow(
+      "Charging",
+      "Show the watch as plugged in / charging.",
+      localStorage.getItem(BAT_CHG_KEY) === "true",
+      (on) => { localStorage.setItem(BAT_CHG_KEY, on ? "true" : "false"); markBatteryDirty(); },
+    );
+
+    batBtn.addEventListener("click", () => {
+      const [pct, charging] = buildBatteryCall(pctSlider.value, localStorage.getItem(BAT_CHG_KEY));
+      batStatus.textContent = "Setting…";
+      void window.studio.setBattery(pct, charging)
+        .then(() => {
+          batStatus.textContent = `Set to ${pct}%${charging ? " (charging)" : ""}.`;
+          batteryDirty = false;
+          batBtn.classList.remove("lib-pick-btn--needs-apply");
+        })
+        .catch((e: unknown) => { batStatus.textContent = `Failed: ${e instanceof Error ? e.message : String(e)}`; });
+    });
+
+    battery.append(batteryHeading, pctControl, chargeRow, batBtn, batStatus);
+
+    // ── Simulated environment (location + weather) ────────────────────────
+    const sim = document.createElement("section");
+    sim.className = "settings-section";
+    const simHeading = document.createElement("h3");
+    simHeading.className = "settings-section-title type-body-strong";
+    simHeading.textContent = "Simulated location & weather";
+
+    // Live UI state, seeded from the default preset and hydrated from sim:get below.
+    const simState = {
+      enabled: DEFAULT_SIM_ENV.enabled,
+      lat: DEFAULT_SIM_ENV.location.lat,
+      lon: DEFAULT_SIM_ENV.location.lon,
+      name: DEFAULT_SIM_ENV.location.name,
+      condition: DEFAULT_SIM_ENV.weather.condition,
+      units: DEFAULT_SIM_ENV.units,
+      tempInput: Math.round(tempCToDisplay(DEFAULT_SIM_ENV.weather.tempC, DEFAULT_SIM_ENV.units)),
+      isDay: DEFAULT_SIM_ENV.weather.isDay,
+    };
+
+    const simApplyBtn = document.createElement("button");
+    simApplyBtn.type = "button";
+    simApplyBtn.className = "lib-pick-btn";
+    simApplyBtn.textContent = "Apply";
+    const simStatus = document.createElement("span");
+    simStatus.className = "settings-row-desc type-caption";
+
+    let simDirty = false;
+    const markSimDirty = (): void => {
+      simDirty = true;
+      simApplyBtn.classList.toggle("lib-pick-btn--needs-apply", true);
+    };
+
+    // Enable toggle.
+    const enableRow = this.makeSwitchRow(
+      "Simulate location & weather",
+      "Feed weather watchfaces a fixed location + synthetic weather (offline). On by default.",
+      simState.enabled,
+      (on) => { simState.enabled = on; markSimDirty(); },
+    );
+
+    // Location: preset dropdown + custom lat/lon.
+    const locControl = document.createElement("label");
+    locControl.className = "settings-watch-control";
+    const locLabel = document.createElement("span");
+    locLabel.className = "settings-watch-label type-body";
+    locLabel.textContent = "Location";
+    const locSelect = document.createElement("select");
+    locSelect.className = "settings-watch-select";
+    for (const c of PRESET_CITIES) {
+      const o = document.createElement("option");
+      o.value = c.name; o.textContent = c.name; locSelect.appendChild(o);
+    }
+    const customOpt = document.createElement("option");
+    customOpt.value = "__custom__"; customOpt.textContent = "Custom…";
+    locSelect.appendChild(customOpt);
+    locSelect.value = simState.name;
+    locControl.append(locLabel, locSelect);
+
+    const customRow = document.createElement("label");
+    customRow.className = "settings-watch-control";
+    const customLabel = document.createElement("span");
+    customLabel.className = "settings-watch-label type-body";
+    customLabel.textContent = "Coordinates";
+    const latInput = document.createElement("input");
+    latInput.type = "number"; latInput.step = "0.0001"; latInput.value = String(simState.lat);
+    latInput.placeholder = "lat"; latInput.title = "Latitude"; latInput.className = "settings-watch-select"; latInput.style.width = "7em";
+    const lonInput = document.createElement("input");
+    lonInput.type = "number"; lonInput.step = "0.0001"; lonInput.value = String(simState.lon);
+    lonInput.placeholder = "lon"; lonInput.title = "Longitude"; lonInput.className = "settings-watch-select"; lonInput.style.width = "7em";
+    const coordWrap = document.createElement("div");
+    coordWrap.className = "settings-time-selects";
+    coordWrap.append(latInput, lonInput);
+    customRow.append(customLabel, coordWrap);
+    const syncCustomVisibility = (): void => { customRow.hidden = locSelect.value !== "__custom__"; };
+    syncCustomVisibility();
+
+    locSelect.addEventListener("change", () => {
+      if (locSelect.value === "__custom__") {
+        simState.name = "Custom";
+      } else {
+        const c = PRESET_CITIES.find((p) => p.name === locSelect.value)!;
+        simState.name = c.name; simState.lat = c.lat; simState.lon = c.lon;
+        latInput.value = String(c.lat); lonInput.value = String(c.lon);
+      }
+      syncCustomVisibility(); markSimDirty();
+    });
+    latInput.addEventListener("input", () => { simState.lat = Number(latInput.value) || 0; markSimDirty(); });
+    lonInput.addEventListener("input", () => { simState.lon = Number(lonInput.value) || 0; markSimDirty(); });
+
+    // Condition dropdown.
+    const condControl = document.createElement("label");
+    condControl.className = "settings-watch-control";
+    const condLabel = document.createElement("span");
+    condLabel.className = "settings-watch-label type-body";
+    condLabel.textContent = "Condition";
+    const condSelect = document.createElement("select");
+    condSelect.className = "settings-watch-select";
+    for (const c of CONDITION_OPTIONS) {
+      const o = document.createElement("option");
+      o.value = c.key; o.textContent = c.label; condSelect.appendChild(o);
+    }
+    condSelect.value = simState.condition;
+    condSelect.addEventListener("change", () => {
+      simState.condition = condSelect.value as ConditionKey; markSimDirty();
+    });
+    condControl.append(condLabel, condSelect);
+
+    // Temperature + unit toggle.
+    const tempControl = document.createElement("label");
+    tempControl.className = "settings-watch-control";
+    const tempLabel = document.createElement("span");
+    tempLabel.className = "settings-watch-label type-body";
+    tempLabel.textContent = "Temperature";
+    const tempInput = document.createElement("input");
+    tempInput.type = "number"; tempInput.step = "1"; tempInput.value = String(simState.tempInput);
+    tempInput.className = "settings-watch-select"; tempInput.style.width = "5em";
+    const unitBtn = document.createElement("button");
+    unitBtn.type = "button"; unitBtn.className = "lib-pick-btn";
+    unitBtn.textContent = `°${simState.units}`;
+    unitBtn.title = "Toggle the unit you enter the temperature in (does not change what the watch shows)";
+    unitBtn.addEventListener("click", () => {
+      // Convert the current displayed value to the other unit so the meaning is preserved.
+      const asC = tempInputToC(Number(tempInput.value) || 0, simState.units);
+      simState.units = simState.units === "F" ? "C" : "F";
+      simState.tempInput = Math.round(tempCToDisplay(asC, simState.units));
+      tempInput.value = String(simState.tempInput);
+      unitBtn.textContent = `°${simState.units}`;
+      markSimDirty();
+    });
+    tempInput.addEventListener("input", () => { simState.tempInput = Number(tempInput.value) || 0; markSimDirty(); });
+    const tempWrap = document.createElement("div");
+    tempWrap.className = "settings-time-selects";
+    tempWrap.append(tempInput, unitBtn);
+    tempControl.append(tempLabel, tempWrap);
+
+    // Day/night.
+    const dayRow = this.makeSwitchRow(
+      "Daytime",
+      "Off = night (affects condition icon day/night variant).",
+      simState.isDay,
+      (on) => { simState.isDay = on; markSimDirty(); },
+    );
+
+    simApplyBtn.addEventListener("click", () => {
+      const cfg = buildSimConfigFromUi(simState);
+      simStatus.textContent = "Applying…";
+      // Arm bridge-dead suppression BEFORE the round-trip: if the backend reboots
+      // the live emulator, the health monitor would otherwise see the expected
+      // restart as a crash and race an auto-relaunch against the refresh. The
+      // `finally` balances this begin on EVERY exit path (reboot, no-reboot,
+      // throw), so suppression is never left stuck on and never depends on the
+      // reconnect handler being wired.
+      this.onWeatherRefreshBegin?.();
+      void window.studio.simSet(cfg)
+        .then(async (res) => {
+          simDirty = false;
+          simApplyBtn.classList.remove("lib-pick-btn--needs-apply");
+          // When live, the backend rebooted the emulator to clear watchface fetch
+          // caches; reconnect the VNC canvas (it's pointing at the dead qemu) the
+          // same way "Clear emulator" does, else the screen stays black.
+          if (res?.rebooted) {
+            simStatus.textContent = "Reloading watch to refresh weather…";
+            await this.onWeatherRefreshReconnect?.();
+          }
+          simStatus.textContent = cfg.enabled
+            ? `Active: ${cfg.location.name}, ${simState.condition}, ${simState.tempInput}°${simState.units}.`
+            : "Simulation off (apps use the real network).";
+        })
+        .catch((e: unknown) => {
+          simStatus.textContent = `Failed: ${e instanceof Error ? e.message : String(e)}`;
+        })
+        .finally(() => { this.onWeatherRefreshEnd?.(); });
+    });
+
+    sim.append(simHeading, enableRow, locControl, customRow, condControl, tempControl, dayRow, simApplyBtn, simStatus);
+
+    // Hydrate from the persisted control file (falls back to the seeded defaults).
+    void window.studio.simGet().then((cfg) => {
+      simState.enabled = cfg.enabled;
+      simState.lat = cfg.location.lat; simState.lon = cfg.location.lon; simState.name = cfg.location.name;
+      simState.condition = cfg.weather.condition; simState.units = cfg.units;
+      simState.isDay = cfg.weather.isDay;
+      simState.tempInput = Math.round(tempCToDisplay(cfg.weather.tempC, cfg.units));
+      // Reflect into controls.
+      const known = PRESET_CITIES.some((p) => p.name === cfg.location.name);
+      locSelect.value = known ? cfg.location.name : "__custom__";
+      latInput.value = String(cfg.location.lat); lonInput.value = String(cfg.location.lon);
+      condSelect.value = cfg.weather.condition;
+      tempInput.value = String(simState.tempInput);
+      unitBtn.textContent = `°${cfg.units}`;
+      enableRow.setOn(cfg.enabled);
+      dayRow.setOn(cfg.weather.isDay);
+      syncCustomVisibility();
+      simDirty = false;
+      simApplyBtn.classList.remove("lib-pick-btn--needs-apply");
+    }).catch(() => { /* keep seeded defaults */ });
+
+    // ── Health section ────────────────────────────────────────────────────
+    const health = document.createElement("section");
+    health.className = "settings-section";
+    const healthHeading = document.createElement("h3");
+    healthHeading.className = "settings-section-title type-body-strong";
+    healthHeading.textContent = "Health";
+    const healthRow = this.makeSwitchRow(
+      "Activate Pebble Health on boot (legacy boards)",
+      "Auto-enables Pebble Health on the legacy boards (Pebble Classic, Pebble Time, Pebble Time Round, Pebble 2) so health-dependent watchfaces work. The newer boards (Pebble Time 2, Pebble Round 2, Pebble 2 Duo) have Pebble Health on by default, so this toggle doesn't affect them. Default on.",
+      localStorage.getItem(HEALTH_BOOT_KEY) !== "false", // default ON
+      (on) => localStorage.setItem(HEALTH_BOOT_KEY, on ? "true" : "false"),
+    );
+    health.append(healthHeading, healthRow);
+
     // ── Capture section ───────────────────────────────────────────────────
     const capture = document.createElement("section");
     capture.className = "settings-section";
@@ -624,7 +955,14 @@ export class SettingsPane {
     blBtnDesc.textContent =
       "What the main-page Backlight button does: Back button reliably wakes the screen but can navigate inside an app; Shake sends a motion nudge (won't navigate).";
 
-    capture.append(blCaptureRow, blMethodControl, blMethodDesc, blBtnControl, blBtnDesc);
+    const sunlightRow = this.makeSwitchRow(
+      "Sunlight color correction",
+      "Match the real Pebble display: mutes the emulator's vivid colors in screenshots & GIFs. Default off.",
+      localStorage.getItem(SUNLIGHT_KEY) === "true", // default OFF
+      (on) => localStorage.setItem(SUNLIGHT_KEY, on ? "true" : "false"),
+    );
+
+    capture.append(blCaptureRow, sunlightRow, blMethodControl, blMethodDesc, blBtnControl, blBtnDesc);
 
     // ── Keyboard section (I) ──────────────────────────────────────────────
     const keyboard = document.createElement("section");
@@ -692,7 +1030,7 @@ export class SettingsPane {
 
     advanced.append(advHeading, diagRow, throttleRow, autoRelaunchRow);
 
-    this.el.append(appearance, watch, time, capture, keyboard, advanced);
+    this.el.append(appearance, watch, time, battery, sim, health, capture, keyboard, advanced);
 
     this.syncSwitch();
     this.syncBootSwitch();
@@ -949,7 +1287,7 @@ export class SettingsPane {
     desc: string,
     initialOn: boolean,
     onToggle: (on: boolean) => void,
-  ): HTMLElement {
+  ): SwitchRow {
     const row = document.createElement("div");
     row.className = "settings-row";
 
@@ -986,7 +1324,11 @@ export class SettingsPane {
     sync();
 
     row.append(text, sw);
-    return row;
+    (row as unknown as SwitchRow).setOn = (next: boolean): void => {
+      on = next;
+      sync();
+    };
+    return row as unknown as SwitchRow;
   }
 
   /** (Re)build the per-action keybinding rows from the current bindings. */

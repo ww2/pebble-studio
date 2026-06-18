@@ -14,6 +14,17 @@ export const CHANGELOG: ChangelogEntry[] = [
   // The 2.x line is the native-Windows track (no WSL); the 1.x line is the
   // WSL-connected track. 2.0.1 is the first native release. 3.0.0 is the first
   // public open-source release.
+  { version: "3.0.1", date: "2026-06-17", changes: [
+    "Battery simulation: set a custom battery percentage and charging state on the running watch from Settings → Battery. Works on every board. The \"Set battery\" button glows when you have changes you haven't applied yet. Your chosen level now sticks across a reboot — changing the weather, clearing the emulator, or switching watches no longer reverts it to the board default.",
+    "Simulated location & weather: watchfaces that use geolocation now work in the emulator with no phone connected. Settings → \"Simulated location & weather\" offers location presets or custom lat/lon, condition, temperature (°F/°C), and day/night. Changing the weather and clicking Apply updates weather watchfaces immediately — it clears their refresh throttle and reloads the watch — while preserving their saved settings.",
+    "Pebble Health now activates reliably on boot across all boards, before user apps load, so health watchfaces no longer show \"This app requires Pebble Health\" or crash. On the legacy boards (Pebble Time, Pebble Time Round, Pebble 2) Health is pre-enabled in the bundled image so it works from the very first boot; the newer boards (Pebble Time 2, Pebble Round 2, Pebble 2 Duo) always have it on.",
+    "Watchfaces that use geolocation no longer crash the emulator (a 32-bit timestamp overflow in the bundled phone-side JS engine on Windows).",
+    "Captures: screenshots and GIFs can apply Pebble's official sunlight colour correction to match the real display. Off by default — toggle in Settings → Captures.",
+    "Startup watch is now a fixed preference (Settings → Startup watch): the watch Pebble Studio opens on launch no longer changes when you switch the active watch from the top bar.",
+    "Watch buttons support long-press (hold the mouse to hold the button) and light up on every keyboard press, confirming each keystroke registered.",
+    "Clear emulator is now available whenever the emulator is running, so stale leftover apps can always be wiped.",
+    "Boot-log panel no longer shrinks the emulator: collapsing the expanded log restores the fit zoom.",
+  ]},
   { version: "3.0.0", date: "2026-06-15", changes: [
     "First public open-source release. Pebble Studio is now available on GitHub under the MIT license.",
   ]},

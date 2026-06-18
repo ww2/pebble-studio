@@ -145,6 +145,49 @@ export function winSetTzOffsetArgv(o: WinSetTzOffsetOpts): PebbleCommand {
   return { cmd: o.pythonExe, args: [o.helperPath, String(off), name] };
 }
 
+// Helper source (pb-activate-health.py): connects to the running emulator's pypkjs
+// websocket and sends ONE BlobDB Prefs INSERT (key "activityPreferences\0", value =
+// 9-byte ActivitySettings with tracking_enabled=1), then reads the BlobResponse and
+// prints "health-activate: status=<n>" (1 == success). The emulator state-file path
+// is argv[1] (default /tmp/pb-emulator.json for POSIX/WSL); the windows-native driver
+// passes %TEMP%\pb-emulator.json — WITHOUT this, native Windows hit FileNotFoundError
+// on /tmp (→ C:\tmp) before sending, so health never activated.
+// Base64 of the script (base64 alphabet is shell-safe — echo'd UNQUOTED, like pb-set-tz.py).
+const ACTIVATE_HEALTH_HELPER_B64 =
+  "aW1wb3J0IHN5cywganNvbiwgb3MsIHN0cnVjdApmcm9tIGxpYnBlYmJsZTIuY29tbXVuaWNhdGlvbiBpbXBvcnQgUGViYmxlQ29ubmVjdGlvbgpmcm9tIGxpYnBlYmJsZTIuY29tbXVuaWNhdGlvbi50cmFuc3BvcnRzLndlYnNvY2tldCBpbXBvcnQgV2Vic29ja2V0VHJhbnNwb3J0CmZyb20gbGlicGViYmxlMi5wcm90b2NvbC5ibG9iZGIgaW1wb3J0IEJsb2JDb21tYW5kLCBJbnNlcnRDb21tYW5kLCBCbG9iUmVzcG9uc2UKc3RhdGVwYXRoID0gc3lzLmFyZ3ZbMV0gaWYgbGVuKHN5cy5hcmd2KSA+IDEgZWxzZSAnL3RtcC9wYi1lbXVsYXRvci5qc29uJwppbmZvID0ganNvbi5sb2FkKG9wZW4oc3RhdGVwYXRoKSkKcG9ydCA9IE5vbmUKZm9yIHBsYXQsIHZlcnMgaW4gaW5mby5pdGVtcygpOgogICAgZm9yIHYsIGQgaW4gdmVycy5pdGVtcygpOgogICAgICAgIHAgPSAoZC5nZXQoJ3B5cGtqcycpIG9yIHt9KS5nZXQoJ3BvcnQnKQogICAgICAgIGlmIHA6IHBvcnQgPSBwCmlmIHBvcnQgaXMgTm9uZToKICAgIHN5cy5leGl0KCdubyBweXBranMgcG9ydCBpbiAlcycgJSBzdGF0ZXBhdGgpCmtleSA9IGInYWN0aXZpdHlQcmVmZXJlbmNlcycgKyBiJ1x4MDAnCnZhbHVlID0gc3RydWN0LnBhY2soJzxoaEJCQmJiJywgMTc1MCwgNzUwMCwgMSwgMSwgMSwgMzAsIDEpCnRva2VuID0gaW50LmZyb21fYnl0ZXMob3MudXJhbmRvbSgyKSwgJ2JpZycpCnBrdCA9IEJsb2JDb21tYW5kKGNvbW1hbmQ9MHgwMSwgdG9rZW49dG9rZW4sIGRhdGFiYXNlPTcsIGNvbnRlbnQ9SW5zZXJ0Q29tbWFuZChrZXk9a2V5LCB2YWx1ZT12YWx1ZSkpCnRyeToKICAgIGMgPSBQZWJibGVDb25uZWN0aW9uKFdlYnNvY2tldFRyYW5zcG9ydCgnd3M6Ly9sb2NhbGhvc3Q6JWQvJyAlIHBvcnQpKQogICAgYy5jb25uZWN0KCk7IGMucnVuX2FzeW5jKCkKICAgIHJlc3AgPSBjLnNlbmRfYW5kX3JlYWQocGt0LCBCbG9iUmVzcG9uc2UsIHRpbWVvdXQ9MykKICAgIHByaW50KCdoZWFsdGgtYWN0aXZhdGU6IHN0YXR1cz0lZCcgJSBpbnQocmVzcC5yZXNwb25zZSkpCmV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgIGNuID0gdHlwZShlKS5fX25hbWVfXwogICAgaWYgY24gPT0gJ1RpbWVvdXRFcnJvcicgb3IgY24gPT0gJ1RpbWVvdXRFbmRwb2ludCc6CiAgICAgICAgcHJpbnQoJ2hlYWx0aC1hY3RpdmF0ZTogbm8tcmVzcG9uc2UnKTsgc3lzLmV4aXQoMSkKICAgIHByaW50KCdoZWFsdGgtYWN0aXZhdGU6IGVycm9yICVzJyAlIGUpOyBzeXMuZXhpdCgxKQo=";
+
+/** POSIX form: deploy + run pb-activate-health.py via `bash -lc` (echoed UNQUOTED,
+ * same quote-free rule as setTzOffsetCmd — the WSL driver re-wraps it). `timeout`
+ * hard-bounds the pypkjs connection. The helper prints `health-activate: status=<n>`. */
+export function activateHealthCmd(): PebbleCommand {
+  const oneLiner =
+    `mkdir -p $HOME/.pebble-studio; ` +
+    `H=$HOME/.pebble-studio/pb-activate-health.py; ` +
+    `echo ${ACTIVATE_HEALTH_HELPER_B64} | base64 -d > $H; ` +
+    `PYBIN=$(head -1 $(command -v pebble) | cut -c3-); ` +
+    `timeout -k 2 6 $PYBIN $H`;
+  return { cmd: "bash", args: ["-lc", oneLiner] };
+}
+
+/** Windows-native form: write the decoded helper to `helperPath` then run it via the
+ * provisioned python (no shell). Returns the argv; the driver writes the file first.
+ * `statePath` is the native emulator state file (`%TEMP%\pb-emulator.json`) — passed
+ * as argv[1] because the helper's /tmp default does not exist on native Windows. */
+export function winActivateHealthArgv(pythonExe: string, helperPath: string, statePath: string): PebbleCommand {
+  return { cmd: pythonExe, args: [helperPath, statePath] };
+}
+
+/** The base64-decoded pb-activate-health.py source, for the windows driver to write. */
+export function activateHealthHelperSource(): Buffer {
+  return Buffer.from(ACTIVATE_HEALTH_HELPER_B64, "base64");
+}
+
+/** Parse the helper's stdout into a status. status===1 ⇒ activated; null ⇒ unknown/fail. */
+export function parseHealthStatus(stdout: string): number | null {
+  const m = /health-activate:\s*status=(\d+)/.exec(stdout);
+  return m ? Number(m[1]) : null;
+}
+
 /** Toggle the timeline quick-view (peek) on the watchface. Real CLI:
  * pebble emu-set-timeline-quick-view {on|off} */
 export function timelineQuickViewCmd(on: boolean): PebbleCommand {

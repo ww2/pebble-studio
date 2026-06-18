@@ -33,10 +33,30 @@ import { join } from "node:path";
  * watch to confirm. Every failure mode prints `ERR ...`; the renderer falls back
  * to the existing VNC-canvas + backlight screenshot, so a failure here is benign.
  */
-export const INPUT_HELPER_PY = `import sys, time, threading
+export const INPUT_HELPER_PY = `import sys, time, threading, json, uuid
 from libpebble2.communication.transports.websocket import WebsocketTransport, MessageTargetPhone
-from libpebble2.communication.transports.websocket.protocol import WebSocketRelayQemu
+from libpebble2.communication.transports.websocket.protocol import WebSocketRelayQemu, WebSocketTimelinePin, InsertPin, DeletePin
 from libpebble2.communication.transports.qemu.protocol import QemuPacket, QemuButton, QemuTap
+
+_SUNLIGHT_LUT = {
+    (0,0,0):(0,0,0),(0,0,85):(0,30,65),(0,0,170):(0,67,135),(0,0,255):(0,104,202),
+    (0,85,0):(43,74,44),(0,85,85):(39,81,79),(0,85,170):(22,99,141),(0,85,255):(0,125,206),
+    (0,170,0):(94,152,96),(0,170,85):(92,155,114),(0,170,170):(87,165,162),(0,170,255):(76,180,219),
+    (0,255,0):(142,227,145),(0,255,85):(142,230,158),(0,255,170):(138,235,192),(0,255,255):(132,245,241),
+    (85,0,0):(74,22,27),(85,0,85):(72,39,72),(85,0,170):(64,72,138),(85,0,255):(47,107,204),
+    (85,85,0):(86,78,54),(85,85,85):(84,84,84),(85,85,170):(79,103,144),(85,85,255):(65,128,208),
+    (85,170,0):(117,154,100),(85,170,85):(117,157,118),(85,170,170):(113,166,164),(85,170,255):(105,181,221),
+    (85,255,0):(158,229,148),(85,255,85):(157,231,160),(85,255,170):(155,236,194),(85,255,255):(149,246,242),
+    (170,0,0):(153,53,63),(170,0,85):(152,62,90),(170,0,170):(149,86,148),(170,0,255):(143,116,210),
+    (170,85,0):(157,91,77),(170,85,85):(157,96,100),(170,85,170):(154,112,153),(170,85,255):(149,135,213),
+    (170,170,0):(175,160,114),(170,170,85):(174,163,130),(170,170,170):(171,171,171),(170,170,255):(167,186,226),
+    (170,255,0):(201,232,157),(170,255,85):(201,234,167),(170,255,170):(199,240,200),(170,255,255):(195,249,247),
+    (255,0,0):(227,84,98),(255,0,85):(226,88,116),(255,0,170):(225,106,163),(255,0,255):(222,131,220),
+    (255,85,0):(230,110,107),(255,85,85):(230,114,124),(255,85,170):(227,127,167),(255,85,255):(225,148,223),
+    (255,170,0):(241,170,134),(255,170,85):(241,173,147),(255,170,170):(239,181,184),(255,170,255):(236,195,235),
+    (255,255,0):(255,238,171),(255,255,85):(255,241,181),(255,255,170):(255,246,211),(255,255,255):(255,255,255),
+}
+_SUNLIGHT_SNAP = [(0,85,170,255)[min(3,(v+42)//85)] for v in range(256)]
 
 # Lazy framebuffer-screenshot state. The PebbleConnection that drives the
 # libpebble2 Screenshot service is built once, on the first 'screenshot' command,
@@ -61,8 +81,8 @@ def _get_pebble(transport):
 
 
 def _grab_png(transport, out_path):
-    # Framebuffer grab → PNG. Returns on success; raises on any failure. Runs in a
-    # worker thread under a watchdog (see do_screenshot) so a hung grab times out.
+    # Framebuffer grab → PNG with Pebble sunlight colour correction (matches
+    # pebble-tool's _correct_colours; only invoked when the UI toggle is on).
     from libpebble2.services.screenshot import Screenshot
     import png
     pebble = _get_pebble(transport)
@@ -71,10 +91,16 @@ def _grab_png(transport, out_path):
         raise RuntimeError('no screenshot data')
     height = len(rows)
     width = len(rows[0]) // 3
-    # pebble_tool saves with png.from_array(..., mode='RGBA;8'); the Screenshot
-    # service returns RGB8 rows, so write straight RGB (no colour correction /
-    # roundify — those are cosmetic, and the renderer masks round platforms).
-    png.from_array(rows, mode='RGB;8', info={'width': width, 'height': height}).save(out_path)
+    snap = _SUNLIGHT_SNAP
+    lut = _SUNLIGHT_LUT
+    corrected = []
+    for row in rows:
+        out = bytearray(len(row))
+        for x in range(0, len(row), 3):
+            cr, cg, cb = lut[(snap[row[x]], snap[row[x+1]], snap[row[x+2]])]
+            out[x] = cr; out[x+1] = cg; out[x+2] = cb
+        corrected.append(out)
+    png.from_array(corrected, mode='RGB;8', info={'width': width, 'height': height}).save(out_path)
 
 
 def do_screenshot(transport, out_path, timeout=8.0):
@@ -118,6 +144,28 @@ def main():
             WebSocketRelayQemu(protocol=packet.protocol, data=data.serialise()),
             target=MessageTargetPhone())
 
+    SANDBOX_UUID = 'a1b2c3d4-0000-0000-0000-000000000001'
+
+    def pin_guid(pin_id):
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, '%s.pin.developer.getpebble.com' % pin_id))
+
+    def send_pin(pin_id, unix_time, title):
+        iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(unix_time))
+        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        pin = {
+            'id': pin_id, 'guid': pin_guid(pin_id), 'time': iso,
+            'createTime': now_iso, 'updateTime': now_iso, 'topicKeys': [],
+            'source': 'sdk', 'dataSource': 'sandbox-uuid:%s' % SANDBOX_UUID,
+            'layout': {'type': 'genericPin', 'title': title,
+                       'tinyIcon': 'system://images/NOTIFICATION_FLAG'},
+        }
+        transport.send_packet(WebSocketTimelinePin(data=InsertPin(json=json.dumps(pin))),
+                              target=MessageTargetPhone())
+
+    def send_unpin(pin_id):
+        transport.send_packet(WebSocketTimelinePin(data=DeletePin(uuid=pin_guid(pin_id))),
+                              target=MessageTargetPhone())
+
     sys.stdout.write('ready\\n')
     sys.stdout.flush()
     for line in sys.stdin:
@@ -149,13 +197,26 @@ def main():
                 else:
                     sys.stdout.write('ERR no output path\\n')
                     sys.stdout.flush()
+            elif cmd == 'pin':
+                # pin <id> <unix_time> <title...>
+                pin_id = parts[1]
+                unix_time = int(parts[2])
+                rest = line.split(None, 3)
+                title = rest[3].strip() if len(rest) > 3 else 'Sample Pin'
+                send_pin(pin_id, unix_time, title)
+                sys.stdout.write('OK pin %s\\n' % pin_id)
+                sys.stdout.flush()
+            elif cmd == 'unpin':
+                send_unpin(parts[1])
+                sys.stdout.write('OK unpin\\n')
+                sys.stdout.flush()
         except Exception as e:
             # Input errors go to stderr (fire-and-forget); a screenshot error is
             # reported on stdout by do_screenshot, so report any stray failure
             # there too so the renderer's pending screenshot request can resolve.
             sys.stderr.write('input-helper error: %s\\n' % e)
             sys.stderr.flush()
-            if parts and parts[0] == 'screenshot':
+            if parts and parts[0] in ('screenshot', 'pin', 'unpin'):
                 sys.stdout.write('ERR %s\\n' % e)
                 sys.stdout.flush()
 

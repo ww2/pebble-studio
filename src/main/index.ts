@@ -86,6 +86,16 @@ function createWindow(): void {
     },
   });
 
+  // Defense-in-depth: the renderer loads only local content and never opens
+  // popups, so lock both down. A stray link or future XSS therefore cannot
+  // navigate this (preload-bearing) window to a remote origin or spawn a new
+  // window. The Clay child window has its own equivalent guards.
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  win.webContents.on("will-navigate", (e, url) => {
+    const allowed = process.env.VITE_DEV_SERVER_URL;
+    if (!(allowed && url.startsWith(allowed))) e.preventDefault();
+  });
+
   // Track as the main window so `second-instance` can restore + focus it; clear
   // the ref on close so we never poke a destroyed window.
   mainWindow = win;

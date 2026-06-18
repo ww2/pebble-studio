@@ -5,9 +5,7 @@ export type Rate = "frozen" | "1x" | "2x" | "4x" | "10x";
 export const RATE_MULT: Record<Rate, number> = { frozen: 0, "1x": 1, "2x": 2, "4x": 4, "10x": 10 };
 
 /**
- * EMULATOR TIME CONTRACT — v0.0.13 control-file model (spec:
- * docs/superpowers/specs/2026-06-12-pebble-studio-v0.0.13-time-clay-port-design.md §A2;
- * background: memory `pebble-emu-time-mechanism`):
+ * EMULATOR TIME CONTRACT — v0.0.13 control-file model:
  *
  *   - The qemu firmware clock is continuously re-jammed from the qemu PROCESS's
  *     CLOCK_REALTIME. An LD_PRELOAD shim (timeShim.ts) fakes that clock, driven
@@ -128,6 +126,9 @@ export interface TimeController {
    * false until the first real probe (at boot/apply) — the renderer must not
    * show "shim unavailable" off the unchecked default. */
   getStatus(): { shim: boolean; checked: boolean };
+  /** The watch's current UTC (unix seconds): system → real time; custom → the
+   * entered target advanced by its rate since apply. Drives sample-pin timing. */
+  currentWatchUnix(): number;
   stop(): void;
 }
 
@@ -144,6 +145,12 @@ export function makeTimeController(
   let shimReady = false;     // last ensureTimeShim() result (false until first check)
   let shimChecked = false;   // has ensureTimeShim() ever actually been probed?
   let legacyActive = false;  // custom mode is running on the legacy fallback
+
+  // Fake-clock anchor for currentWatchUnix(). Updated on every shim apply() write.
+  // Defaults describe real time at construction so a pre-apply read is sane.
+  let fakeTarget = Math.trunc(now() / 1000);
+  let fakeRate = 1;
+  let fakeAppliedAtMs = now();
 
   // -------------------------------------------------------------------------
   // LEGACY FALLBACK — pre-v0.0.13 virtual-clock machinery, kept VERBATIM for
@@ -251,13 +258,24 @@ export function makeTimeController(
       await legacyPush(true);
       syncLegacyTimer();
     } else if (shimReady) {
-      // PRIMARY PATH: write the control file FIRST. Custom → entered wall-clock at
-      // the chosen rate; System → real time at 1× (the shim has no reset, so
-      // jumping the fake clock to now IS the reset; sub-second skew acceptable).
-      const target = cfg.source === "custom"
-        ? fakeTargetUnix(cfg.customWallMs, hostTz(), now())
-        : Math.trunc(now() / 1000);
-      const rate = cfg.source === "custom" ? RATE_MULT[cfg.rate] : 1;
+      // PRIMARY PATH: write the control file FIRST.
+      //   · Custom → the entered wall-clock baked into an ABSOLUTE target at rate.
+      //   · System → a RELATIVE anchor ("- 1"), NOT an absolute "<now> 1". The f2xx
+      //     RTC (basalt/chalk/diorite/aplite) seeds its clock from the control file
+      //     at qemu *realize*, which happens BEFORE this apply() runs (apply fires
+      //     after the emulator reaches "live"). An absolute target written here is
+      //     read one boot STALE at the next realize, seeding that RTC tens-of-seconds
+      //     behind real — and the f2xx host→target offset is computed once and
+      //     sticks, so the watch runs permanently ~1 min behind. (The generic-RTC
+      //     M33 boards — emery/gabbro/flint — re-read the live clock every access,
+      //     so they were unaffected.) A relative "-" anchor reads as real time
+      //     WHENEVER qemu reads it, so the seed is correct regardless of ordering.
+      const isCustom = cfg.source === "custom";
+      const target = isCustom ? fakeTargetUnix(cfg.customWallMs, hostTz(), now()) : null;
+      const rate = isCustom ? RATE_MULT[cfg.rate] : 1;
+      fakeTarget = target ?? Math.trunc(now() / 1000); // currentWatchUnix anchor: system tracks real now
+      fakeRate = rate;
+      fakeAppliedAtMs = now();
       try { await d.setFakeTime(target, rate); } catch { /* ignore */ }
     }
     // System with no shim: nothing to write — skip.
@@ -294,6 +312,9 @@ export function makeTimeController(
       // post_connect pushes). Plain system mode (host zone): NO-OP.
     },
     getStatus: () => ({ shim: shimReady, checked: shimChecked }),
+    currentWatchUnix(): number {
+      return Math.trunc(fakeTarget + ((now() - fakeAppliedAtMs) / 1000) * fakeRate);
+    },
     stop(): void { clearTimer(); },
   };
 }

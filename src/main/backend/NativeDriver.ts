@@ -1,5 +1,5 @@
 import type { PlatformId, ButtonId, ButtonAction } from "../../shared/types.js";
-import type { BackendDriver, Runner, RunResult, VncEndpoint } from "./BackendDriver.js";
+import type { BackendDriver, HealthActivateResult, Runner, RunResult, VncEndpoint } from "./BackendDriver.js";
 import type { PebbleCommand } from "./pebbleCli.js";
 import * as cli from "./pebbleCli.js";
 import { bootEmulator, stopEmulator, type BootToken, type OnStep } from "./bootEmulator.js";
@@ -88,6 +88,17 @@ export class NativeDriver implements BackendDriver {
 
   async battery(percent: number, charging: boolean): Promise<void> {
     await this.exec(cli.batteryCmd(percent, charging));
+  }
+
+  async activateHealth(): Promise<HealthActivateResult> {
+    try {
+      const c = cli.activateHealthCmd();
+      const r = await this.deps.run(c.cmd, c.args, c.env);
+      const status = cli.parseHealthStatus(r.stdout);
+      return { ok: status === 1, status, detail: (r.stdout || r.stderr || "").trim() };
+    } catch (e) {
+      return { ok: false, status: null, detail: String(e) };
+    }
   }
 
   async screenshot(outPath: string): Promise<void> {
