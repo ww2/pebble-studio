@@ -57,4 +57,12 @@ $dest = Join-Path $repo $OutDir
 if (Test-Path $dest) { [System.IO.Directory]::Delete($dest, $true) }
 New-Item -ItemType Directory -Force (Split-Path -Parent $dest) | Out-Null
 Copy-Item -Recurse -Force $py $dest
+# Brand the interpreter so the emulator's Python processes (pypkjs/websockify,
+# spawned via sys.executable) show as "PebbleStudioEmu.exe" in Task Manager.
+# Relocatable CPython resolves its home from the directory, not the exe name.
+$branded = Join-Path $dest "PebbleStudioEmu.exe"
+Move-Item -Force (Join-Path $dest "python.exe") $branded
+$self = & $branded -c "from pebble_tool import run_tool; run_tool()" --version 2>&1 | Select-String "Pebble Tool"
+if (-not $self) { throw "branded self-test failed: pebble-tool did not report a version under PebbleStudioEmu.exe" }
+Write-Host "Branded interpreter OK: $self" -ForegroundColor Green
 Write-Host "Bundle ready at $dest" -ForegroundColor Green

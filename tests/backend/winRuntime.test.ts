@@ -45,7 +45,7 @@ describe("winRuntime path resolution", () => {
 
   it("resolves the bundled python exe under resourcesPath when packaged", () => {
     expect(pebblePyExe(packaged)).toBe(
-      "C:\\Program Files\\Pebble Studio\\resources\\pebble-py\\python.exe",
+      "C:\\Program Files\\Pebble Studio\\resources\\pebble-py\\PebbleStudioEmu.exe",
     );
   });
 
@@ -57,12 +57,12 @@ describe("winRuntime path resolution", () => {
 
   it("resolves bundles under repo vendor/ in dev when they are staged", () => {
     expect(qemuExe(devStaged)).toBe("C:\\repo\\vendor\\qemu-pebble-win\\qemu-pebble.exe");
-    expect(pebblePyExe(devStaged)).toBe("C:\\repo\\vendor\\pebble-py\\python.exe");
+    expect(pebblePyExe(devStaged)).toBe("C:\\repo\\vendor\\pebble-py\\PebbleStudioEmu.exe");
     expect(sdkBundleRoot(devStaged)).toBe("C:\\repo\\vendor\\pebble-sdk");
   });
 
   it("falls back to the C:\\tmp build location for the python bundle in dev when unstaged", () => {
-    expect(pebblePyExe(devUnstaged)).toBe("C:\\tmp\\pebble-py-build\\python\\python.exe");
+    expect(pebblePyExe(devUnstaged)).toBe("C:\\tmp\\pebble-py-build\\python\\PebbleStudioEmu.exe");
   });
 
   it("pebbleDataDir is the writable app-data persist root under userData", () => {
@@ -90,7 +90,7 @@ describe("winRuntime bundledToolsPresent", () => {
 describe("winRuntime pebbleCmd invocation contract", () => {
   it("invokes the bundled python path-independently via run_tool() and passes pebble args", () => {
     const c = pebbleCmd(["emu-control", "--emulator", "emery", "--vnc"], packaged);
-    expect(c.cmd).toBe("C:\\Program Files\\Pebble Studio\\resources\\pebble-py\\python.exe");
+    expect(c.cmd).toBe("C:\\Program Files\\Pebble Studio\\resources\\pebble-py\\PebbleStudioEmu.exe");
     expect(c.args).toEqual([
       "-c",
       "from pebble_tool import run_tool; run_tool()",

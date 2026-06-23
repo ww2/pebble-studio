@@ -141,6 +141,7 @@ describe("makeWinBootDeps killAll — process-leak fix", () => {
     }
     // Image backstop for qemu still runs; state file removed.
     expect(calls.some((a) => a.includes("qemu-pebble.exe") && a.includes("/F"))).toBe(true);
+    expect(calls.some((a) => a.includes("PebbleStudioEmu.exe"))).toBe(true);
     expect(d.rm).toHaveBeenCalled();
   });
 

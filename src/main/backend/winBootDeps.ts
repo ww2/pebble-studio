@@ -129,6 +129,10 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps {
     // 3. Backstop: kill any remaining qemu-pebble.exe by image (covers a pid a
     //    partial/absent state-file write missed). Safe — that image is uniquely ours.
     await safeRun("taskkill", taskkillByImageArgs("qemu-pebble.exe"));
+    // Backstop the branded interpreter image too (pypkjs/websockify run under it).
+    // Safe by image because the name is uniquely ours; PID kills above already
+    // got the ones the state file listed — this catches a partial-write miss.
+    await safeRun("taskkill", taskkillByImageArgs("PebbleStudioEmu.exe"));
     await rm(paths.emuInfo);
     // taskkill /F is async; we settle on ports free as a proxy for exit (the port
     // is released on process exit on Windows).

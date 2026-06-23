@@ -23,7 +23,7 @@ describe("paths + argv", () => {
   });
   it("clearWeatherCacheArgv invokes the bundled module on that root", () => {
     const c = clearWeatherCacheArgv(ctx);
-    expect(c.cmd).toMatch(/python\.exe$/);
+    expect(c.cmd).toMatch(/PebbleStudioEmu\.exe$/);
     expect(c.args).toEqual(["-m", "pebble_studio_clearcache", localStorageRoot(ctx)]);
     expect(c.env).toBeUndefined(); // file-only helper needs no emulator env
   });

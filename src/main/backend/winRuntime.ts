@@ -37,6 +37,13 @@ const PY_BUNDLE = "pebble-py";
 const SDK_BUNDLE = "pebble-sdk";
 const TIMESHIM_WIN_BUNDLE = "timeshim-win";
 
+/** Branded basename for the bundled interpreter so Task Manager shows the
+ * emulator's Python (pypkjs/websockify, spawned via sys.executable) as a Pebble
+ * Studio process rather than a generic python.exe. The relocatable CPython
+ * locates its home from the containing directory, NOT the exe name, so renaming
+ * is safe. The build script (build-pebble-py.ps1) emits this name. */
+const PY_EXE_NAME = "PebbleStudioEmu.exe";
+
 /**
  * Dev-only fallback for the not-yet-staged python bundle: the build script
  * (`scripts/build-pebble-py.ps1`) stages to `vendor/pebble-py`, but until that
@@ -69,9 +76,9 @@ export function pebblePyDir(ctx: WinRuntimeCtx): string {
   return bundleDir(ctx, PY_BUNDLE, TMP_PY_FALLBACK);
 }
 
-/** Absolute path to the bundled python.exe. */
+/** Absolute path to the bundled interpreter (PebbleStudioEmu.exe). */
 export function pebblePyExe(ctx: WinRuntimeCtx): string {
-  return winPath.join(pebblePyDir(ctx), "python.exe");
+  return winPath.join(pebblePyDir(ctx), PY_EXE_NAME);
 }
 
 /** Read-only SDK bundle root (contains `SDKs\<ver>\sdk-core`). */
