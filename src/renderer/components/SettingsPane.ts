@@ -21,6 +21,7 @@ import {
   tempInputToC, tempCToDisplay,
   type SimEnvConfig, type ConditionKey,
 } from "../../shared/simEnv.js";
+import { LIVE_SUNLIGHT_KEY, LIVE_SUNLIGHT_EVENT } from "../liveSunlight.js";
 
 type ThemeChoice = "light" | "dark";
 type BootMode = "auto" | "manual";
@@ -962,7 +963,17 @@ export class SettingsPane {
       (on) => localStorage.setItem(SUNLIGHT_KEY, on ? "true" : "false"),
     );
 
-    capture.append(blCaptureRow, sunlightRow, blMethodControl, blMethodDesc, blBtnControl, blBtnDesc);
+    const liveSunlightRow = this.makeSwitchRow(
+      "Sunlight correction on live view",
+      "Also apply the sunlight colour correction to the live emulator screen (not just screenshots & GIFs). Default off.",
+      localStorage.getItem(LIVE_SUNLIGHT_KEY) === "true", // default OFF
+      (on) => {
+        localStorage.setItem(LIVE_SUNLIGHT_KEY, on ? "true" : "false");
+        window.dispatchEvent(new Event(LIVE_SUNLIGHT_EVENT));
+      },
+    );
+
+    capture.append(blCaptureRow, sunlightRow, liveSunlightRow, blMethodControl, blMethodDesc, blBtnControl, blBtnDesc);
 
     // ── Keyboard section (I) ──────────────────────────────────────────────
     const keyboard = document.createElement("section");
