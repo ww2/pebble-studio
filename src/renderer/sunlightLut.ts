@@ -25,17 +25,67 @@ const CORRECTED: number[] = [
   255,238,171,255,241,181,255,246,211,255,255,255,
 ];
 
-// Snap a 0..255 channel to its grid index 0..3 (nearest of 0/85/170/255).
-const SNAP_IDX = new Uint8Array(256);
-for (let v = 0; v < 256; v++) SNAP_IDX[v] = Math.min(3, Math.floor((v + 42) / 85));
+// Grid spacing: the four nominal channel levels 0/85/170/255 sit at 0,1,2,3.
+const STEP = 85;
+// Snap tolerance, in 0..255 channel units. A channel within this of a grid node
+// is treated as exactly that node — so full-brightness nominal frames (and minor
+// VNC/LCD jitter around the grid) map to the exact LUT entry, byte-identical to a
+// plain nearest-grid lookup. Genuinely off-grid values (a fading backlight) fall
+// through to interpolation instead.
+const SNAP_TOL = 6;
 
-/** Apply the Pebble sunlight LUT to an RGBA byte array in place (alpha untouched). */
+/** Resolve a 0..255 channel to a grid segment: lower node `i0`, upper node `i1`
+ * (both 0..3) and the fraction `f` (0..1) between them. `f === 0` means the value
+ * snapped to a node (within SNAP_TOL), so i0 === i1. */
+function gridPos(v: number): { i0: number; i1: number; f: number } {
+  const pos = v / STEP; // 0..3
+  let i0 = Math.floor(pos);
+  let f = pos - i0;
+  if (f * STEP <= SNAP_TOL) {
+    f = 0; // close to the node below — snap down
+  } else if ((1 - f) * STEP <= SNAP_TOL) {
+    i0 += 1; // close to the node above — snap up
+    f = 0;
+  }
+  if (i0 >= 3) return { i0: 3, i1: 3, f: 0 }; // clamp (255 -> node 3)
+  return { i0, i1: f === 0 ? i0 : i0 + 1, f };
+}
+
+/**
+ * Apply the Pebble sunlight LUT to an RGBA byte array in place (alpha untouched).
+ *
+ * The LUT is only defined at the 64 nominal colours, so we TRILINEARLY INTERPOLATE
+ * between the eight surrounding nodes rather than snapping to the nearest. On-grid
+ * (full-brightness) frames are unchanged — interpolation at a node returns that
+ * node exactly. The interpolation matters while the backlight fades: those frames
+ * carry off-grid intermediate brightnesses, and a nearest-grid snap would recolour
+ * them in discrete steps as channels cross node boundaries (the "colours change
+ * three times as the screen dims" artifact). Interpolating makes the fade smooth.
+ */
 export function applySunlightLut(data: Uint8Array): void {
   for (let i = 0; i + 4 <= data.length; i += 4) {
-    const k = (SNAP_IDX[data[i]] * 16 + SNAP_IDX[data[i + 1]] * 4 + SNAP_IDX[data[i + 2]]) * 3;
-    data[i] = CORRECTED[k];
-    data[i + 1] = CORRECTED[k + 1];
-    data[i + 2] = CORRECTED[k + 2];
+    const R = gridPos(data[i]);
+    const G = gridPos(data[i + 1]);
+    const B = gridPos(data[i + 2]);
+    // Eight surrounding LUT-entry offsets (each *3 to index the RGB triple).
+    const o000 = (R.i0 * 16 + G.i0 * 4 + B.i0) * 3;
+    const o001 = (R.i0 * 16 + G.i0 * 4 + B.i1) * 3;
+    const o010 = (R.i0 * 16 + G.i1 * 4 + B.i0) * 3;
+    const o011 = (R.i0 * 16 + G.i1 * 4 + B.i1) * 3;
+    const o100 = (R.i1 * 16 + G.i0 * 4 + B.i0) * 3;
+    const o101 = (R.i1 * 16 + G.i0 * 4 + B.i1) * 3;
+    const o110 = (R.i1 * 16 + G.i1 * 4 + B.i0) * 3;
+    const o111 = (R.i1 * 16 + G.i1 * 4 + B.i1) * 3;
+    for (let ch = 0; ch < 3; ch++) {
+      // Interpolate along blue, then green, then red.
+      const c00 = CORRECTED[o000 + ch] + (CORRECTED[o001 + ch] - CORRECTED[o000 + ch]) * B.f;
+      const c01 = CORRECTED[o010 + ch] + (CORRECTED[o011 + ch] - CORRECTED[o010 + ch]) * B.f;
+      const c10 = CORRECTED[o100 + ch] + (CORRECTED[o101 + ch] - CORRECTED[o100 + ch]) * B.f;
+      const c11 = CORRECTED[o110 + ch] + (CORRECTED[o111 + ch] - CORRECTED[o110 + ch]) * B.f;
+      const c0 = c00 + (c01 - c00) * G.f;
+      const c1 = c10 + (c11 - c10) * G.f;
+      data[i + ch] = Math.round(c0 + (c1 - c0) * R.f);
+    }
     // data[i + 3] (alpha) unchanged
   }
 }
