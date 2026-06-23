@@ -281,12 +281,15 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     driver = d;
     driverKind = kind;
     console.log(`[backend] initialized kind=${kind}`);
-    // Startup reap: a prior session killed via Task Manager "End process"
-    // (TerminateProcess) can't run before-quit, so its qemu/python stack may still
-    // be alive and holding ports 5901/6080 + a stale state file. driver.stop()
-    // runs killAll (taskkill by PID from the state file + qemu/branded image
-    // backstops, then removes the state file). No-op when nothing is orphaned.
-    try { await driver.stop(); } catch { /* nothing to reap */ }
+    // NOTE: no startup reap here. Orphans from a prior session killed via Task
+    // Manager "End process" (TerminateProcess — can't run before-quit) are reaped
+    // by the boot path instead: bootEmulator runs killAll ("Killing stale
+    // emulator…") before EVERY boot, freeing ports 5901/6080 + the stale state
+    // file. Reaping here too would block the renderer's first watch morph behind a
+    // `pebble kill` interpreter spawn (a visible startup slowdown), and a
+    // fire-and-forget reap could race a quick Launch and kill the fresh emulator.
+    // before-quit covers graceful closes (incl. "End task"); boot-time killAll
+    // covers the hard-kill aftermath when it matters (the next boot).
     // First-run SDK provisioning for the native-Windows stack: the bundled SDK is
     // read-only, so we materialise a writable copy under the app-data persist dir
     // (the XDG_DATA_HOME the invocation contract points at) BEFORE any boot. Runs
