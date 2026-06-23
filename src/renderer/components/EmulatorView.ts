@@ -5,6 +5,8 @@ import { connectVnc, type VncHandle } from "../vncClient.js";
 import { loadBindings, resolveAction, type Bindings } from "../keybindings.js";
 import type { TimeConfig } from "../../main/backend/timeController.js";
 import { SessionLog } from "../sessionLog.js";
+import { applySunlightLut } from "../sunlightLut.js";
+import { shouldRunLiveSunlight, LIVE_SUNLIGHT_KEY, LIVE_SUNLIGHT_EVENT } from "../liveSunlight.js";
 
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 /** Format hours/minutes as 12h "h:mm AM/PM" (default) or 24h "HH:MM". */
@@ -273,6 +275,17 @@ export class EmulatorView {
   /** Tiny offscreen 2D context used to read a sample region of the noVNC canvas. */
   private fpsSampleCtx: CanvasRenderingContext2D | null = null;
 
+  /** Live sunlight overlay (Issue 2): enabled flag, rAF id, and the offscreen
+   * native-resolution scratch canvas reused each frame. The visible overlay
+   * canvas lives inside #emu-screen and is (re)created on demand. */
+  private liveSunlight = localStorage.getItem(LIVE_SUNLIGHT_KEY) === "true";
+  private sunlightRaf: number | null = null;
+  private sunlightScratch: HTMLCanvasElement | null = null;
+  private readonly onLiveSunlightChanged = (): void => {
+    this.liveSunlight = localStorage.getItem(LIVE_SUNLIGHT_KEY) === "true";
+    this.syncSunlightOverlay();
+  };
+
   /** Last time config received via setTimeBadge; null = hidden. */
   private timeCfg: TimeConfig | null = null;
   /** Interval id for the live-clock ticker in the time badge. */
@@ -288,7 +301,7 @@ export class EmulatorView {
         <div class="emu-frame">
           <div class="emu-buttons" id="emu-buttons"></div>
           <div class="emu-stage" id="emu-stage">
-            <div class="emu-screen" id="emu-screen"></div>
+            <div class="emu-screen" id="emu-screen"><canvas class="emu-sunlight" id="emu-sunlight" hidden></canvas></div>
           </div>
           <div class="emu-switch-overlay" id="emu-switch-overlay">Switching…</div>
         </div>
@@ -480,6 +493,9 @@ export class EmulatorView {
     // J-runtime: diagnostics overlay. Restore the persisted flag; re-read on the
     // change event so the Settings toggle (Wave 2b) reflects live.
     window.addEventListener("pebble-studio:diagnostics-changed", this.onDiagnosticsChanged);
+    // Issue 2: live sunlight overlay. Re-read the setting and restart/stop the
+    // overlay loop whenever the toggle in Settings changes.
+    window.addEventListener(LIVE_SUNLIGHT_EVENT, this.onLiveSunlightChanged);
     // Record boot-progress into the persistent session log for the WHOLE app
     // session — NOT just while diagnostics is visible — so a "loads then crashes"
     // event is captured even if the panel was never opened. The diagnostics flag
@@ -797,6 +813,8 @@ export class EmulatorView {
 
     // J-runtime: the FPS sampler only runs while diagnostics on AND live.
     this.syncFpsSampler();
+    // Issue 2: the live sunlight overlay only runs while the setting is on AND live.
+    this.syncSunlightOverlay();
   }
 
   /** E: remove the launch-failure highlight ring from the Launch button. */
@@ -1001,7 +1019,8 @@ export class EmulatorView {
    * a fixed, small per-frame cost regardless of screen size.
    */
   private sampleCanvasSignature(): number | null {
-    const canvas = this.screenHost.querySelector("canvas");
+    // Exclude #emu-sunlight — it's the overlay we write, not the noVNC source.
+    const canvas = this.findVncCanvas();
     if (!canvas || canvas.width === 0 || canvas.height === 0) return null;
     const N = 8; // sample into an 8×8 thumbnail
     if (!this.fpsSampleCtx) {
@@ -1027,6 +1046,68 @@ export class EmulatorView {
       return null;
     }
   }
+
+  /**
+   * Issue 2: start/stop the live sunlight overlay. Runs ONLY when the setting is
+   * on AND the emulator is live (mirrors syncFpsSampler — zero cost otherwise).
+   * The overlay canvas re-draws the noVNC canvas through applySunlightLut every
+   * frame, so it is pixel-identical to the screenshot/GIF correction. It lives
+   * inside #emu-screen (the scaled .emu-frame), so it inherits the zoom transform.
+   */
+  private syncSunlightOverlay(): void {
+    const run = shouldRunLiveSunlight(this.state, this.liveSunlight);
+    if (run && this.sunlightRaf === null) {
+      this.sunlightRaf = requestAnimationFrame(this.drawSunlightFrame);
+    } else if (!run && this.sunlightRaf !== null) {
+      cancelAnimationFrame(this.sunlightRaf);
+      this.sunlightRaf = null;
+      const overlay = this.screenHost.querySelector<HTMLCanvasElement>("#emu-sunlight");
+      if (overlay) overlay.hidden = true;
+      const vncCanvas = this.findVncCanvas();
+      if (vncCanvas) vncCanvas.style.visibility = "";
+    }
+  }
+
+  /** The noVNC-rendered canvas (the overlay canvas is excluded by id). */
+  private findVncCanvas(): HTMLCanvasElement | null {
+    const all = Array.from(this.screenHost.querySelectorAll("canvas"));
+    return (all.find((c) => c.id !== "emu-sunlight") as HTMLCanvasElement) ?? null;
+  }
+
+  /** One rAF tick: correct the noVNC frame onto the overlay. Re-schedules itself. */
+  private readonly drawSunlightFrame = (): void => {
+    if (!shouldRunLiveSunlight(this.state, this.liveSunlight)) { this.sunlightRaf = null; return; }
+    const src = this.findVncCanvas();
+    let overlay = this.screenHost.querySelector<HTMLCanvasElement>("#emu-sunlight");
+    if (!overlay) {
+      overlay = document.createElement("canvas");
+      overlay.id = "emu-sunlight";
+      overlay.className = "emu-sunlight";
+      this.screenHost.appendChild(overlay);
+    }
+    if (src && src.width > 0 && src.height > 0) {
+      const w = src.width, h = src.height;
+      if (overlay.width !== w) overlay.width = w;
+      if (overlay.height !== h) overlay.height = h;
+      if (!this.sunlightScratch) this.sunlightScratch = document.createElement("canvas");
+      const scratch = this.sunlightScratch;
+      if (scratch.width !== w) scratch.width = w;
+      if (scratch.height !== h) scratch.height = h;
+      const sctx = scratch.getContext("2d", { willReadFrequently: true });
+      const octx = overlay.getContext("2d");
+      if (sctx && octx) {
+        try {
+          sctx.drawImage(src, 0, 0);
+          const img = sctx.getImageData(0, 0, w, h);
+          applySunlightLut(img.data as unknown as Uint8Array);
+          octx.putImageData(img, 0, 0);
+          overlay.hidden = false;
+          src.style.visibility = "hidden"; // show the corrected overlay instead
+        } catch { /* tainted/transient — skip this frame */ }
+      }
+    }
+    this.sunlightRaf = requestAnimationFrame(this.drawSunlightFrame);
+  };
 
   /**
    * Morph to a new platform's chrome WITHOUT booting. Used by manual mode (both

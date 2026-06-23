@@ -552,6 +552,17 @@ body {
   image-rendering: crisp-edges;
 }
 
+/* Issue 2: live sunlight overlay — sits above the noVNC canvas, covers it exactly,
+   never eats pointer events. Pixel-for-pixel match with screenshot/GIF correction. */
+.emu-sunlight {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  image-rendering: pixelated;
+}
+
 /* Button overlay covers the whole frame; only the nubs capture clicks. It sits
    below the frame rim (z 3) but above the casing background so the outer half of
    each nub peeks out beyond the rim. */
