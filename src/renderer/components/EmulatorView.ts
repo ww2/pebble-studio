@@ -212,10 +212,10 @@ export class EmulatorView {
    * promise may still be settling.
    */
   private bootGen = 0;
-  /** One-shot guard for the first-load pop-out: the stage starts collapsed (0×0)
-   * and the frame hidden so the watch isn't shown at a default size before its
-   * geometry is known; the first applyGeometry reveals it and the stage's
-   * width/height transition animates it open. */
+  /** One-shot guard for the first-load pop-out: the frame-wrapper starts scaled
+   * down + transparent so the watch isn't shown at a default size before its
+   * geometry is known; the first applyGeometry reveals it (scale→1, opacity→1).
+   * The pop is a transform (not a layout change), so it never perturbs fit zoom. */
   private framePopped = false;
 
   /** Current keyboard bindings (I-runtime); re-read on the change event. */
@@ -404,13 +404,15 @@ export class EmulatorView {
     this.frameWrapper = this.el.querySelector<HTMLElement>(".emu-frame-wrapper")!;
     this.frame = this.el.querySelector<HTMLElement>(".emu-frame")!;
     this.stage = this.el.querySelector<HTMLElement>("#emu-stage")!;
-    // First-load pop-out: start the stage collapsed and the frame hidden so the
-    // screen + button nubs don't flash at a default size before the first model's
-    // geometry is applied. The first applyGeometry() sets the real stage size and
-    // reveals the frame; the stage's width/height CSS transition animates it open.
-    this.stage.style.width = "0px";
-    this.stage.style.height = "0px";
-    this.frame.style.opacity = "0";
+    // First-load pop-out: start the whole device shrunk + hidden so the screen +
+    // button nubs don't flash at a default size before the first model's geometry
+    // is applied. The pop is a TRANSFORM on the frame-wrapper (not a layout-size
+    // change), so it never perturbs the fit-zoom measurement (which reads the
+    // frame's offsetWidth — unaffected by transforms). The first applyGeometry()
+    // reveals it (scale→1, opacity→1). transform-origin matches the zoom origin.
+    this.frameWrapper.style.transformOrigin = "center top";
+    this.frameWrapper.style.transform = "scale(0.25)";
+    this.frameWrapper.style.opacity = "0";
     this.switchOverlay = this.el.querySelector<HTMLElement>("#emu-switch-overlay")!;
     this.bezelToggle = this.el.querySelector<HTMLElement>("#emu-bezel-toggle")!;
     this.diagEl = this.el.querySelector<HTMLElement>("#emu-diag")!;
@@ -1541,14 +1543,18 @@ export class EmulatorView {
       });
     }
 
-    // First-load pop-out reveal: the constructor collapsed the stage (0×0) and
-    // hid the frame (opacity 0). Now that the real geometry is set, fade the frame
-    // in on the next paint so the stage's 0→size transition reads as a pop-out
-    // instead of the watch appearing at a default size and then morphing. One-shot:
-    // subsequent model switches keep the existing size→size morph.
+    // First-load pop-out reveal: the constructor shrank + hid the frame-wrapper
+    // (transform scale + opacity 0). Now that the real geometry is set, scale it up
+    // and fade it in on the next paint so the watch pops out instead of appearing
+    // at a default size and then morphing. The transform never touched layout, so
+    // the fit-zoom math above measured the true frame size. One-shot: subsequent
+    // model switches keep the existing size→size morph.
     if (!this.framePopped) {
       this.framePopped = true;
-      requestAnimationFrame(() => { this.frame.style.opacity = "1"; });
+      requestAnimationFrame(() => {
+        this.frameWrapper.style.transform = "scale(1)";
+        this.frameWrapper.style.opacity = "1";
+      });
     }
   }
 

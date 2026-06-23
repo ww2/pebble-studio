@@ -456,11 +456,8 @@ body {
   background: linear-gradient(155deg, color-mix(in srgb, var(--case-color) 100%, white 6%), var(--case-color));
   border: 1px solid var(--border);
   box-shadow: var(--device-shadow), inset 0 1px 0 var(--case-hi);
-  /* Morph: animate the casing shape (square ↔ circle) when switching models.
-     opacity animates the one-shot first-load pop-out reveal (see EmulatorView
-     applyGeometry: the frame starts hidden + stage collapsed, then fades in as
-     the stage grows from 0 to its real size). */
-  transition: border-radius 420ms var(--ease), padding 420ms var(--ease), opacity 320ms var(--ease);
+  /* Morph: animate the casing shape (square ↔ circle) when switching models. */
+  transition: border-radius 420ms var(--ease), padding 420ms var(--ease);
 }
 .emu-frame--round { --frame-pad: 18px; border-radius: 50%; }
 
@@ -698,7 +695,10 @@ body {
   align-items: flex-start;
   /* Reserve space = natural height × zoom so content below stays clear. */
   height: calc(var(--stage-height) * var(--zoom-scale));
-  transition: height 180ms var(--ease);
+  /* transform + opacity animate the one-shot first-load pop-out (see EmulatorView
+     applyGeometry). transform is on the WRAPPER, not the frame, so it composes
+     with the frame's zoom transform and never affects the fit-zoom measurement. */
+  transition: height 180ms var(--ease), transform 320ms var(--ease), opacity 320ms var(--ease);
 }
 
 /* F (v0.0.6): the "● Live" status reads as a clearly green pill — the dot + text
