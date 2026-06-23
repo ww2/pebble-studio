@@ -104,7 +104,7 @@ export function nextIndexedName(existingNames: string[], base: string, ext: stri
   return max;
 }
 
-export function registerIpc(getMainWindow: () => BrowserWindow | null = () => null): void {
+export function registerIpc(getMainWindow: () => BrowserWindow | null = () => null): { shutdown: () => Promise<void> } {
   const library = new LibraryStore(path.join(app.getPath("userData"), "library.json"));
   // Default capture target is the user's Downloads; settings:setCaptureDir can
   // repoint it. Resolved here (not at module load) so app paths are ready.
@@ -148,6 +148,22 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // skipped when showing plain host/system time so we don't spawn needlessly.
   const reassertTime = (): void => {
     if (isNonSystemTime(time.getConfig(), detectHostTimezone())) void time.reassert();
+  };
+
+  /**
+   * Tear down everything the emulator owns: quiesce the keepalive/time/bridge
+   * timers, cancel any in-flight boot, then stop the driver (which reaps
+   * qemu/pypkjs/websockify/emu-control via killAll and kills the input helper).
+   * Shared by `emu:stop` and the app-quit handler (index.ts before-quit). Safe to
+   * call when nothing is running: the timers no-op and `driver?.stop()` skips.
+   * Never throws — a teardown error must not block app exit.
+   */
+  const teardownEmulator = async (): Promise<void> => {
+    backlight.stop();
+    time.stop();
+    bridgeMonitor.stop();
+    if (currentBootToken) currentBootToken.cancelled = true;
+    try { await driver?.stop(); } catch { /* may already be stopped */ }
   };
 
   /** Seconds ahead of the watch clock to place the demo pin (inside the peek window). */
@@ -246,6 +262,12 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     driver = d;
     driverKind = kind;
     console.log(`[backend] initialized kind=${kind}`);
+    // Startup reap: a prior session killed via Task Manager "End process"
+    // (TerminateProcess) can't run before-quit, so its qemu/python stack may still
+    // be alive and holding ports 5901/6080 + a stale state file. driver.stop()
+    // runs killAll (taskkill by PID from the state file + qemu/branded image
+    // backstops, then removes the state file). No-op when nothing is orphaned.
+    try { await driver.stop(); } catch { /* nothing to reap */ }
     // First-run SDK provisioning for the native-Windows stack: the bundled SDK is
     // read-only, so we materialise a writable copy under the app-data persist dir
     // (the XDG_DATA_HOME the invocation contract points at) BEFORE any boot. Runs
@@ -305,26 +327,10 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     if (currentBootToken) currentBootToken.cancelled = true;
   });
   ipcMain.handle("emu:stop", async () => {
-    // Stop the backlight keepalive, time controller, and bridge-health monitor
-    // first so we don't operate on a dead emulator.
-    backlight.stop();
-    time.stop();
-    bridgeMonitor.stop();
-    // Cancel the in-flight boot BEFORE teardown so a mid-boot wait aborts and the
-    // killAll sweep reliably reaps qemu/websockify/emu-control/pypkjs.
-    if (currentBootToken) currentBootToken.cancelled = true;
-    await driver!.stop();
-    // Deliberately NOT resetting the time-shim control file here: the next
-    // emu:start's applyAll() rewrites it, and the controller starts every app run
-    // at the System default anyway.
-    // NOTE: do NOT clear `loaded` here. A stop/kill (killAll) only reaps the
-    // qemu/websockify/pypkjs/emu-control processes + the state file — it does NOT
-    // delete installed apps, which persist on disk and are removed ONLY by
-    // `pebble wipe` (driver.wipe(), called from loaded:clear). Clearing the set on
-    // stop desynced it from disk: after a relaunch/force-close/model-switch the
-    // apps were still installed but `loaded` was empty, so loaded:list returned []
-    // and the renderer's "Clear emulator" button stayed disabled. The set now
-    // mirrors on-disk install state and is cleared only on a real wipe.
+    // Shared teardown (also used by the app-quit handler). Deliberately does NOT
+    // clear `loaded`: a stop/kill reaps processes + the state file but leaves
+    // installed apps on disk (removed only by `pebble wipe`).
+    await teardownEmulator();
   });
 
   // Backlight keepalive toggles (Task K). "Always on" is independent of captures;
@@ -552,4 +558,6 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     console.log(`[capture] saved ${out}`);
     return out;
   });
+
+  return { shutdown: teardownEmulator };
 }

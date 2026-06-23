@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, Menu, dialog } from "electron";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { registerIpc } from "./ipc.js";
+import { createQuitHandler } from "./quitHandler.js";
 import { buildMenuTemplate } from "./menu.js";
 
 // This file is bundled to CommonJS (dist/main/index.cjs) by esbuild, where
@@ -225,7 +226,12 @@ function setupApplicationMenu(): void {
 // second instance has already called app.quit() above.
 if (gotSingleInstanceLock) {
   app.whenReady().then(() => {
-    registerIpc(() => mainWindow);
+    const { shutdown } = registerIpc(() => mainWindow);
+    // before-quit fires for the X button, app.quit(), and Task Manager "End
+    // task" (all WM_CLOSE). Bounded so "End task"'s short grace window doesn't
+    // escalate to a hard kill mid-cleanup. "End process" (TerminateProcess)
+    // can't be intercepted — the backend:init startup reap covers its aftermath.
+    app.on("before-quit", createQuitHandler(shutdown, () => app.exit(0)));
     createWindow();
     setupApplicationMenu();
 
