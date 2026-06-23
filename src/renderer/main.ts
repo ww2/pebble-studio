@@ -40,6 +40,7 @@ interface StudioApi {
   // v3.0.2 (Issue 3): emulator app-log stream.
   onAppLog(cb: (line: string) => void): () => void;
   getAppLogHistory(): Promise<string[]>;
+  setLogCapture(on: boolean): Promise<void>;
   nextCaptureName(base: string, ext: string): Promise<string>;
   backlightAlways(on: boolean): Promise<void>;
   backlightCaptureHold(on: boolean): Promise<void>;

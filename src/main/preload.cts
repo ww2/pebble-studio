@@ -91,6 +91,9 @@ const studio = {
     return () => ipcRenderer.removeListener("emu:app-log", handler);
   },
   getAppLogHistory: (): Promise<string[]> => ipcRenderer.invoke("emu:appLogHistory"),
+  // Enable/disable the emulator app-log stream (driven by the Settings toggle). Off
+  // by default so the stream never contends for the pypkjs bridge unless requested.
+  setLogCapture: (on: boolean): Promise<void> => ipcRenderer.invoke("emu:logCapture", on),
 };
 
 contextBridge.exposeInMainWorld("studio", studio);

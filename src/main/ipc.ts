@@ -158,13 +158,38 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     onLine: (line) => getMainWindow()?.webContents.send("emu:app-log", line),
   });
   let logHandle: { kill(): void } | null = null;
-  const startAppLog = (id: PlatformId): void => {
+  // The log stream runs ONLY while the renderer's "Show emulator logs" toggle is on
+  // (set via emu:logCapture). Default off ⇒ no persistent `pebble logs` client, so
+  // the default experience has zero extra load on the limited pypkjs bridge (the
+  // pre-v3.0.2 behavior). `emuLive` gates a mid-session toggle-on so we never spawn
+  // `pebble logs` against a dead emulator (which would LAUNCH a rogue one).
+  let logCaptureEnabled = false;
+  let emuLive = false;
+  const startAppLog = (id: PlatformId, opts: { clear?: boolean } = {}): void => {
+    if (!logCaptureEnabled) return;
     stopAppLog();
-    appLog.clear();
+    if (opts.clear !== false) appLog.clear();
     logHandle = driver?.streamLogs?.(id, (line) => appLog.push(line)) ?? null;
   };
   const stopAppLog = (): void => {
     if (logHandle) { try { logHandle.kill(); } catch { /* already gone */ } logHandle = null; }
+  };
+  /**
+   * Run a pypkjs-bridge operation (install, health) with the log stream PAUSED.
+   * The bundled pypkjs accepts only a couple of concurrent clients; the always-on
+   * input helper plus a persistent `pebble logs` stream already fill them, so an
+   * install becomes a third client and pypkjs rejects it ("unable to add pbw when
+   * emulator already running"). We drop the log stream for the duration, then
+   * resume it WITHOUT clearing the buffer so captured lines survive the op.
+   */
+  const withAppLogPaused = async <T>(fn: () => Promise<T>): Promise<T> => {
+    const wasRunning = logHandle != null;
+    if (wasRunning) stopAppLog();
+    try {
+      return await fn();
+    } finally {
+      if (wasRunning && currentPlatform) startAppLog(currentPlatform, { clear: false });
+    }
   };
 
   /**
@@ -176,6 +201,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
    * Never throws — a teardown error must not block app exit.
    */
   const teardownEmulator = async (): Promise<void> => {
+    emuLive = false;
     stopAppLog();
     backlight.stop();
     time.stop();
@@ -235,10 +261,12 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     return library.list();
   });
   ipcMain.handle("lib:installAll", async () => {
-    for (const p of library.list()) {
-      await driver!.install(p);
-      loaded.add(p);
-    }
+    await withAppLogPaused(async () => {
+      for (const p of library.list()) {
+        await driver!.install(p);
+        loaded.add(p);
+      }
+    });
     // Each `pebble install` re-syncs host time on connect (post_connect),
     // clobbering any custom/timezone offset. installAll runs AFTER emu:start's
     // applyAll() (the renderer reinstalls once VNC is up), so without this the
@@ -263,6 +291,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     await battery.reassert(); // re-assert the chosen battery level on the clear-rebooted emulator (before the time push: emu-battery's connect re-syncs host time)
     void time.applyAll(); // re-assert time settings on the clear-rebooted emulator (fire-and-forget)
     bridgeMonitor.start(platformId);
+    emuLive = true;
     startAppLog(platformId);
     // loaded remains empty after the clear reboot.
   });
@@ -341,7 +370,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     // and a boot that resolves in that same window would otherwise re-start a monitor
     // polling an already-killed emulator (symmetric to the renderer's bootGen guard).
     if (!token.cancelled) bridgeMonitor.start(id);
-    if (!token.cancelled) startAppLog(id);
+    if (!token.cancelled) { emuLive = true; startAppLog(id); }
     return ep;
   });
   ipcMain.handle("emu:abort", async () => {
@@ -350,6 +379,18 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     if (currentBootToken) currentBootToken.cancelled = true;
   });
   ipcMain.handle("emu:appLogHistory", async () => appLog.history());
+  // Renderer drives this from the "Show emulator logs" toggle (and once on startup
+  // with the persisted value). On → start streaming if an emulator is live (else it
+  // starts at the next boot); off → stop the stream so it stops contending for the
+  // pypkjs bridge.
+  ipcMain.handle("emu:logCapture", async (_e, on: boolean) => {
+    logCaptureEnabled = on;
+    if (on) {
+      if (emuLive && currentPlatform) startAppLog(currentPlatform);
+    } else {
+      stopAppLog();
+    }
+  });
   ipcMain.handle("emu:stop", async () => {
     // Shared teardown (also used by the app-quit handler). Deliberately does NOT
     // clear `loaded`: a stop/kill reaps processes + the state file but leaves
@@ -418,10 +459,12 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
           await driver!.start(currentPlatform!, token);
           void time.applyAll();
           if (!token.cancelled) bridgeMonitor.start(currentPlatform!);
-          if (!token.cancelled) startAppLog(currentPlatform!);
+          if (!token.cancelled) { emuLive = true; startAppLog(currentPlatform!); }
         },
         reinstall: async () => {
-          for (const p of library.list()) { await driver!.install(p); loaded.add(p); }
+          await withAppLogPaused(async () => {
+            for (const p of library.list()) { await driver!.install(p); loaded.add(p); }
+          });
           // Re-assert the chosen battery level so a weather change doesn't revert it
           // to the firmware default. Before reassertTime() because emu-battery's
           // pebble connect re-syncs host time, so the time push must run last.
@@ -437,7 +480,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     }
   });
   ipcMain.handle("emu:install", async (_e, pbwPath: string) => {
-    await driver!.install(pbwPath);
+    await withAppLogPaused(() => driver!.install(pbwPath));
     loaded.add(pbwPath);
     reassertTime();
   });
@@ -457,7 +500,9 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   });
   ipcMain.handle("emu:activateHealth", async () => {
     if (!driver) return { ok: false, status: null, detail: "no emulator" };
-    const r = await driver.activateHealth();
+    // Pause the log stream: health activation is another pypkjs-bridge client, and
+    // the persistent log stream can crowd out the limited connection slots.
+    const r = await withAppLogPaused(() => driver!.activateHealth());
     console.log(`[health] activate: ok=${r.ok} status=${r.status} ${r.detail}`);
     return r;
   });

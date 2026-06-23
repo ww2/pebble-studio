@@ -301,6 +301,9 @@ export class EmulatorView {
   private appLogDispose: (() => void) | null = null;
   private readonly onEmuLogsChanged = (): void => {
     this.emuLogsEnabled = localStorage.getItem(EMU_LOGS_KEY) === "true";
+    // Tell main to start/stop the actual `pebble logs` stream. The stream only runs
+    // while this is on, so the default (off) keeps the pypkjs bridge uncontended.
+    void window.studio.setLogCapture(this.emuLogsEnabled);
     this.syncEmuLogsPanel();
   };
 
@@ -319,7 +322,7 @@ export class EmulatorView {
         <div class="emu-frame">
           <div class="emu-buttons" id="emu-buttons"></div>
           <div class="emu-stage" id="emu-stage">
-            <div class="emu-screen" id="emu-screen"><canvas class="emu-sunlight" id="emu-sunlight" hidden></canvas></div>
+            <div class="emu-screen" id="emu-screen"></div>
           </div>
           <div class="emu-switch-overlay" id="emu-switch-overlay">Switching…</div>
         </div>
@@ -441,6 +444,9 @@ export class EmulatorView {
       if (overflow > 0) this.emuLogLines.splice(0, overflow);
       if (this.emuLogsEnabled && this.emuLogsExpanded) this.renderEmuLog();
     });
+    // Push the persisted toggle state to main so the stream's on/off matches the UI
+    // from the first boot (main defaults to off until told otherwise).
+    void window.studio.setLogCapture(this.emuLogsEnabled);
     this.syncEmuLogsPanel();
 
     // Create the four physical button nubs ONCE. They persist across model
@@ -1165,11 +1171,20 @@ export class EmulatorView {
     } else if (!run && this.sunlightRaf !== null) {
       cancelAnimationFrame(this.sunlightRaf);
       this.sunlightRaf = null;
-      const overlay = this.screenHost.querySelector<HTMLCanvasElement>("#emu-sunlight");
-      if (overlay) overlay.hidden = true;
-      const vncCanvas = this.findVncCanvas();
-      if (vncCanvas) vncCanvas.style.visibility = "";
+      this.teardownSunlightOverlay();
     }
+  }
+
+  /** Remove the overlay canvas and un-hide the noVNC canvas. The overlay is
+   * REMOVED (not just `hidden`): `.emu-screen canvas { display: block }` outranks
+   * the `[hidden]` attribute, so hiding it left the last corrected frame frozen on
+   * top of the live (still-updating) noVNC canvas. drawSunlightFrame re-creates the
+   * overlay on demand when correction is re-enabled. */
+  private teardownSunlightOverlay(): void {
+    const overlay = this.screenHost.querySelector<HTMLCanvasElement>("#emu-sunlight");
+    if (overlay) overlay.remove();
+    const vncCanvas = this.findVncCanvas();
+    if (vncCanvas) vncCanvas.style.visibility = "";
   }
 
   /** The noVNC-rendered canvas (the overlay canvas is excluded by id). */
@@ -1205,7 +1220,6 @@ export class EmulatorView {
           const img = sctx.getImageData(0, 0, w, h);
           applySunlightLut(img.data as unknown as Uint8Array);
           octx.putImageData(img, 0, 0);
-          overlay.hidden = false;
           src.style.visibility = "hidden"; // show the corrected overlay instead
         } catch { /* tainted/transient — skip this frame */ }
       }
