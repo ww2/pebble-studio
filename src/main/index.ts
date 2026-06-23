@@ -35,34 +35,7 @@ app.on("second-instance", () => {
   }
 });
 
-// Show a frameless splash window immediately so the first visible window isn't
-// a blank frame while the (heavier) renderer bundle loads. Closed once the main
-// window fires `did-finish-load`. The version is injected via a query param so
-// the static splash.html needs no build-time substitution.
-function createSplashWindow(): BrowserWindow {
-  const splash = new BrowserWindow({
-    width: 420,
-    height: 260,
-    frame: false,
-    show: true,
-    resizable: false,
-    maximizable: false,
-    center: true,
-    backgroundColor: "#202020",
-    // Frameless + matching dark base => no white flash before paint.
-    transparent: false,
-  });
-  splash.setMenu(null);
-  // dist/main/index.cjs -> dist/main/splash.html (copied by build:main).
-  void splash.loadFile(join(__dirname, "splash.html"), {
-    query: { v: app.getVersion() },
-  });
-  return splash;
-}
-
 function createWindow(): void {
-  const splash = createSplashWindow();
-
   const win = new BrowserWindow({
     title: "Pebble Studio",
     width: 1100,
@@ -70,8 +43,8 @@ function createWindow(): void {
     // dist/main/index.cjs -> <repo>/build/icon.png (dev/taskbar parity; the
     // packaged .exe icon comes from electron-builder win.icon).
     icon: join(__dirname, "..", "..", "build", "icon.png"),
-    // Hidden until the renderer has finished loading; we then swap from the
-    // splash to this fully-painted window in one step.
+    // Hidden until the renderer has finished loading; then shown fully painted
+    // (backgroundColor avoids a white flash in the gap). No splash window.
     show: false,
     backgroundColor: "#202020",
     webPreferences: {
@@ -113,10 +86,8 @@ function createWindow(): void {
     }
   });
 
-  // Swap splash -> main once the renderer is ready. Guard against the splash
-  // already being destroyed (e.g. closed by the user) before calling into it.
+  // Show the main window once the renderer has finished loading (fully painted).
   win.webContents.once("did-finish-load", () => {
-    if (!splash.isDestroyed()) splash.close();
     if (!win.isDestroyed()) win.show();
   });
 
