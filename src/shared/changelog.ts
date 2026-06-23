@@ -14,6 +14,12 @@ export const CHANGELOG: ChangelogEntry[] = [
   // The 2.x line is the native-Windows track (no WSL); the 1.x line is the
   // WSL-connected track. 2.0.1 is the first native release. 3.0.0 is the first
   // public open-source release.
+  { version: "3.0.2", date: "2026-06-22", changes: [
+    "Closing Pebble Studio now shuts the emulator down with it — QEMU and the watch's Python helpers no longer keep running (and hogging CPU) in the background, and a fresh launch always starts cleanly.",
+    "The emulator's background processes now show up as \"PebbleStudioEmu\" in Task Manager instead of a generic \"python\".",
+    "New option (Settings → Captures → \"Sunlight correction on live view\") applies Pebble's sunlight colour correction to the live emulator screen, matching what you already get in screenshots and GIFs. Off by default.",
+    "New option (Settings → Advanced → \"Show emulator logs\") streams the watch app logs (pebble install --logs) in a collapsible panel under the emulator, with a Copy button. Off by default.",
+  ]},
   { version: "3.0.1", date: "2026-06-17", changes: [
     "Battery simulation: set a custom battery percentage and charging state on the running watch from Settings → Battery. Works on every board. The \"Set battery\" button glows when you have changes you haven't applied yet. Your chosen level now sticks across a reboot — changing the weather, clearing the emulator, or switching watches no longer reverts it to the board default.",
     "Simulated location & weather: watchfaces that use geolocation now work in the emulator with no phone connected. Settings → \"Simulated location & weather\" offers location presets or custom lat/lon, condition, temperature (°F/°C), and day/night. Changing the weather and clicking Apply updates weather watchfaces immediately — it clears their refresh throttle and reloads the watch — while preserving their saved settings.",
