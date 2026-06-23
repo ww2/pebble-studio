@@ -242,10 +242,14 @@ export class WindowsNativeDriver implements BackendDriver {
 
   streamLogs(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null {
     const spawnFn = this.deps.logSpawn ?? spawnLineStream;
+    // --vnc is REQUIRED: a `--emulator` command without it makes pebble-tool
+    // SIGKILL the running VNC qemu and respawn a non-VNC one (see withVnc in
+    // NativeDriver), which tore down the live emulator the instant log capture
+    // started — the v3.0.2-test1 boot-crash loop ("reason: pid" every ~4s).
     if (this.deps.pebble) {
-      const c = this.deps.pebble(["logs", "--emulator", id]);
+      const c = this.deps.pebble(["logs", "--emulator", id, "--vnc"]);
       return spawnFn(c.cmd, c.args, c.env, onLine);
     }
-    return spawnFn("pebble", ["logs", "--emulator", id], undefined, onLine);
+    return spawnFn("pebble", ["logs", "--emulator", id, "--vnc"], undefined, onLine);
   }
 }

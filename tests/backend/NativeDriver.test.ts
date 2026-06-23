@@ -14,6 +14,15 @@ describe("NativeDriver", () => {
     expect(calls[0].args).toContain("/apps/face.pbw");
   });
 
+  it("streamLogs attaches --vnc so it reuses the running VNC emulator (without --vnc the tool SIGKILLs the VNC qemu)", () => {
+    const calls: { cmd: string; args: string[] }[] = [];
+    const logSpawn = vi.fn((cmd: string, args: string[]) => { calls.push({ cmd, args }); return { kill: () => {} }; });
+    const d = new NativeDriver({ run: vi.fn(async () => ({ code: 0, stdout: "", stderr: "" })), logSpawn });
+    d.streamLogs("basalt", () => {});
+    expect(calls[0].cmd).toBe("pebble");
+    expect(calls[0].args).toEqual(["logs", "--emulator", "basalt", "--vnc"]);
+  });
+
   it("rejects when the runner returns a non-zero code", async () => {
     const run = vi.fn(async () => ({ code: 1, stdout: "", stderr: "boom" }));
     const d = new NativeDriver({ run });

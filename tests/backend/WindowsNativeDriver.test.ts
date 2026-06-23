@@ -27,6 +27,18 @@ describe("WindowsNativeDriver", () => {
     expect(calls[0].args).not.toContain("-lc");          // NOT wrapped in bash -lc
   });
 
+  it("streamLogs builds the bundled `pebble logs` command WITH --vnc (without it the tool SIGKILLs the live VNC qemu → boot-crash loop)", () => {
+    const spawned: { cmd: string; args: string[] }[] = [];
+    const logSpawn = vi.fn((cmd: string, args: string[]) => { spawned.push({ cmd, args }); return { kill: () => {} }; });
+    const pebble = (args: string[]) => ({ cmd: "C:\\py\\PebbleStudioEmu.exe", args: ["-c", "from pebble_tool import run_tool; run_tool()", ...args], env: {} });
+    const d = new WindowsNativeDriver({ run: vi.fn(async () => ({ code: 0, stdout: "", stderr: "" })), pebble, logSpawn, boot: async () => ep, stop: async () => {} });
+    d.streamLogs("emery", () => {});
+    expect(spawned[0].args).toContain("logs");
+    expect(spawned[0].args).toContain("--emulator");
+    expect(spawned[0].args).toContain("emery");
+    expect(spawned[0].args).toContain("--vnc");
+  });
+
   it("routes discrete pebble commands through the injected bundled invocation (python + run_tool + env)", async () => {
     const calls: { cmd: string; args: string[]; env?: Record<string, string> }[] = [];
     const run = vi.fn(async (cmd: string, args: string[], env?: Record<string, string>) => { calls.push({ cmd, args, env }); return { code: 0, stdout: "", stderr: "" }; });

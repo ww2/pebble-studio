@@ -129,7 +129,10 @@ export class NativeDriver implements BackendDriver {
 
   streamLogs(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null {
     const spawnFn = this.deps.logSpawn ?? spawnLineStream;
-    return spawnFn("pebble", ["logs", "--emulator", id], undefined, onLine);
+    // --vnc is REQUIRED: a `--emulator` command without it makes pebble-tool
+    // SIGKILL the running VNC qemu and respawn a non-VNC one (see withVnc below),
+    // which would tear down the live emulator the instant log capture starts.
+    return spawnFn("pebble", ["logs", "--emulator", id, "--vnc"], undefined, onLine);
   }
 
   private async exec(c: PebbleCommand): Promise<RunResult> {

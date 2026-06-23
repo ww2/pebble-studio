@@ -141,6 +141,8 @@ export class WslDriver implements BackendDriver {
 
   streamLogs(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null {
     // Quote-free one-liner (crosses the wsl.exe -> bash boundary, like setTzOffset).
-    return spawnLineStream("wsl.exe", ["--", "bash", "-lc", `pebble logs --emulator ${id}`], undefined, onLine);
+    // --vnc is REQUIRED: without it a `--emulator` command makes pebble-tool
+    // SIGKILL the running VNC qemu and respawn a non-VNC one, killing the live emulator.
+    return spawnLineStream("wsl.exe", ["--", "bash", "-lc", `pebble logs --emulator ${id} --vnc`], undefined, onLine);
   }
 }
