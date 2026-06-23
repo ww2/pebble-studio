@@ -4,6 +4,7 @@ import type { PebbleCommand } from "./pebbleCli.js";
 import * as cli from "./pebbleCli.js";
 import { bootEmulator, stopEmulator, type BootToken, type OnStep } from "./bootEmulator.js";
 import { setFakeTimeCmd, ensureTimeShim } from "./timeShim.js";
+import { spawnLineStream } from "./lineStream.js";
 
 /** Default stop uses the native (current-host) teardown. */
 const defaultStop: StopFn = () => stopEmulator();
@@ -17,6 +18,9 @@ export interface NativeDriverDeps {
   boot?: BootFn;
   /** Real stop orchestration; injectable so the WSL host can tear down in-WSL. */
   stop?: StopFn;
+  /** Streaming spawn for `streamLogs` (injectable for tests). Defaults to the
+   * real node spawn. */
+  logSpawn?: typeof spawnLineStream;
 }
 
 export class NativeDriver implements BackendDriver {
@@ -121,6 +125,11 @@ export class NativeDriver implements BackendDriver {
 
   async timelineQuickView(on: boolean): Promise<void> {
     await this.exec(cli.timelineQuickViewCmd(on));
+  }
+
+  streamLogs(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null {
+    const spawnFn = this.deps.logSpawn ?? spawnLineStream;
+    return spawnFn("pebble", ["logs", "--emulator", id], undefined, onLine);
   }
 
   private async exec(c: PebbleCommand): Promise<RunResult> {

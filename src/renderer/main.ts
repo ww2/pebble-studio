@@ -37,6 +37,9 @@ interface StudioApi {
   onBootProgress(cb: (msg: string) => void): () => void;
   // v0.0.13 (Task H4): bridge-dead notifications from the health monitor.
   onBridgeDead(cb: (reason: string) => void): () => void;
+  // v3.0.2 (Issue 3): emulator app-log stream.
+  onAppLog(cb: (line: string) => void): () => void;
+  getAppLogHistory(): Promise<string[]>;
   nextCaptureName(base: string, ext: string): Promise<string>;
   backlightAlways(on: boolean): Promise<void>;
   backlightCaptureHold(on: boolean): Promise<void>;

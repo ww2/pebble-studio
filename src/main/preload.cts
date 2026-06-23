@@ -83,6 +83,14 @@ const studio = {
     ipcRenderer.on("emu:bridge-dead", handler);
     return () => ipcRenderer.removeListener("emu:bridge-dead", handler);
   },
+  // Issue 3: emulator app-log stream. onAppLog subscribes to live lines (returns a
+  // disposer); getAppLogHistory back-fills the panel when first opened.
+  onAppLog: (cb: (line: string) => void): (() => void) => {
+    const handler = (_e: unknown, line: string): void => cb(line);
+    ipcRenderer.on("emu:app-log", handler);
+    return () => ipcRenderer.removeListener("emu:app-log", handler);
+  },
+  getAppLogHistory: (): Promise<string[]> => ipcRenderer.invoke("emu:appLogHistory"),
 };
 
 contextBridge.exposeInMainWorld("studio", studio);

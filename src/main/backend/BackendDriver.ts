@@ -56,4 +56,8 @@ export interface BackendDriver {
   insertSamplePin?(pinTimeUnix: number, title: string): Promise<void>;
   /** Remove the sample pin inserted by insertSamplePin. Optional (see above). */
   deleteSamplePin?(): Promise<void>;
+  /** Stream the emulator app log (`pebble logs`) as whole lines until killed.
+   * Optional: windows-native + native + WSL implement it; returns null when the
+   * driver/stack can't stream (caller shows an empty panel). */
+  streamLogs?(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null;
 }

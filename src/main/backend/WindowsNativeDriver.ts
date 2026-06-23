@@ -10,6 +10,7 @@ import { winSetTzOffsetArgv } from "./pebbleCli.js";
 import * as cli from "./pebbleCli.js";
 import type { WinInputChannel } from "./winInputChannel.js";
 import { writeWinFakeTime } from "./winTimeShim.js";
+import { spawnLineStream } from "./lineStream.js";
 
 /** Fixed id for the demo pin the Timeline button inserts so the peek is visible. */
 const SAMPLE_PIN_ID = "studio-sample-pin";
@@ -49,6 +50,8 @@ export interface WindowsNativeDriverDeps {
   /** Injectable delay (tests pass a no-op so health-activation retries don't wait).
    * Defaults to a real setTimeout-backed sleep. */
   sleep?: (ms: number) => Promise<void>;
+  /** Streaming spawn for `streamLogs` (injectable for tests). */
+  logSpawn?: typeof spawnLineStream;
 }
 
 /**
@@ -235,5 +238,14 @@ export class WindowsNativeDriver implements BackendDriver {
   async deleteSamplePin(): Promise<void> {
     // Best-effort: nothing to remove if the channel is gone (emulator stopped).
     await this.deps.inputChannel?.deletePin(SAMPLE_PIN_ID);
+  }
+
+  streamLogs(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null {
+    const spawnFn = this.deps.logSpawn ?? spawnLineStream;
+    if (this.deps.pebble) {
+      const c = this.deps.pebble(["logs", "--emulator", id]);
+      return spawnFn(c.cmd, c.args, c.env, onLine);
+    }
+    return spawnFn("pebble", ["logs", "--emulator", id], undefined, onLine);
   }
 }

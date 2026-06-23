@@ -1,6 +1,7 @@
 import { ipcMain, app, dialog, BrowserWindow } from "electron";
 import path from "node:path";
 import fs from "node:fs/promises";
+import { AppLogStream } from "./backend/appLogStream.js";
 import { createDriver } from "./backend/createDriver.js";
 import type { BackendDriver } from "./backend/BackendDriver.js";
 import { makeNativeShell, makeWslShell, type BootToken } from "./backend/bootEmulator.js";
@@ -150,6 +151,22 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     if (isNonSystemTime(time.getConfig(), detectHostTimezone())) void time.reassert();
   };
 
+  // Emulator app-log stream (Issue 3). Capture runs while the emulator is live
+  // (the renderer toggle only controls visibility); the buffer back-fills the
+  // panel when first opened. Each line is also forwarded live to the renderer.
+  const appLog = new AppLogStream({
+    onLine: (line) => getMainWindow()?.webContents.send("emu:app-log", line),
+  });
+  let logHandle: { kill(): void } | null = null;
+  const startAppLog = (id: PlatformId): void => {
+    stopAppLog();
+    appLog.clear();
+    logHandle = driver?.streamLogs?.(id, (line) => appLog.push(line)) ?? null;
+  };
+  const stopAppLog = (): void => {
+    if (logHandle) { try { logHandle.kill(); } catch { /* already gone */ } logHandle = null; }
+  };
+
   /**
    * Tear down everything the emulator owns: quiesce the keepalive/time/bridge
    * timers, cancel any in-flight boot, then stop the driver (which reaps
@@ -159,6 +176,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
    * Never throws — a teardown error must not block app exit.
    */
   const teardownEmulator = async (): Promise<void> => {
+    stopAppLog();
     backlight.stop();
     time.stop();
     bridgeMonitor.stop();
@@ -245,6 +263,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     await battery.reassert(); // re-assert the chosen battery level on the clear-rebooted emulator (before the time push: emu-battery's connect re-syncs host time)
     void time.applyAll(); // re-assert time settings on the clear-rebooted emulator (fire-and-forget)
     bridgeMonitor.start(platformId);
+    startAppLog(platformId);
     // loaded remains empty after the clear reboot.
   });
 
@@ -319,6 +338,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     // and a boot that resolves in that same window would otherwise re-start a monitor
     // polling an already-killed emulator (symmetric to the renderer's bootGen guard).
     if (!token.cancelled) bridgeMonitor.start(id);
+    if (!token.cancelled) startAppLog(id);
     return ep;
   });
   ipcMain.handle("emu:abort", async () => {
@@ -326,6 +346,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     // if nothing is booting.
     if (currentBootToken) currentBootToken.cancelled = true;
   });
+  ipcMain.handle("emu:appLogHistory", async () => appLog.history());
   ipcMain.handle("emu:stop", async () => {
     // Shared teardown (also used by the app-quit handler). Deliberately does NOT
     // clear `loaded`: a stop/kill reaps processes + the state file but leaves
@@ -394,6 +415,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
           await driver!.start(currentPlatform!, token);
           void time.applyAll();
           if (!token.cancelled) bridgeMonitor.start(currentPlatform!);
+          if (!token.cancelled) startAppLog(currentPlatform!);
         },
         reinstall: async () => {
           for (const p of library.list()) { await driver!.install(p); loaded.add(p); }

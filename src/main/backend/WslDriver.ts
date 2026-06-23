@@ -3,6 +3,7 @@ import type { BackendDriver, HealthActivateResult, Runner, RunResult, VncEndpoin
 import { NativeDriver, type BootFn, type StopFn } from "./NativeDriver.js";
 import type { BootToken, OnStep } from "./bootEmulator.js";
 import { toWslPath } from "./wslPath.js";
+import { spawnLineStream } from "./lineStream.js";
 
 export interface WslDriverDeps {
   run: Runner;
@@ -136,5 +137,10 @@ export class WslDriver implements BackendDriver {
 
   async timelineQuickView(on: boolean): Promise<void> {
     return this.inner.timelineQuickView(on);
+  }
+
+  streamLogs(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null {
+    // Quote-free one-liner (crosses the wsl.exe -> bash boundary, like setTzOffset).
+    return spawnLineStream("wsl.exe", ["--", "bash", "-lc", `pebble logs --emulator ${id}`], undefined, onLine);
   }
 }
