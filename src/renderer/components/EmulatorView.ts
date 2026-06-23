@@ -27,6 +27,9 @@ function errText(err: unknown): string {
 const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
 /** When "true", auto-reboot the emulator on a bridge crash (SettingsPane writes this). */
 const AUTO_RELAUNCH_KEY = "pebble-studio:auto-relaunch";
+const EMU_LOGS_KEY = "pebble-studio:emu-logs";
+const EMU_LOGS_EVENT = "pebble-studio:emu-logs-changed";
+const EMU_LOGS_CAP = 2000; // mirror the main-side AppLogStream cap
 /**
  * How the main-page "Backlight" button wakes the screen (SettingsPane writes
  * this). "back" = a Back-button press (reliable wake, can navigate inside an
@@ -286,6 +289,16 @@ export class EmulatorView {
     this.syncSunlightOverlay();
   };
 
+  /** Issue 3: emulator app-log panel state. */
+  private emuLogsEnabled = localStorage.getItem(EMU_LOGS_KEY) === "true";
+  private emuLogsExpanded = false;
+  private readonly emuLogLines: string[] = [];
+  private appLogDispose: (() => void) | null = null;
+  private readonly onEmuLogsChanged = (): void => {
+    this.emuLogsEnabled = localStorage.getItem(EMU_LOGS_KEY) === "true";
+    this.syncEmuLogsPanel();
+  };
+
   /** Last time config received via setTimeBadge; null = hidden. */
   private timeCfg: TimeConfig | null = null;
   /** Interval id for the live-clock ticker in the time badge. */
@@ -354,6 +367,18 @@ export class EmulatorView {
           </div>
         </div>
       </div>
+      <div class="emu-diag emu-logs" id="emu-logs" hidden>
+        <button class="emu-diag-header" id="emu-logs-toggle" type="button" aria-expanded="false" title="Show/hide the emulator app logs (pebble logs)">
+          <span class="emu-diag-caret" aria-hidden="true">▸</span>
+          <span class="emu-diag-summary" id="emu-logs-summary">Emulator logs</span>
+        </button>
+        <div class="emu-diag-body" id="emu-logs-body" hidden>
+          <pre class="emu-diag-log" id="emu-logs-log"></pre>
+          <div class="emu-diag-actions">
+            <button class="emu-diag-btn" id="emu-logs-copy" type="button">Copy log</button>
+          </div>
+        </div>
+      </div>
     `;
 
     this.screenHost = this.el.querySelector<HTMLElement>("#emu-screen")!;
@@ -389,6 +414,20 @@ export class EmulatorView {
         this.sessionLog.clear();
         this.renderDiag();
       });
+
+    const logsToggle = this.el.querySelector<HTMLButtonElement>("#emu-logs-toggle")!;
+    const logsCopy = this.el.querySelector<HTMLButtonElement>("#emu-logs-copy")!;
+    logsToggle.addEventListener("click", () => this.setEmuLogsExpanded(!this.emuLogsExpanded));
+    logsCopy.addEventListener("click", () => void this.copyEmuLog());
+    window.addEventListener(EMU_LOGS_EVENT, this.onEmuLogsChanged);
+    // Always subscribe to live lines (cheap); the panel visibility is separate.
+    this.appLogDispose = window.studio.onAppLog((line) => {
+      this.emuLogLines.push(line);
+      const overflow = this.emuLogLines.length - EMU_LOGS_CAP;
+      if (overflow > 0) this.emuLogLines.splice(0, overflow);
+      if (this.emuLogsEnabled && this.emuLogsExpanded) this.renderEmuLog();
+    });
+    this.syncEmuLogsPanel();
 
     // Create the four physical button nubs ONCE. They persist across model
     // switches; applyGeometry only toggles the square/round classes so CSS can
@@ -971,6 +1010,57 @@ export class EmulatorView {
     setTimeout(() => { btn.textContent = prev; }, 1500);
   }
 
+  /** Show/hide the emulator-logs panel per the setting; back-fill from history
+   * the first time it is shown so the user sees prior lines retroactively. */
+  private syncEmuLogsPanel(): void {
+    const el = this.el.querySelector<HTMLElement>("#emu-logs")!;
+    el.hidden = !this.emuLogsEnabled;
+    if (this.emuLogsEnabled && this.emuLogLines.length === 0) {
+      void window.studio.getAppLogHistory().then((lines) => {
+        if (this.emuLogLines.length === 0) this.emuLogLines.push(...lines);
+        if (this.emuLogsExpanded) this.renderEmuLog();
+        this.renderEmuLogSummary();
+      });
+    }
+    this.renderEmuLogSummary();
+    if (this.zoom === "fit") this.applyFitScale();
+  }
+
+  private setEmuLogsExpanded(expanded: boolean): void {
+    this.emuLogsExpanded = expanded;
+    const body = this.el.querySelector<HTMLElement>("#emu-logs-body")!;
+    const toggle = this.el.querySelector<HTMLButtonElement>("#emu-logs-toggle")!;
+    body.hidden = !expanded;
+    toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+    const caret = toggle.querySelector(".emu-diag-caret");
+    if (caret) caret.textContent = expanded ? "▾" : "▸";
+    if (expanded) this.renderEmuLog();
+    if (this.zoom === "fit") this.applyFitScale(); // sibling resize; observer won't fire
+  }
+
+  private renderEmuLogSummary(): void {
+    const n = this.emuLogLines.length;
+    const summary = this.el.querySelector<HTMLElement>("#emu-logs-summary")!;
+    summary.textContent = `Emulator logs · ${n} ${n === 1 ? "line" : "lines"}`;
+  }
+
+  private renderEmuLog(): void {
+    const pre = this.el.querySelector<HTMLElement>("#emu-logs-log")!;
+    pre.textContent = this.emuLogLines.join("\n") || "(no logs yet)";
+    pre.scrollTop = pre.scrollHeight;
+    this.renderEmuLogSummary();
+  }
+
+  private async copyEmuLog(): Promise<void> {
+    const text = this.emuLogLines.join("\n");
+    const btn = this.el.querySelector<HTMLButtonElement>("#emu-logs-copy")!;
+    let ok = false;
+    try { await navigator.clipboard.writeText(text); ok = true; } catch { ok = false; }
+    const prev = btn.textContent;
+    btn.textContent = ok ? "Copied!" : "Copy failed";
+    setTimeout(() => { btn.textContent = prev; }, 1500);
+  }
+
   /**
    * J-runtime: start/stop the rAF FPS sampler so it runs ONLY while diagnostics
    * is on and the emulator is live (no overhead otherwise). Each frame we read a
@@ -1140,6 +1230,8 @@ export class EmulatorView {
     const gen = ++this.bootGen;
 
     this.state = "booting";
+    this.emuLogLines.length = 0;
+    if (this.emuLogsEnabled && this.emuLogsExpanded) this.renderEmuLog();
     this.currentPlatform = platformId;
     // The session log is NOT wiped on boot (it persists across launch/crash so a
     // crash can be inspected after the fact) — just mark the start of this attempt.

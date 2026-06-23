@@ -59,6 +59,7 @@ const BACKLIGHT_ACTIVATION_KEY = "pebble-studio:backlight-activation";
 const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
 /** Auto-relaunch the emulator when the bridge crashes (EmulatorView reads this). Default OFF. */
 const AUTO_RELAUNCH_KEY = "pebble-studio:auto-relaunch";
+const EMU_LOGS_KEY = "pebble-studio:emu-logs";
 
 const TIME_SOURCE_KEY = "pebble-studio:time-source";
 const TIME_RATE_KEY = "pebble-studio:time-rate";
@@ -1039,7 +1040,17 @@ export class SettingsPane {
       },
     );
 
-    advanced.append(advHeading, diagRow, throttleRow, autoRelaunchRow);
+    const emuLogsRow = this.makeSwitchRow(
+      "Show emulator logs",
+      "Stream the watch app logs (the output of pebble install --logs) in a collapsible panel under the emulator. Default off.",
+      localStorage.getItem(EMU_LOGS_KEY) === "true", // default OFF
+      (on) => {
+        localStorage.setItem(EMU_LOGS_KEY, on ? "true" : "false");
+        window.dispatchEvent(new Event("pebble-studio:emu-logs-changed"));
+      },
+    );
+
+    advanced.append(advHeading, diagRow, throttleRow, autoRelaunchRow, emuLogsRow);
 
     this.el.append(appearance, watch, time, battery, sim, health, capture, keyboard, advanced);
 

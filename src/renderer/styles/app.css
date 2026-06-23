@@ -1001,6 +1001,8 @@ body {
   color: var(--text);
 }
 
+.emu-logs { margin-top: 4px; }
+
 .emu-status {
   font-size: var(--type-caption);
   color: var(--text-tertiary);
