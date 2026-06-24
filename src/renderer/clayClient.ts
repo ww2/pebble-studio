@@ -115,6 +115,50 @@ export async function fetchConfigUrl(
 }
 
 /**
+ * Resilient wrapper around fetchConfigUrl for the first-boot bridge-readiness
+ * race. On a fresh boot the emulator reports "Live" once VNC is up, but pypkjs's
+ * phone-sim bridge takes several more seconds to bind and the foreground app's JS
+ * to register its showConfiguration handler (see bridgeMonitor's startup grace).
+ * During that window a single attempt fails with BridgeUnreachableError (port not
+ * bound yet) or NoConfigPageError (bridge up, app not answering) — surfacing the
+ * misleading "No config page" even for an app that DOES support Clay. We retry
+ * both classes a few times; a genuinely config-less app simply exhausts the
+ * budget and the last error surfaces unchanged (same UX as before, just delayed).
+ * Any other error (e.g. a real transport fault) propagates immediately.
+ */
+export const CLAY_FETCH_MAX_ATTEMPTS = 3;
+export const CLAY_FETCH_RETRY_MS = 600;
+export const CLAY_FETCH_TIMEOUT_MS = 2800;
+
+export interface ClayResilientDeps extends ClayClientDeps {
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export async function fetchConfigUrlResilient(
+  port: number,
+  deps: ClayResilientDeps = {},
+  opts: { attempts?: number; timeoutMs?: number; retryMs?: number } = {},
+): Promise<string> {
+  const attempts = opts.attempts ?? CLAY_FETCH_MAX_ATTEMPTS;
+  const timeoutMs = opts.timeoutMs ?? CLAY_FETCH_TIMEOUT_MS;
+  const retryMs = opts.retryMs ?? CLAY_FETCH_RETRY_MS;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await fetchConfigUrl(port, timeoutMs, deps);
+    } catch (e) {
+      lastErr = e;
+      // Only the readiness-race classes are worth retrying; anything else is a
+      // hard fault that retrying won't fix.
+      if (!(e instanceof NoConfigPageError || e instanceof BridgeUnreachableError)) throw e;
+      if (attempt < attempts - 1) await sleep(retryMs);
+    }
+  }
+  throw lastErr;
+}
+
+/**
  * Connect (a FRESH connection is fine — see header) and deliver the config
  * result: AppConfigResponse carrying the RAW STILL-PERCENT-ENCODED fragment,
  * or AppConfigCancelled when the fragment is empty (user cancelled). Resolves

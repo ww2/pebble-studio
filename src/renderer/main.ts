@@ -65,6 +65,12 @@ interface StudioApi {
   // RAW still-percent-encoded close fragment ("" = cancelled).
   clayPhonesimPort(): Promise<number | null>;
   clayOpenWindow(url: string): Promise<string>;
+  // v3.0.3: Pebble SDK management. sdkInfo reports the active version + source;
+  // sdkInstall opens a picker then installs ("Replace & persist", null = cancel);
+  // sdkReset returns to the bundled SDK.
+  sdkInfo(): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }>;
+  sdkInstall(): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean } | null>;
+  sdkReset(): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }>;
   // v1.0.0: app version + application-menu action subscription.
   appVersion(): Promise<string>;
   onMenu(cb: (action: string) => void): () => void;
@@ -156,7 +162,10 @@ const library = new AppLibrary(
 
 // Application-menu wiring (v1.0.0): File → Install PBW / Clear Emulator reuse the
 // AppLibrary flows; Help → What's New opens the changelog modal.
-const changelogModal = new ChangelogModal(() => window.studio.appVersion());
+const changelogModal = new ChangelogModal(
+  () => window.studio.appVersion(),
+  () => window.studio.sdkInfo(), // re-queried each open → reflects the latest SDK upload/reset
+);
 // Disposer kept for the app lifetime (renderer is a singleton); stored rather
 // than discarded so the subscription is explicit and test-cleanable.
 const disposeMenu = window.studio.onMenu((action) => {
@@ -190,6 +199,10 @@ const settings = new SettingsPane(themeMode, initialPlatform, (id: PlatformId) =
   // no reboot occurred or the apply failed (end).
   onWeatherRefreshBegin: () => view.beginExternalReboot(),
   onWeatherRefreshEnd: () => view.endExternalReboot(),
+  // SDK upload/reset swaps the active SDK; if the emulator is live the backend
+  // tears it down, so relaunch it here to pick up the new SDK automatically.
+  isEmuLive: () => view.isLive(),
+  onSdkRelaunch: () => view.relaunch(),
 });
 
 // Command bar: version switcher (Fluent combobox) controls the persistent

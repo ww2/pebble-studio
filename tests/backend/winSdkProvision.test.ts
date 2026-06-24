@@ -2,6 +2,9 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   pickSdkVersion,
   isSdkCoreManifestValid,
+  parseSdkCoreManifest,
+  readActiveSdkOverride,
+  ACTIVE_SDK_MARKER,
   planWinSdkProvision,
   provisionWinSdk,
   refreshWinSdkFirmware,
@@ -76,6 +79,63 @@ describe("isSdkCoreManifestValid", () => {
 
   it("rejects malformed JSON", () => {
     expect(isSdkCoreManifestValid("{ not json", "4.9.169")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseSdkCoreManifest (version-agnostic locate helper)
+// ---------------------------------------------------------------------------
+
+describe("parseSdkCoreManifest", () => {
+  it("returns the version for a well-formed sdk-core manifest", () => {
+    expect(parseSdkCoreManifest(JSON.stringify({ type: "sdk-core", version: "4.3" }))).toEqual({ version: "4.3" });
+  });
+  it("rejects a non-sdk-core type", () => {
+    expect(parseSdkCoreManifest(JSON.stringify({ type: "toolchain", version: "4.3" }))).toBeNull();
+  });
+  it("rejects a non-version-shaped version string", () => {
+    expect(parseSdkCoreManifest(JSON.stringify({ type: "sdk-core", version: "latest" }))).toBeNull();
+  });
+  it("rejects empty / malformed JSON", () => {
+    expect(parseSdkCoreManifest("")).toBeNull();
+    expect(parseSdkCoreManifest("{nope")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// readActiveSdkOverride (.active-sdk marker)
+// ---------------------------------------------------------------------------
+
+const PERSIST_SDK_ROOT =
+  "C:\\Users\\TestUser\\AppData\\Roaming\\Pebble Studio\\pebble-data\\pebble-sdk";
+const overrideManifest = (ver: string) => `${PERSIST_SDK_ROOT}\\SDKs\\${ver}\\sdk-core\\manifest.json`;
+
+describe("readActiveSdkOverride", () => {
+  it("returns the version when the marker names a version with a valid persisted manifest", async () => {
+    const fs = makeFakeFs({
+      files: {
+        [`${PERSIST_SDK_ROOT}\\${ACTIVE_SDK_MARKER}`]: "5.0.0\n",
+        [overrideManifest("5.0.0")]: JSON.stringify({ type: "sdk-core", version: "5.0.0" }),
+      },
+    });
+    expect(await readActiveSdkOverride(fs, PERSIST_SDK_ROOT)).toBe("5.0.0");
+  });
+
+  it("returns null when the marker is absent (no override → use the bundle)", async () => {
+    const fs = makeFakeFs({});
+    expect(await readActiveSdkOverride(fs, PERSIST_SDK_ROOT)).toBeNull();
+  });
+
+  it("returns null when the marker names a version whose manifest is missing/invalid", async () => {
+    const fs = makeFakeFs({
+      files: { [`${PERSIST_SDK_ROOT}\\${ACTIVE_SDK_MARKER}`]: "5.0.0" }, // no manifest
+    });
+    expect(await readActiveSdkOverride(fs, PERSIST_SDK_ROOT)).toBeNull();
+  });
+
+  it("returns null for a non-version-shaped marker (defends against a junk file)", async () => {
+    const fs = makeFakeFs({ files: { [`${PERSIST_SDK_ROOT}\\${ACTIVE_SDK_MARKER}`]: "garbage" } });
+    expect(await readActiveSdkOverride(fs, PERSIST_SDK_ROOT)).toBeNull();
   });
 });
 
@@ -229,6 +289,44 @@ describe("provisionWinSdk — idempotent re-run", () => {
     });
     const res = await provisionWinSdk(packaged, { fs });
     expect(res.actions.copiedSdkCore).toBe(true);
+  });
+});
+
+describe("provisionWinSdk — user SDK override (.active-sdk)", () => {
+  beforeEach(() => _resetProvisionState());
+
+  it("provisions the OVERRIDE version (not the bundled one) and points current at it", async () => {
+    const ovr = planWinSdkProvision(packaged, "5.0.0");
+    const fs = makeFakeFs({
+      dirs: { [BUNDLE_SDKS]: ["4.9.169", "current"], [KEYMAPS_SRC]: ["en-us"] },
+      files: {
+        // The upload already materialised the override version + its marker.
+        [`${ovr.persistSdkRoot}\\${ACTIVE_SDK_MARKER}`]: "5.0.0",
+        [ovr.targetManifest]: JSON.stringify({ type: "sdk-core", version: "5.0.0" }),
+        [`${ovr.targetKeymaps}\\en-us`]: "x",
+      },
+    });
+
+    const res = await provisionWinSdk(packaged, { fs });
+
+    expect(res.version).toBe("5.0.0");
+    // The bundled 4.9.169 sdk-core is NOT copied — the override owns it.
+    expect(fs.calls.some((c) => c.startsWith("copyTree"))).toBe(false);
+    // current → the override version dir.
+    expect(fs.calls).toContain(`junction ${ovr.currentLink} -> ${ovr.targetVersionDir}`);
+  });
+
+  it("falls back to the bundled version when the override manifest is invalid (bad upload can't wedge boot)", async () => {
+    const ovr = planWinSdkProvision(packaged, "5.0.0");
+    const fs = makeFakeFs({
+      dirs: { [BUNDLE_SDKS]: ["4.9.169", "current"], [KEYMAPS_SRC]: ["en-us"] },
+      files: {
+        [`${ovr.persistSdkRoot}\\${ACTIVE_SDK_MARKER}`]: "5.0.0",
+        // marker present but NO valid manifest for 5.0.0 → override rejected
+      },
+    });
+    const res = await provisionWinSdk(packaged, { fs });
+    expect(res.version).toBe("4.9.169");
   });
 });
 

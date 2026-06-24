@@ -1,5 +1,5 @@
 import {
-  fetchConfigUrl,
+  fetchConfigUrlResilient,
   sendConfigResult,
   NoConfigPageError,
   BridgeUnreachableError,
@@ -241,7 +241,10 @@ export class AppLibrary {
     try {
       const port = await window.studio.clayPhonesimPort();
       if (port == null) throw new Error("emulator not running");
-      const url = await fetchConfigUrl(port);
+      // Resilient against the first-boot bridge-readiness race: a fresh boot can
+      // report "Live" before pypkjs/the app's JS is ready to answer Setup, which
+      // otherwise surfaced a misleading "No config page". Retries a few times.
+      const url = await fetchConfigUrlResilient(port);
       // RAW still-percent-encoded fragment ("" = cancelled) — passed back
       // undecoded; the app's JS decodes it itself.
       const rawFragment = await window.studio.clayOpenWindow(url);

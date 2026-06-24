@@ -61,6 +61,16 @@ const studio = {
   // unfocused (the default); pass true to allow Electron's normal throttling.
   setBackgroundThrottling: (throttle: boolean): Promise<void> =>
     ipcRenderer.invoke("app:setBackgroundThrottling", throttle),
+  // Pebble SDK management (native-Windows). sdkInfo reports the active version +
+  // source; sdkInstall opens a picker then installs the chosen SDK ("Replace &
+  // persist"); sdkReset returns to the bundled SDK. install/reset resolve null
+  // only when the user cancels the picker.
+  sdkInfo: (): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }> =>
+    ipcRenderer.invoke("sdk:info"),
+  sdkInstall: (): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean } | null> =>
+    ipcRenderer.invoke("sdk:install"),
+  sdkReset: (): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }> =>
+    ipcRenderer.invoke("sdk:reset"),
   // App version (v1.0.0) — for the Help → What's New modal header.
   appVersion: (): Promise<string> => ipcRenderer.invoke("app:version"),
   // Subscribe to application-menu actions (v1.0.0). Returns a disposer.

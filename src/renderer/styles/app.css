@@ -1066,6 +1066,10 @@ body {
   display: flex;
   flex-direction: column;
   gap: 20px;
+  /* Contain a help tooltip that would otherwise extend past the pane and add a
+     horizontal scrollbar. `clip` (not `hidden`) leaves the vertical axis visible
+     so tooltips can still drop below their row. */
+  overflow-x: clip;
 }
 .settings-section {
   display: flex;
@@ -1087,6 +1091,92 @@ body {
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+}
+/* Group of action buttons on its own row (e.g. SDK upload/reset). Wraps on a
+   narrow pane so buttons never collide with each other or the text above. */
+.settings-row-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+/* Section heading + inline "?" help icon. */
+.settings-section-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* A control's label paired with a trailing "?" help icon. Normal inline flow (NOT
+   flex) so the icon follows the label's last word and wraps WITH the text — when
+   the label spans two lines the "?" sits right after the final word, not pinned to
+   the right edge. */
+.settings-row-labelline {
+  min-width: 0;
+}
+.settings-row-labelline .help-tip {
+  margin-left: 5px;
+}
+/* "?" help icon whose explanation appears in a tooltip on hover/focus, so long
+   descriptions don't crowd the always-visible layout. */
+.help-tip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  /* Sit on the text's midline so the trailing "?" reads as part of the label. */
+  vertical-align: middle;
+}
+.help-tip__glyph {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 1px solid color-mix(in srgb, var(--text-secondary) 50%, transparent);
+  color: var(--text-secondary);
+  /* Center the "?" optically in the smaller circle: a 1-char flex box with a
+     line-height matching the inner height, no padding, so it sits dead-center. */
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  text-align: center;
+  cursor: help;
+}
+.help-tip:hover .help-tip__glyph,
+.help-tip:focus-visible .help-tip__glyph {
+  color: var(--text);
+  border-color: var(--text-secondary);
+}
+.help-tip__bubble {
+  position: absolute;
+  top: calc(100% + 6px);
+  /* Left-anchored by default; clampHelpBubble() shifts `left` on hover/focus so a
+     trailing "?" near the right edge slides the bubble left to stay in the pane.
+     `.settings-pane { overflow-x: clip }` is the backstop against any remainder. */
+  left: 0;
+  z-index: 60;
+  width: max-content;
+  max-width: 240px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-3px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  pointer-events: none;
+}
+.help-tip:hover .help-tip__bubble,
+.help-tip:focus-visible .help-tip__bubble {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
 }
 .settings-row-label { color: var(--text); }
 .settings-row-desc { color: var(--text-secondary); margin: 0; }
@@ -1140,6 +1230,13 @@ body {
   gap: 12px;
   width: 100%;
 }
+/* Stacked variant: label on its own line, the control(s) full-width below — used
+   for the Coordinates row so both lat & lon inputs are fully visible. */
+.settings-watch-control--stack {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
 .settings-watch-label { color: var(--text); }
 .settings-watch-select {
   appearance: none;
@@ -1159,6 +1256,10 @@ body {
   min-width: 160px;
   transition: border-color var(--dur) var(--ease);
 }
+/* Narrower variant for selects with short options (e.g. the backlight method /
+   button pickers), so the wide default min-width doesn't squeeze the label into
+   a second line. */
+.settings-watch-select--compact { min-width: 96px; }
 .settings-watch-select:hover { border-color: var(--border-strong); }
 .settings-watch-select:focus-visible {
   outline: none;
@@ -1476,6 +1577,7 @@ body {
 .cl-head { display: flex; align-items: center; gap: 12px; padding: 16px 18px; border-bottom: 1px solid var(--border); }
 .cl-title { flex: 1; }
 .cl-version { color: var(--text-secondary); font-size: var(--type-caption); }
+.cl-sdk { color: var(--text-secondary); font-size: var(--type-caption); opacity: 0.85; margin-top: 1px; }
 .cl-close { border: none; background: transparent; color: var(--text-secondary); font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: var(--radius-control); }
 .cl-close:hover { background: var(--control-hover); color: var(--text); }
 .cl-body { padding: 8px 18px 18px; overflow-y: auto; }

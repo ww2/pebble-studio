@@ -48,6 +48,14 @@ interface SettingsOptions {
    * no-reboot, or failure), so the EmulatorView always balances the suppression
    * armed by onWeatherRefreshBegin. */
   onWeatherRefreshEnd?: () => void;
+  /** Whether the emulator is currently live. Used by the SDK controls to decide
+   * whether to auto-relaunch after swapping the SDK (so the change takes effect
+   * without the user manually relaunching). */
+  isEmuLive?: () => boolean;
+  /** Relaunch the live emulator (used after an SDK upload/reset so the new SDK is
+   * picked up). The backend tears the emulator down during the swap; this brings
+   * it back on the newly-active SDK. */
+  onSdkRelaunch?: () => void | Promise<void>;
 }
 
 const CAPTURE_DIR_KEY = "pebble-studio:capture-dir";
@@ -76,6 +84,64 @@ const HEALTH_BOOT_KEY = "pebble-studio:health-activate-on-boot";
 export function buildBatteryCall(sliderValue: string, chargingStored: string | null): [number, boolean] {
   const pct = Math.max(0, Math.min(100, Number(sliderValue) || 0));
   return [pct, chargingStored === "true"];
+}
+
+/**
+ * Roughly the most characters that fit on one line of caption text in the
+ * Settings pane. A description longer than this is tucked behind a "?" tooltip
+ * (next to its label) instead of shown inline, so the section stays uncluttered.
+ */
+export const ONE_LINE_DESC_CHARS = 50;
+
+/**
+ * A small "?" help icon that reveals `text` in a tooltip on hover/focus — used to
+ * keep long explanations out of the always-visible layout so Settings stays
+ * uncluttered. Pure CSS reveal (see `.help-tip` in app.css); keyboard-focusable.
+ */
+export function makeHelpTip(text: string): HTMLElement {
+  const tip = document.createElement("span");
+  tip.className = "help-tip";
+  tip.tabIndex = 0;
+  tip.setAttribute("role", "note");
+  tip.setAttribute("aria-label", text);
+  const glyph = document.createElement("span");
+  glyph.className = "help-tip__glyph";
+  glyph.textContent = "?";
+  glyph.setAttribute("aria-hidden", "true");
+  const bubble = document.createElement("span");
+  bubble.className = "help-tip__bubble";
+  bubble.textContent = text;
+  tip.append(glyph, bubble);
+  // Some help tips sit inside a <label> (next to a select); swallow the click so
+  // tapping the "?" doesn't activate the labelled control.
+  tip.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); });
+  // The "?" sits right after the (variable-length) label, so the bubble's default
+  // left-anchored position can run past the pane edge. Clamp it inside the pane
+  // on hover/focus so it never overflows (no horizontal scrollbar, never cut off).
+  const clamp = (): void => clampHelpBubble(tip, bubble);
+  tip.addEventListener("mouseenter", clamp);
+  tip.addEventListener("focus", clamp);
+  return tip;
+}
+
+/**
+ * Reposition a help-tip bubble so it stays within its `.settings-pane`: cap its
+ * width to the pane and shift it horizontally to fit (preferring the left anchor,
+ * sliding left when the trailing "?" would push it off the right edge).
+ */
+function clampHelpBubble(tip: HTMLElement, bubble: HTMLElement): void {
+  bubble.style.left = "0px";
+  const margin = 8;
+  const pane = tip.closest(".settings-pane") as HTMLElement | null;
+  const bounds = pane?.getBoundingClientRect();
+  if (bounds) bubble.style.maxWidth = `${Math.max(160, bounds.width - margin * 2)}px`;
+  const rect = bubble.getBoundingClientRect();
+  const leftLimit = (bounds?.left ?? 0) + margin;
+  const rightLimit = (bounds?.right ?? document.documentElement.clientWidth) - margin;
+  let shift = 0;
+  if (rect.right > rightLimit) shift = rightLimit - rect.right; // slide left to fit
+  if (rect.left + shift < leftLimit) shift = leftLimit - rect.left; // but not past the left edge
+  bubble.style.left = `${shift}px`;
 }
 
 /** UI state -> persisted SimEnvConfig. tempInput is in `units`; stored as canonical tempC. */
@@ -155,6 +221,8 @@ export class SettingsPane {
   private readonly watchSelect: HTMLSelectElement;
   private readonly bootSwitchEl: HTMLButtonElement;
   private readonly captureDirValue: HTMLSpanElement;
+  private readonly sdkVersionValue: HTMLSpanElement;
+  private readonly sdkStatus: HTMLSpanElement;
   private bootMode: BootMode;
   /** Switches the live preview to the chosen platform (wired from main.ts). */
   private readonly onPlatformChange: (id: PlatformId) => void;
@@ -163,6 +231,8 @@ export class SettingsPane {
   /** Flips EmulatorView's diagnostics overlay live (J). */
   private readonly onDiagnosticsChange: (on: boolean) => void;
   private readonly onWeatherRefreshReconnect?: () => void | Promise<void>;
+  private readonly isEmuLive?: () => boolean;
+  private readonly onSdkRelaunch?: () => void | Promise<void>;
   private readonly onWeatherRefreshBegin?: () => void;
   private readonly onWeatherRefreshEnd?: () => void;
 
@@ -214,6 +284,8 @@ export class SettingsPane {
     this.onBootModeChange = options.onBootModeChange;
     this.onDiagnosticsChange = options.onDiagnosticsChange;
     this.onWeatherRefreshReconnect = options.onWeatherRefreshReconnect;
+    this.isEmuLive = options.isEmuLive;
+    this.onSdkRelaunch = options.onSdkRelaunch;
     this.onWeatherRefreshBegin = options.onWeatherRefreshBegin;
     this.onWeatherRefreshEnd = options.onWeatherRefreshEnd;
     this.bindings = loadBindings();
@@ -263,14 +335,15 @@ export class SettingsPane {
     const watch = document.createElement("section");
     watch.className = "settings-section";
 
+    const watchHeader = document.createElement("div");
+    watchHeader.className = "settings-section-header";
     const watchHeading = document.createElement("h3");
     watchHeading.className = "settings-section-title type-body-strong";
     watchHeading.textContent = "Default watch";
-
-    const watchDesc = document.createElement("p");
-    watchDesc.className = "settings-row-desc type-caption";
-    watchDesc.textContent =
-      "Which watch Pebble Studio opens on launch. Switching the active watch from the top bar won't change this.";
+    watchHeader.append(
+      watchHeading,
+      makeHelpTip("Which watch Pebble Studio opens on launch. Switching the active watch from the top bar won't change this."),
+    );
 
     // Container hosting the labeled "Startup watch" dropdown.
     this.defaultWatchSlot = document.createElement("div");
@@ -311,13 +384,16 @@ export class SettingsPane {
 
     const bootText = document.createElement("div");
     bootText.className = "settings-row-text";
+    const bootLabelLine = document.createElement("div");
+    bootLabelLine.className = "settings-row-labelline";
     const bootLabel = document.createElement("span");
     bootLabel.className = "settings-row-label type-body";
     bootLabel.textContent = "Auto-boot on switch";
-    const bootDesc = document.createElement("span");
-    bootDesc.className = "settings-row-desc type-caption";
-    bootDesc.textContent = "On: boot when a model is selected. Off: load the chrome and wait for Launch.";
-    bootText.append(bootLabel, bootDesc);
+    bootLabelLine.append(
+      bootLabel,
+      makeHelpTip("On: boot when a model is selected. Off: load the chrome and wait for Launch."),
+    );
+    bootText.append(bootLabelLine);
 
     this.bootSwitchEl = document.createElement("button");
     this.bootSwitchEl.type = "button";
@@ -332,7 +408,7 @@ export class SettingsPane {
 
     bootRow.append(bootText, this.bootSwitchEl);
 
-    watch.append(watchHeading, watchDesc, this.defaultWatchSlot, bootRow);
+    watch.append(watchHeader, this.defaultWatchSlot, bootRow);
 
     // ── Time section ──────────────────────────────────────────────────────
     const time = document.createElement("section");
@@ -688,19 +764,24 @@ export class SettingsPane {
     locSelect.value = simState.name;
     locControl.append(locLabel, locSelect);
 
+    // Stacked: "Coordinates" label on its own line, the lat & lon inputs full-width
+    // below it (each fills half the row) so the whole value is visible.
     const customRow = document.createElement("label");
-    customRow.className = "settings-watch-control";
+    customRow.className = "settings-watch-control settings-watch-control--stack";
     const customLabel = document.createElement("span");
     customLabel.className = "settings-watch-label type-body";
     customLabel.textContent = "Coordinates";
     const latInput = document.createElement("input");
     latInput.type = "number"; latInput.step = "0.0001"; latInput.value = String(simState.lat);
-    latInput.placeholder = "lat"; latInput.title = "Latitude"; latInput.className = "settings-watch-select"; latInput.style.width = "7em";
+    latInput.placeholder = "lat"; latInput.title = "Latitude"; latInput.className = "settings-watch-select";
+    latInput.style.flex = "1"; latInput.style.minWidth = "0";
     const lonInput = document.createElement("input");
     lonInput.type = "number"; lonInput.step = "0.0001"; lonInput.value = String(simState.lon);
-    lonInput.placeholder = "lon"; lonInput.title = "Longitude"; lonInput.className = "settings-watch-select"; lonInput.style.width = "7em";
+    lonInput.placeholder = "lon"; lonInput.title = "Longitude"; lonInput.className = "settings-watch-select";
+    lonInput.style.flex = "1"; lonInput.style.minWidth = "0";
     const coordWrap = document.createElement("div");
     coordWrap.className = "settings-time-selects";
+    coordWrap.style.width = "100%";
     coordWrap.append(latInput, lonInput);
     customRow.append(customLabel, coordWrap);
     const syncCustomVisibility = (): void => { customRow.hidden = locSelect.value !== "__custom__"; };
@@ -886,11 +967,17 @@ export class SettingsPane {
     // Backlight keepalive method selector (Back-press / Motion / Off).
     const blMethodControl = document.createElement("label");
     blMethodControl.className = "settings-watch-control";
+    const blMethodLabelLine = document.createElement("div");
+    blMethodLabelLine.className = "settings-row-labelline";
     const blMethodLabel = document.createElement("span");
     blMethodLabel.className = "settings-watch-label type-body";
     blMethodLabel.textContent = "Backlight keepalive";
+    blMethodLabelLine.append(
+      blMethodLabel,
+      makeHelpTip("Back-press wakes the screen but navigates menus; Motion wakes it but triggers shake handlers; Off disables the keepalive."),
+    );
     const blMethodSelect = document.createElement("select");
-    blMethodSelect.className = "settings-watch-select";
+    blMethodSelect.className = "settings-watch-select settings-watch-select--compact";
     for (const [value, text] of [
       ["back", "Back-press"],
       ["motion", "Motion"],
@@ -912,12 +999,7 @@ export class SettingsPane {
         void window.studio.backlightAlways(false).catch(() => {});
       }
     });
-    blMethodControl.append(blMethodLabel, blMethodSelect);
-
-    const blMethodDesc = document.createElement("p");
-    blMethodDesc.className = "settings-row-desc type-caption";
-    blMethodDesc.textContent =
-      "Back-press wakes the screen but navigates menus; Motion wakes it but triggers shake handlers; Off disables the keepalive.";
+    blMethodControl.append(blMethodLabelLine, blMethodSelect);
 
     // Apply persisted backlight method to main on startup. Default OFF — the
     // keepalive sends real Back presses / motion taps that can navigate menus,
@@ -932,11 +1014,17 @@ export class SettingsPane {
     // clicked. Default "back".
     const blBtnControl = document.createElement("label");
     blBtnControl.className = "settings-watch-control";
+    const blBtnLabelLine = document.createElement("div");
+    blBtnLabelLine.className = "settings-row-labelline";
     const blBtnLabel = document.createElement("span");
     blBtnLabel.className = "settings-watch-label type-body";
     blBtnLabel.textContent = "Backlight button";
+    blBtnLabelLine.append(
+      blBtnLabel,
+      makeHelpTip("What the main-page Backlight button does: Back button reliably wakes the screen but can navigate inside an app; Shake sends a motion nudge (won't navigate)."),
+    );
     const blBtnSelect = document.createElement("select");
-    blBtnSelect.className = "settings-watch-select";
+    blBtnSelect.className = "settings-watch-select settings-watch-select--compact";
     for (const [value, text] of [
       ["back", "Back button"],
       ["shake", "Shake"],
@@ -950,12 +1038,7 @@ export class SettingsPane {
     blBtnSelect.addEventListener("change", () => {
       localStorage.setItem(BACKLIGHT_ACTIVATION_KEY, blBtnSelect.value);
     });
-    blBtnControl.append(blBtnLabel, blBtnSelect);
-
-    const blBtnDesc = document.createElement("p");
-    blBtnDesc.className = "settings-row-desc type-caption";
-    blBtnDesc.textContent =
-      "What the main-page Backlight button does: Back button reliably wakes the screen but can navigate inside an app; Shake sends a motion nudge (won't navigate).";
+    blBtnControl.append(blBtnLabelLine, blBtnSelect);
 
     const sunlightRow = this.makeSwitchRow(
       "Sunlight color correction",
@@ -974,19 +1057,18 @@ export class SettingsPane {
       },
     );
 
-    capture.append(blCaptureRow, sunlightRow, liveSunlightRow, blMethodControl, blMethodDesc, blBtnControl, blBtnDesc);
+    capture.append(blCaptureRow, sunlightRow, liveSunlightRow, blMethodControl, blBtnControl);
 
     // ── Keyboard section (I) ──────────────────────────────────────────────
     const keyboard = document.createElement("section");
     keyboard.className = "settings-section";
 
+    const keyHeader = document.createElement("div");
+    keyHeader.className = "settings-section-header";
     const keyHeading = document.createElement("h3");
     keyHeading.className = "settings-section-title type-body-strong";
     keyHeading.textContent = "Keyboard";
-
-    const keyDesc = document.createElement("p");
-    keyDesc.className = "settings-row-desc type-caption";
-    keyDesc.textContent = "Bind keys to emulator buttons (active only while live).";
+    keyHeader.append(keyHeading, makeHelpTip("Bind keys to emulator buttons (active only while live)."));
 
     const resetBtn = document.createElement("button");
     resetBtn.type = "button";
@@ -994,7 +1076,7 @@ export class SettingsPane {
     resetBtn.textContent = "Reset to defaults";
     resetBtn.addEventListener("click", () => this.resetBindings());
 
-    keyboard.append(keyHeading, keyDesc, this.keyRowsHost, resetBtn);
+    keyboard.append(keyHeader, this.keyRowsHost, resetBtn);
     this.renderKeyRows();
 
     // ── Advanced section (J) ──────────────────────────────────────────────
@@ -1052,7 +1134,66 @@ export class SettingsPane {
 
     advanced.append(advHeading, diagRow, throttleRow, autoRelaunchRow, emuLogsRow);
 
-    this.el.append(appearance, watch, time, battery, sim, health, capture, keyboard, advanced);
+    // ── SDK section ───────────────────────────────────────────────────────
+    // Show the active Pebble SDK and let the user replace it with their own
+    // (a .tar.bz2 SDK or its folder) without a developer editing files. The
+    // uploaded SDK persists across relaunches until replaced or reset, and keeps
+    // the full PebbleOS launcher (the bundled unlocked firmware is overlaid).
+    const sdk = document.createElement("section");
+    sdk.className = "settings-section";
+    // Heading carries a "?" help icon — the explanation lives in its tooltip so
+    // the section stays uncluttered (no always-on paragraph of text).
+    const sdkHeader = document.createElement("div");
+    sdkHeader.className = "settings-section-header";
+    const sdkHeading = document.createElement("h3");
+    sdkHeading.className = "settings-section-title type-body-strong";
+    sdkHeading.textContent = "Pebble SDK";
+    sdkHeader.append(
+      sdkHeading,
+      makeHelpTip(
+        "Upload a Pebble SDK (a sdk-core .tar.bz2 / .zip archive or its folder) to replace the bundled one. " +
+          "It persists across updates until you upload another or reset. The full PebbleOS launcher " +
+          "(Settings, Health, full menu) is kept automatically. Relaunch the emulator to use a newly installed SDK.",
+      ),
+    );
+
+    // Version on its own row (full width) so it can never collide with the buttons.
+    const sdkRow = document.createElement("div");
+    sdkRow.className = "settings-row";
+    const sdkText = document.createElement("div");
+    sdkText.className = "settings-row-text";
+    const sdkLabel = document.createElement("span");
+    sdkLabel.className = "settings-row-label type-body";
+    sdkLabel.textContent = "Current version";
+    this.sdkVersionValue = document.createElement("span");
+    this.sdkVersionValue.className = "settings-row-desc type-caption";
+    this.sdkVersionValue.textContent = "Checking…";
+    sdkText.append(sdkLabel, this.sdkVersionValue);
+    sdkRow.append(sdkText);
+
+    // Buttons on their own row below the version.
+    const sdkUploadBtn = document.createElement("button");
+    sdkUploadBtn.type = "button";
+    sdkUploadBtn.className = "lib-pick-btn";
+    sdkUploadBtn.textContent = "Upload SDK…";
+    const sdkResetBtn = document.createElement("button");
+    sdkResetBtn.type = "button";
+    sdkResetBtn.className = "lib-pick-btn";
+    sdkResetBtn.textContent = "Reset to bundled";
+    const sdkBtns = document.createElement("div");
+    sdkBtns.className = "settings-row-actions";
+    sdkBtns.append(sdkUploadBtn, sdkResetBtn);
+
+    this.sdkStatus = document.createElement("span");
+    this.sdkStatus.className = "settings-row-desc type-caption";
+
+    sdkUploadBtn.addEventListener("click", () => void this.uploadSdk(sdkUploadBtn, sdkResetBtn));
+    sdkResetBtn.addEventListener("click", () => void this.resetSdk(sdkUploadBtn, sdkResetBtn));
+
+    sdk.append(sdkHeader, sdkRow, sdkBtns, this.sdkStatus);
+    void this.refreshSdkInfo();
+
+    this.el.append(appearance, watch, time, battery, sim, health, capture, sdk, keyboard, advanced);
 
     this.syncSwitch();
     this.syncBootSwitch();
@@ -1315,13 +1456,24 @@ export class SettingsPane {
 
     const text = document.createElement("div");
     text.className = "settings-row-text";
+    const labelLine = document.createElement("div");
+    labelLine.className = "settings-row-labelline";
     const labelEl = document.createElement("span");
     labelEl.className = "settings-row-label type-body";
     labelEl.textContent = label;
-    const descEl = document.createElement("span");
-    descEl.className = "settings-row-desc type-caption";
-    descEl.textContent = desc;
-    text.append(labelEl, descEl);
+    // A blurb longer than one line goes behind a "?" tooltip right after the
+    // label's last word; a short one stays inline below the label. (The tooltip
+    // clamps itself inside the pane, so the trailing "?" can't cause overflow.)
+    const longDesc = desc.length > ONE_LINE_DESC_CHARS;
+    labelLine.append(labelEl);
+    if (longDesc) labelLine.append(makeHelpTip(desc));
+    text.append(labelLine);
+    if (!longDesc) {
+      const descEl = document.createElement("span");
+      descEl.className = "settings-row-desc type-caption";
+      descEl.textContent = desc;
+      text.append(descEl);
+    }
 
     const sw = document.createElement("button");
     sw.type = "button";
@@ -1467,6 +1619,84 @@ export class SettingsPane {
     }
     localStorage.setItem(CAPTURE_DIR_KEY, dir);
     this.captureDirValue.textContent = dir;
+  }
+
+  /** Format "4.17 (custom · full launcher)" / "4.9.169 (bundled · full launcher)". */
+  private sdkLabel(info: { version: string; source: "custom" | "bundled"; fullLauncher: boolean }): string {
+    const fw = info.fullLauncher ? "full launcher" : "stock firmware";
+    return `${info.version} (${info.source} · ${fw})`;
+  }
+
+  /** Query main for the active SDK and render it. */
+  private async refreshSdkInfo(): Promise<void> {
+    try {
+      this.sdkVersionValue.textContent = this.sdkLabel(await window.studio.sdkInfo());
+    } catch (err) {
+      console.warn("[settings] sdkInfo failed (ignored):", err);
+      this.sdkVersionValue.textContent = "unknown";
+    }
+  }
+
+  /** If the emulator was live when an SDK swap ran, the backend tore it down — so
+   * relaunch it to pick up the new SDK (and to restore a working emulator even if
+   * the swap failed). No-op when it wasn't running. */
+  private async maybeRelaunchAfterSdk(wasLive: boolean): Promise<void> {
+    if (!wasLive) return;
+    try {
+      await this.onSdkRelaunch?.();
+    } catch (err) {
+      console.warn("[settings] relaunch after SDK change failed:", err);
+    }
+  }
+
+  /** Upload + install a user-chosen SDK (Replace & persist + full-launcher overlay). */
+  private async uploadSdk(uploadBtn: HTMLButtonElement, resetBtn: HTMLButtonElement): Promise<void> {
+    const wasLive = this.isEmuLive?.() ?? false;
+    uploadBtn.disabled = true;
+    resetBtn.disabled = true;
+    this.sdkStatus.textContent = "Installing…";
+    let relaunch = false;
+    try {
+      const info = await window.studio.sdkInstall();
+      if (info == null) {
+        this.sdkStatus.textContent = ""; // cancelled — emulator untouched
+      } else {
+        this.sdkVersionValue.textContent = this.sdkLabel(info);
+        relaunch = wasLive; // a real install tore the live emulator down
+        const tail = wasLive ? " Relaunching the emulator…" : " Relaunch the emulator to use it.";
+        this.sdkStatus.textContent =
+          `Installed SDK ${info.version}${info.fullLauncher ? " with the full PebbleOS launcher" : ""}.${tail}`;
+      }
+    } catch (err) {
+      const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
+      this.sdkStatus.textContent = `Upload failed: ${reason || "see console"}`;
+      relaunch = wasLive; // the backend may have torn the emulator down before failing
+    } finally {
+      uploadBtn.disabled = false;
+      resetBtn.disabled = false;
+    }
+    await this.maybeRelaunchAfterSdk(relaunch);
+  }
+
+  /** Drop the user override and return to the bundled SDK. */
+  private async resetSdk(uploadBtn: HTMLButtonElement, resetBtn: HTMLButtonElement): Promise<void> {
+    const wasLive = this.isEmuLive?.() ?? false;
+    uploadBtn.disabled = true;
+    resetBtn.disabled = true;
+    this.sdkStatus.textContent = "Resetting…";
+    try {
+      const info = await window.studio.sdkReset();
+      this.sdkVersionValue.textContent = this.sdkLabel(info);
+      const tail = wasLive ? " Relaunching the emulator…" : " Relaunch the emulator to use it.";
+      this.sdkStatus.textContent = `Reset to bundled SDK ${info.version}.${tail}`;
+    } catch (err) {
+      const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
+      this.sdkStatus.textContent = `Reset failed: ${reason || "see console"}`;
+    } finally {
+      uploadBtn.disabled = false;
+      resetBtn.disabled = false;
+    }
+    await this.maybeRelaunchAfterSdk(wasLive);
   }
 
   private toggleTheme(): void {

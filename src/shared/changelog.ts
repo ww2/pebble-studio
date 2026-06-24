@@ -14,6 +14,14 @@ export const CHANGELOG: ChangelogEntry[] = [
   // The 2.x line is the native-Windows track (no WSL); the 1.x line is the
   // WSL-connected track. 2.0.1 is the first native release. 3.0.0 is the first
   // public open-source release.
+  { version: "3.0.3", date: "2026-06-23", changes: [
+    "Your watchface now appears much faster after the emulator boots. Health activation used to run first and could hold the watchface back by up to ~10 seconds (sometimes leaving you on the launcher to open it by hand); it now runs in the background after your watchface loads.",
+    "New Settings → Pebble SDK section: see which SDK version is in use and upload your own (a Pebble sdk-core .tar.bz2 / .zip archive or its folder) to replace the bundled one. Your SDK persists across updates until you upload another or reset to the bundled one. The full PebbleOS launcher (Settings, Health, full menu) is kept automatically on an uploaded SDK, and if the emulator is running it relaunches itself to apply the change. The active SDK version is also shown in Help → What's New.",
+    "The App Library's \"loaded\" badges now clear when the emulator stops, is force-closed, or relaunches — they no longer linger as if apps were still running on a watch that isn't.",
+    "Settings is less cluttered: longer explanations are now tucked behind a small \"?\" icon you can hover (or focus) for the full description, instead of always-on paragraphs of text.",
+    "Setting the battery level right after the watch boots no longer fails with an error — Pebble Studio now waits for the watch to finish starting up and retries, instead of giving up while the phone bridge is still connecting.",
+    "Opening a watchface's config (the gear button) right after boot no longer shows a misleading \"No config page\" message — it now retries while the watchface and phone bridge finish starting up before reporting that an app has no config page.",
+  ]},
   { version: "3.0.2", date: "2026-06-22", changes: [
     "Closing Pebble Studio now shuts the emulator down with it — QEMU and the watch's Python helpers no longer keep running (and hogging CPU) in the background, and a fresh launch always starts cleanly.",
     "The emulator's background processes now show up as \"PebbleStudioEmu\" in Task Manager instead of a generic \"python\".",

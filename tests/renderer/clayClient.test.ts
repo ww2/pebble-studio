@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import {
   fetchConfigUrl,
+  fetchConfigUrlResilient,
   sendConfigResult,
   NoConfigPageError,
   BridgeUnreachableError,
@@ -166,6 +167,59 @@ describe("fetchConfigUrl", () => {
     // Timer must have been cleared — advancing past the deadline is a no-op.
     await vi.advanceTimersByTimeAsync(10000);
     ws.emitClose(); // late close after settle is also ignored
+  });
+});
+
+describe("fetchConfigUrlResilient — first-boot bridge-readiness retry", () => {
+  // Real timers (injected no-op sleep means no real delay); flush lets the
+  // post-rejection microtasks run so the next attempt's socket is constructed.
+  const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+
+  it("retries past a first-boot close/NoConfigPage, then resolves once the app answers", async () => {
+    const sleep = vi.fn(async () => {});
+    const p = fetchConfigUrlResilient(9000, { ...deps, sleep }, { attempts: 3, retryMs: 5 });
+    // Attempt 1: connects but closes before any URL (bridge/app still settling).
+    FakeWebSocket.instances[0].open();
+    FakeWebSocket.instances[0].emitClose();
+    await flush();
+    // Attempt 2: same.
+    FakeWebSocket.instances[1].open();
+    FakeWebSocket.instances[1].emitClose();
+    await flush();
+    // Attempt 3: the app's JS is now up and answers with the config URL.
+    FakeWebSocket.instances[2].open();
+    FakeWebSocket.instances[2].message(urlFrame("http://cfg/"));
+    await expect(p).resolves.toBe("http://cfg/");
+    expect(FakeWebSocket.instances).toHaveLength(3);
+    expect(sleep).toHaveBeenCalledTimes(2); // one delay between each attempt
+  });
+
+  it("gives up with the last error after exhausting attempts (a genuinely config-less app)", async () => {
+    const sleep = vi.fn(async () => {});
+    const p = fetchConfigUrlResilient(9000, { ...deps, sleep }, { attempts: 2, retryMs: 5 });
+    FakeWebSocket.instances[0].open();
+    FakeWebSocket.instances[0].emitClose();
+    await flush();
+    FakeWebSocket.instances[1].open();
+    FakeWebSocket.instances[1].emitClose();
+    await expect(p).rejects.toBeInstanceOf(NoConfigPageError);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
+  it("also retries the port-not-bound race (BridgeUnreachableError), not just NoConfigPage", async () => {
+    const sleep = vi.fn(async () => {});
+    const p = fetchConfigUrlResilient(9000, { ...deps, sleep }, { attempts: 3, retryMs: 5 });
+    // Attempts 1-2: the pypkjs port isn't bound yet → socket error.
+    FakeWebSocket.instances[0].emitError();
+    await flush();
+    FakeWebSocket.instances[1].emitError();
+    await flush();
+    // Attempt 3: bridge is up and the app answers.
+    FakeWebSocket.instances[2].open();
+    FakeWebSocket.instances[2].message(urlFrame("http://cfg/"));
+    await expect(p).resolves.toBe("http://cfg/");
+    expect(FakeWebSocket.instances).toHaveLength(3);
+    expect(sleep).toHaveBeenCalledTimes(2);
   });
 });
 

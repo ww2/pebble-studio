@@ -7,6 +7,7 @@ import {
   healthRetryDecision,
   HEALTH_ACTIVATE_MAX_ATTEMPTS,
   HEALTH_ACTIVATE_READY_MS,
+  BATTERY_PUSH_MAX_ATTEMPTS,
 } from "../../src/main/backend/WindowsNativeDriver.js";
 
 const ep = { host: "localhost", port: 6080, wsPath: "/" };
@@ -70,6 +71,45 @@ describe("WindowsNativeDriver", () => {
     const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
     const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {} });
     expect(await d.ensureTimeShim()).toBe(false);
+  });
+
+  describe("battery push — first-boot bridge-readiness retry", () => {
+    it("retries emu-battery across the settling window, then succeeds (error never surfaces)", async () => {
+      let batteryCalls = 0;
+      const run = vi.fn(async (_c: string, args: string[]) => {
+        if (args.includes("emu-battery")) {
+          batteryCalls++;
+          // Bridge not ready for the first two attempts (libpebble2 TimeoutError),
+          // then settles and succeeds — exactly the first-boot race.
+          return batteryCalls < 3
+            ? { code: 1, stdout: "", stderr: "libpebble2.exceptions.TimeoutError" }
+            : { code: 0, stdout: "", stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      });
+      const sleep = vi.fn(async () => {});
+      const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {}, sleep });
+      d.setPlatform("emery");
+      await expect(d.battery(31, false)).resolves.toBeUndefined();
+      expect(batteryCalls).toBe(3);
+      expect(sleep).toHaveBeenCalledTimes(2); // one delay between each of the 3 attempts
+    });
+
+    it("after exhausting attempts throws a FRIENDLY message — never the raw libpebble2 traceback", async () => {
+      const run = vi.fn(async (_c: string, args: string[]) =>
+        args.includes("emu-battery")
+          ? { code: 1, stdout: "", stderr: "Traceback (most recent call last): libpebble2.exceptions.TimeoutError" }
+          : { code: 0, stdout: "", stderr: "" },
+      );
+      const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {}, sleep: async () => {} });
+      d.setPlatform("emery");
+      const err = await d.battery(31, false).then(() => null, (e: unknown) => e as Error);
+      expect(err).toBeInstanceOf(Error);
+      expect(err!.message).not.toMatch(/Traceback|libpebble2/);
+      expect(err!.message).toMatch(/starting up/i);
+      const batteryCalls = run.mock.calls.filter((c) => (c[1] as string[]).includes("emu-battery")).length;
+      expect(batteryCalls).toBe(BATTERY_PUSH_MAX_ATTEMPTS);
+    });
   });
 
   it("setFakeTime is a no-op that resolves when no timeShim dep is wired", async () => {

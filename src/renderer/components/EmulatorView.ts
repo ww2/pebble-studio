@@ -1311,49 +1311,14 @@ export class EmulatorView {
     // so a "loads then crashes" sequence shows the boot + the crash together).
     this.logEvent("live", "● Live");
 
-    // Activate Pebble Health on boot BEFORE installing user apps, so a misbehaving/
-    // crashing watchface can never prevent health activation (health is a system-level
-    // BlobDB pref and doesn't need any app installed). Awaited so the BlobDB write
-    // lands on the fresh, healthy emulator before any user app runs.
-    //
-    // The modern boards (emery/gabbro/flint) ALSO need this runtime activation — the
-    // modern PebbleOS firmware ships with Health tracking OFF by default
-    // (ACTIVITY_DEFAULT_PREFERENCES.tracking_enabled = false), so the Health app shows
-    // "Enable Pebble Health" until we insert the activityPreferences pref. They always
-    // activate; the "Activate Pebble Health on boot" toggle only governs the legacy boards.
-    //
-    // A single attempt at "Live" frequently RACES the bridge: pypkjs's websocket can lag
-    // the live signal by a few seconds on a fresh/retried boot, so the first activation
-    // returns a null status (connected-but-no-ack) and Health stays off. The BlobDB
-    // insert is idempotent, so we retry until it actually lands (r.ok) within a bounded
-    // window — this is the fix for "Health says enable on emery after a normal boot".
-    const MODERN_HEALTH_BOARDS = new Set<PlatformId>(["emery", "gabbro", "flint"]);
-    const healthOnBoot =
-      (this.currentPlatform != null && MODERN_HEALTH_BOARDS.has(this.currentPlatform)) ||
-      localStorage.getItem("pebble-studio:health-activate-on-boot") !== "false";
-    if (healthOnBoot) {
-      const HEALTH_BOOT_ATTEMPTS = 8;
-      const HEALTH_BOOT_RETRY_MS = 1500;
-      let activated = false;
-      let lastStatus: number | null = null;
-      for (let attempt = 0; attempt < HEALTH_BOOT_ATTEMPTS && !activated; attempt++) {
-        try {
-          const r = await window.studio.activateHealth();
-          lastStatus = r.status;
-          if (r.ok) { activated = true; break; }
-        } catch (e) {
-          console.warn("[health] activate failed", e);
-        }
-        // Wait for the bridge to finish coming up before the next idempotent retry.
-        if (attempt < HEALTH_BOOT_ATTEMPTS - 1) {
-          await new Promise<void>((res) => setTimeout(res, HEALTH_BOOT_RETRY_MS));
-        }
-      }
-      if (activated) this.logEvent("live", "● Pebble Health activated");
-      else if (lastStatus != null) this.logEvent("info", `Pebble Health activation returned status ${lastStatus}`);
-      else this.logEvent("info", "Pebble Health: activation not confirmed (bridge never became ready)");
-    }
-    // Re-install library apps after boot so a platform switch picks them up.
+    // Install library apps FIRST so the user's watchface appears on screen as
+    // soon as possible after "Live" — `pebble install` launches the app it pushes.
+    // Health activation used to run BEFORE this and AWAIT a retry loop of up to
+    // ~10s, which delayed the watchface (and let its bridge traffic crowd out the
+    // install's auto-launch, so the watch sat on the launcher and the user had to
+    // open the watchface by hand). Health is a system-level BlobDB pref that needs
+    // no app installed, so it can safely follow the install and run in the
+    // background without blocking the watchface.
     try {
       await window.studio.libInstallAll();
     } catch (err) {
@@ -1362,6 +1327,53 @@ export class EmulatorView {
     // The loaded-app set just changed — tell the App Library to refresh its
     // "N loaded" count + pills (it only otherwise refreshes on a drop/pick).
     window.dispatchEvent(new Event("pebble-studio:apps-changed"));
+
+    // Activate Pebble Health in the BACKGROUND (not awaited) so it never delays
+    // the watchface. The modern boards (emery/gabbro/flint) ALSO need this runtime
+    // activation — modern PebbleOS ships Health tracking OFF by default
+    // (ACTIVITY_DEFAULT_PREFERENCES.tracking_enabled = false), so the Health app
+    // shows "Enable Pebble Health" until we insert the activityPreferences pref.
+    // They always activate; the "Activate Pebble Health on boot" toggle only
+    // governs the legacy boards.
+    const MODERN_HEALTH_BOARDS = new Set<PlatformId>(["emery", "gabbro", "flint"]);
+    const healthOnBoot =
+      (this.currentPlatform != null && MODERN_HEALTH_BOARDS.has(this.currentPlatform)) ||
+      localStorage.getItem("pebble-studio:health-activate-on-boot") !== "false";
+    if (healthOnBoot) void this.activateHealthOnBoot(gen);
+  }
+
+  /**
+   * Idempotently activate Pebble Health after a boot, retrying until it lands.
+   * Runs in the BACKGROUND (callers must NOT await it) so it never delays the
+   * watchface. `window.studio.activateHealth()` already retries internally with a
+   * fast, early-exit loop (~3s worst case per call); a single bridge-not-ready
+   * miss can still happen on a slow boot, so we make a few spaced attempts. Bails
+   * the moment the boot is superseded (force-close / relaunch) so a stale boot
+   * never writes to the new emulator.
+   */
+  private async activateHealthOnBoot(gen: number): Promise<void> {
+    const HEALTH_BOOT_ATTEMPTS = 4;
+    const HEALTH_BOOT_RETRY_MS = 1500;
+    let lastStatus: number | null = null;
+    for (let attempt = 0; attempt < HEALTH_BOOT_ATTEMPTS; attempt++) {
+      if (gen !== this.bootGen || this.state !== "live") return; // superseded — stop
+      try {
+        const r = await window.studio.activateHealth();
+        lastStatus = r.status;
+        if (r.ok) {
+          this.logEvent("live", "● Pebble Health activated");
+          return;
+        }
+      } catch (e) {
+        console.warn("[health] activate failed", e);
+      }
+      if (attempt < HEALTH_BOOT_ATTEMPTS - 1) {
+        await new Promise<void>((res) => setTimeout(res, HEALTH_BOOT_RETRY_MS));
+      }
+    }
+    if (gen !== this.bootGen) return;
+    if (lastStatus != null) this.logEvent("info", `Pebble Health activation returned status ${lastStatus}`);
+    else this.logEvent("info", "Pebble Health: activation not confirmed (bridge never became ready)");
   }
 
   /** Whether the emulator is currently live (VNC connected). Injected into
@@ -1426,6 +1438,9 @@ export class EmulatorView {
     } catch (err) {
       console.warn("[emu] stop() during relaunch failed (ignored):", err);
     }
+    // Backend cleared "loaded" on stop — clear the pills now; the reboot's
+    // libInstallAll will repopulate them once the apps re-install.
+    window.dispatchEvent(new Event("pebble-studio:apps-changed"));
     await this.boot(id);
   }
 
@@ -1464,6 +1479,9 @@ export class EmulatorView {
     this.status.classList.remove("emu-status--live");
     this.status.classList.remove("emu-status--dead");
     this.updateLifecycleButtons();
+    // The backend cleared its "loaded" set in teardown — refresh the App Library
+    // so the "● loaded" pills disappear now that nothing is running.
+    window.dispatchEvent(new Event("pebble-studio:apps-changed"));
   }
 
   /** Disconnect VNC without stopping the backend. */

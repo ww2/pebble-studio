@@ -68,6 +68,17 @@ export const HEALTH_ACTIVATE_MAX_ATTEMPTS = 8;
 export const HEALTH_ACTIVATE_RETRY_MS = 400;
 export const HEALTH_ACTIVATE_READY_MS = 1200;
 
+/**
+ * Battery pushes (`pebble emu-battery`) open a libpebble2 connection that calls
+ * fetch_watch_info() on connect; on first boot the pypkjs bridge + watch-protocol
+ * handshake lags the "Live" signal (see bridgeMonitor's startup grace) and that
+ * connect times out (libpebble2 TimeoutError) → the CLI exits nonzero and `exec`
+ * rethrows the raw Python traceback. Like health activation, we retry across the
+ * settling window and surface a short, friendly message instead of the traceback.
+ */
+export const BATTERY_PUSH_MAX_ATTEMPTS = 5;
+export const BATTERY_PUSH_RETRY_MS = 600;
+
 /** Pure retry decision for one activation attempt. Exported for testing. */
 export function healthRetryDecision(
   status: number | null,
@@ -182,7 +193,26 @@ export class WindowsNativeDriver implements BackendDriver {
 
   async timeFormat(hour24: boolean): Promise<void> { return this.inner.timeFormat(hour24); }
   async bluetooth(connected: boolean): Promise<void> { return this.inner.bluetooth(connected); }
-  async battery(percent: number, charging: boolean): Promise<void> { return this.inner.battery(percent, charging); }
+  async battery(percent: number, charging: boolean): Promise<void> {
+    // Retry past the first-boot bridge-readiness race (see BATTERY_PUSH_* above):
+    // emu-battery's connect can time out for a few seconds after "Live" while the
+    // pypkjs bridge/watch handshake settles, exactly as health activation does.
+    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < BATTERY_PUSH_MAX_ATTEMPTS; attempt++) {
+      try {
+        await this.inner.battery(percent, charging);
+        return;
+      } catch (e) {
+        lastErr = e;
+        if (attempt < BATTERY_PUSH_MAX_ATTEMPTS - 1) await sleep(BATTERY_PUSH_RETRY_MS);
+      }
+    }
+    // Keep the raw cause for the logs, but never surface the libpebble2 traceback
+    // to the user — the SettingsPane shows the thrown message verbatim.
+    console.warn(`[battery] push failed after ${BATTERY_PUSH_MAX_ATTEMPTS} attempts: ${String(lastErr)}`);
+    throw new Error("Couldn't reach the watch — it may still be starting up. Try setting the battery again in a moment.");
+  }
 
   async activateHealth(): Promise<HealthActivateResult> {
     const h = this.deps.timeHelper;

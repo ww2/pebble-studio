@@ -18,6 +18,7 @@ import { winHostPaths } from "./backend/hostPaths.js";
 import { readPypkjsPort } from "./backend/winInputChannel.js";
 import { defaultCtx } from "./backend/winRuntime.js";
 import { ensureWinSdkProvisioned } from "./backend/winSdkProvision.js";
+import { currentSdkInfo, installCustomSdk, resetToBundledSdk } from "./backend/sdkController.js";
 import { readSimEnv, writeSimEnv } from "./backend/simEnv.js";
 import { clearWeatherCacheArgv, refreshWeatherAfterSimChange } from "./backend/weatherCacheRefresh.js";
 import { spawnRunner } from "./backend/spawnRunner.js";
@@ -55,11 +56,12 @@ let currentBootToken: BootToken | null = null;
 let captureDir: string | null = null;
 
 /**
- * The set of .pbw paths currently installed on the emulator's on-disk data dir.
- * Populated when install succeeds; cleared ONLY on a real wipe (loaded:clear).
- * A plain stop/kill preserves installed apps on disk, so it must NOT clear this.
- * Known limitation: a fresh app process starts with an empty set even if apps
- * persist on disk from a previous run (no cross-process persistence by design).
+ * The set of .pbw paths currently LOADED on the running emulator. Populated as
+ * installs succeed; reset to empty whenever the emulator stops, is force-closed,
+ * relaunches, or is wiped (teardownEmulator + loaded:clear) — a watch that isn't
+ * running has nothing loaded, so the App Library's "● loaded" pills clear with
+ * it. Repopulated by the renderer's libInstallAll on the next boot. (The .pbw
+ * files themselves stay on disk across a stop; this tracks live-load status only.)
  */
 const loaded = new Set<string>();
 
@@ -207,6 +209,11 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     time.stop();
     bridgeMonitor.stop();
     if (currentBootToken) currentBootToken.cancelled = true;
+    // Reset the "loaded" status: a stopped/force-closed emulator is running
+    // nothing, so the App Library's "● loaded" pills must clear. The set is
+    // repopulated by the renderer's libInstallAll on the next boot. (Apps stay
+    // on disk; this tracks what's loaded on a LIVE watch, which is now none.)
+    loaded.clear();
     try { await driver?.stop(); } catch { /* may already be stopped */ }
   };
 
@@ -606,6 +613,37 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
       throw new Error(`capture dir does not exist or is not a directory: ${dir}`);
     }
     captureDir = path.resolve(dir);
+  });
+
+  // ── Pebble SDK management (native-Windows) ───────────────────────────────
+  // Report / replace / reset the SDK pebble-tool resolves via SDKs\current. An
+  // uploaded SDK is "Replace & persist": it survives relaunches via the
+  // .active-sdk override marker until the user uploads another or resets.
+  const sdkProgress = (msg: string): void => {
+    console.log(`[sdk] ${msg}`);
+    getMainWindow()?.webContents.send("emu:boot-progress", msg);
+  };
+  ipcMain.handle("sdk:info", async () => {
+    return currentSdkInfo(await defaultCtx());
+  });
+  ipcMain.handle("sdk:install", async () => {
+    const result = await dialog.showOpenDialog({
+      title: "Select a Pebble SDK (archive or folder)",
+      properties: ["openFile"],
+      filters: [
+        { name: "Pebble SDK archive", extensions: ["bz2", "tbz2", "gz", "tgz", "tar", "zip"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    // Installing a new SDK changes what the NEXT boot resolves; if an emulator is
+    // live, tear it down first so it isn't left on the old SDK mid-swap.
+    if (emuLive) await teardownEmulator();
+    return installCustomSdk(await defaultCtx(), result.filePaths[0], { run: spawnRunner, onProgress: sdkProgress });
+  });
+  ipcMain.handle("sdk:reset", async () => {
+    if (emuLive) await teardownEmulator();
+    return resetToBundledSdk(await defaultCtx(), { onProgress: sdkProgress });
   });
 
   ipcMain.handle("capture:nextName", async (_e, base: string, ext: "png" | "gif") => {

@@ -11,15 +11,30 @@ export function renderChangelogSections(
  * In-app "What's New / Changelog" modal. Built lazily; opened from the Help menu.
  * Reuses theme tokens. Close via the ✕, backdrop click, or Esc.
  */
+export interface ChangelogSdkInfo {
+  version: string;
+  source: "custom" | "bundled";
+  fullLauncher: boolean;
+}
+
 export class ChangelogModal {
   private overlay: HTMLElement | null = null;
   private onKey: ((e: KeyboardEvent) => void) | null = null;
 
-  constructor(private readonly version: () => Promise<string>) {}
+  constructor(
+    private readonly version: () => Promise<string>,
+    /** Optional: the active Pebble SDK, shown beneath the app version. Re-queried
+     * each open, so it reflects the latest upload/reset. */
+    private readonly sdkInfo?: () => Promise<ChangelogSdkInfo>,
+  ) {}
 
   async open(): Promise<void> {
     if (this.overlay) return;
     const v = await this.version().catch(() => "");
+    const sdk = this.sdkInfo ? await this.sdkInfo().catch(() => null) : null;
+    const sdkLine = sdk
+      ? `<div class="cl-sdk type-caption">SDK ${escapeHtml(sdk.version)} · ${sdk.source === "custom" ? "custom" : "bundled"}</div>`
+      : "";
     const overlay = document.createElement("div");
     overlay.className = "cl-overlay";
     overlay.innerHTML = `
@@ -29,6 +44,7 @@ export class ChangelogModal {
           <div class="cl-title">
             <div class="type-body-strong">Pebble Studio</div>
             <div class="cl-version">v${escapeHtml(v)}</div>
+            ${sdkLine}
           </div>
           <button class="cl-close" type="button" aria-label="Close">✕</button>
         </div>

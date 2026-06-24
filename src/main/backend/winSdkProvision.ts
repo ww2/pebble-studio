@@ -95,6 +95,47 @@ export function isSdkCoreManifestValid(raw: string, expectVersion: string): bool
   }
 }
 
+/**
+ * Parse an sdk-core manifest WITHOUT knowing the version in advance (used when
+ * locating an uploaded SDK). Returns its declared version when the manifest is a
+ * well-formed sdk-core with a version-shaped string; null otherwise. PURE.
+ */
+export function parseSdkCoreManifest(raw: string): { version: string } | null {
+  try {
+    const o = JSON.parse(raw) as { type?: unknown; version?: unknown };
+    if (o?.type === "sdk-core" && typeof o?.version === "string" && VERSION_RE.test(o.version)) {
+      return { version: o.version };
+    }
+  } catch {
+    /* not JSON / not sdk-core */
+  }
+  return null;
+}
+
+/**
+ * Marker file naming the user-installed ("Replace & persist") SDK that overrides
+ * the bundled one. Lives at `<persistSdkRoot>\.active-sdk` and holds just the
+ * version string. Absent ⇒ use the bundled SDK (default).
+ */
+export const ACTIVE_SDK_MARKER = ".active-sdk";
+
+/**
+ * Read + validate the user SDK override. Returns the version when the marker
+ * names a version whose persist-side `sdk-core\manifest.json` validates; null
+ * otherwise — a missing, stale, or corrupt override silently falls back to the
+ * bundled SDK, so a bad upload can never wedge boot. PURE (uses injected fs).
+ */
+export async function readActiveSdkOverride(
+  fs: ProvisionFs,
+  persistSdkRoot: string,
+): Promise<string | null> {
+  const version = (await fs.readText(winPath.join(persistSdkRoot, ACTIVE_SDK_MARKER))).trim();
+  if (!version || !VERSION_RE.test(version)) return null;
+  const manifest = winPath.join(persistSdkRoot, "SDKs", version, "sdk-core", "manifest.json");
+  if (!isSdkCoreManifestValid(await fs.readText(manifest), version)) return null;
+  return version;
+}
+
 /** All resolved paths involved in provisioning a given version. PURE. */
 export interface WinSdkPaths {
   version: string;
@@ -333,7 +374,15 @@ export async function provisionWinSdk(
 
   const bundleRoot = sdkBundleRoot(ctx);
   const bundleSdksDir = winPath.join(bundleRoot, "SDKs");
-  const version = pickSdkVersion(await fs.list(bundleSdksDir));
+  // A valid user-installed SDK ("Replace & persist") wins over the bundled one.
+  // Its sdk-core already lives in the persist dir (the upload put it there), so
+  // the copy/keymaps steps below see a valid target and no-op, the junction
+  // points `current` at it, and the bundle-keyed firmware refresh is skipped
+  // (the override version has no bundle source). A missing/corrupt override
+  // falls back to the bundled version, so a bad upload can't wedge boot.
+  const persistSdkRoot = winPath.join(pebbleDataDir(ctx), "pebble-sdk");
+  const override = await readActiveSdkOverride(fs, persistSdkRoot);
+  const version = override ?? pickSdkVersion(await fs.list(bundleSdksDir));
   if (!version) {
     throw new Error(`no SDK version found in bundle at ${bundleSdksDir}`);
   }
