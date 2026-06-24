@@ -19,6 +19,8 @@ export const CHANGELOG: ChangelogEntry[] = [
     "The emulator's background processes now show up as \"PebbleStudioEmu\" in Task Manager instead of a generic \"python\".",
     "New option (Settings → Captures → \"Sunlight correction on live view\") applies Pebble's sunlight colour correction to the live emulator screen, matching what you already get in screenshots and GIFs. Off by default.",
     "New option (Settings → Advanced → \"Show emulator logs\") streams the watch app logs (pebble install --logs) in a collapsible panel under the emulator, with a Copy button. Off by default.",
+    "Watch buttons now respond from the very first press after boot — earlier builds could drop the first couple of presses while the input helper was still starting up.",
+    "Pebble Health now activates reliably on the newer boards (Pebble Time 2, Pebble Round 2, Pebble 2 Duo): boot activation retries until it lands instead of giving up when the phone bridge is still connecting, so the Health app no longer occasionally shows \"Enable Pebble Health\" after a normal boot.",
   ]},
   { version: "3.0.1", date: "2026-06-17", changes: [
     "Battery simulation: set a custom battery percentage and charging state on the running watch from Settings → Battery. Works on every board. The \"Set battery\" button glows when you have changes you haven't applied yet. Your chosen level now sticks across a reboot — changing the weather, clearing the emulator, or switching watches no longer reverts it to the board default.",
