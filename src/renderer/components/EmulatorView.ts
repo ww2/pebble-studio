@@ -1316,26 +1316,42 @@ export class EmulatorView {
     // BlobDB pref and doesn't need any app installed). Awaited so the BlobDB write
     // lands on the fresh, healthy emulator before any user app runs.
     //
-    // The modern boards (emery/gabbro/flint) always get health on — they ship with it
-    // enabled by default; the "Activate Pebble Health on boot" toggle only governs the
-    // legacy boards whose stock firmware relies on this runtime injection.
+    // The modern boards (emery/gabbro/flint) ALSO need this runtime activation — the
+    // modern PebbleOS firmware ships with Health tracking OFF by default
+    // (ACTIVITY_DEFAULT_PREFERENCES.tracking_enabled = false), so the Health app shows
+    // "Enable Pebble Health" until we insert the activityPreferences pref. They always
+    // activate; the "Activate Pebble Health on boot" toggle only governs the legacy boards.
+    //
+    // A single attempt at "Live" frequently RACES the bridge: pypkjs's websocket can lag
+    // the live signal by a few seconds on a fresh/retried boot, so the first activation
+    // returns a null status (connected-but-no-ack) and Health stays off. The BlobDB
+    // insert is idempotent, so we retry until it actually lands (r.ok) within a bounded
+    // window — this is the fix for "Health says enable on emery after a normal boot".
     const MODERN_HEALTH_BOARDS = new Set<PlatformId>(["emery", "gabbro", "flint"]);
     const healthOnBoot =
       (this.currentPlatform != null && MODERN_HEALTH_BOARDS.has(this.currentPlatform)) ||
       localStorage.getItem("pebble-studio:health-activate-on-boot") !== "false";
     if (healthOnBoot) {
-      try {
-        const r = await window.studio.activateHealth();
-        if (r.ok) this.logEvent("live", "● Pebble Health activated");
-        // A real (non-success) status code is worth surfacing; a null status means
-        // the runtime probe couldn't confirm (state file / pypkjs not reachable in
-        // time) — NOT that Health is off, since the modern boards ship with it on and
-        // the legacy boards have it seeded in firmware. Don't cry "not activated".
-        else if (r.status != null) this.logEvent("info", `Pebble Health activation returned status ${r.status}`);
-        else this.logEvent("info", "Pebble Health: activation not confirmed (may already be enabled on this board)");
-      } catch (e) {
-        console.warn("[health] activate failed", e);
+      const HEALTH_BOOT_ATTEMPTS = 8;
+      const HEALTH_BOOT_RETRY_MS = 1500;
+      let activated = false;
+      let lastStatus: number | null = null;
+      for (let attempt = 0; attempt < HEALTH_BOOT_ATTEMPTS && !activated; attempt++) {
+        try {
+          const r = await window.studio.activateHealth();
+          lastStatus = r.status;
+          if (r.ok) { activated = true; break; }
+        } catch (e) {
+          console.warn("[health] activate failed", e);
+        }
+        // Wait for the bridge to finish coming up before the next idempotent retry.
+        if (attempt < HEALTH_BOOT_ATTEMPTS - 1) {
+          await new Promise<void>((res) => setTimeout(res, HEALTH_BOOT_RETRY_MS));
+        }
       }
+      if (activated) this.logEvent("live", "● Pebble Health activated");
+      else if (lastStatus != null) this.logEvent("info", `Pebble Health activation returned status ${lastStatus}`);
+      else this.logEvent("info", "Pebble Health: activation not confirmed (bridge never became ready)");
     }
     // Re-install library apps after boot so a platform switch picks them up.
     try {

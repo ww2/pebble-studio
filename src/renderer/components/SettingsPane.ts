@@ -835,7 +835,7 @@ export class SettingsPane {
     healthHeading.textContent = "Health";
     const healthRow = this.makeSwitchRow(
       "Activate Pebble Health on boot (legacy boards)",
-      "Auto-enables Pebble Health on the legacy boards (Pebble Classic, Pebble Time, Pebble Time Round, Pebble 2) so health-dependent watchfaces work. The newer boards (Pebble Time 2, Pebble Round 2, Pebble 2 Duo) have Pebble Health on by default, so this toggle doesn't affect them. Default on.",
+      "Auto-enables Pebble Health on the legacy boards (Pebble Classic, Pebble Time, Pebble Time Round, Pebble 2) so health-dependent watchfaces work. The newer boards (Pebble Time 2, Pebble Round 2, Pebble 2 Duo) ship with Health OFF and are always auto-activated on boot regardless of this toggle, so it doesn't affect them. Default on.",
       localStorage.getItem(HEALTH_BOOT_KEY) !== "false", // default ON
       (on) => localStorage.setItem(HEALTH_BOOT_KEY, on ? "true" : "false"),
     );
