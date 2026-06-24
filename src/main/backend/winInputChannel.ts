@@ -102,6 +102,18 @@ export class WinInputChannel {
     this.spawnChild = deps.spawnChild ?? defaultSpawnChild;
   }
 
+  /**
+   * Pre-spawn the helper for the current pypkjs port so the FIRST user button
+   * press doesn't pay the ~300–700ms python-start + websocket-connect warmup —
+   * during that window the helper isn't relaying yet, so early presses are lost
+   * ("need a few presses to get it going"). Called once right after boot. Best-
+   * effort + idempotent: returns true if a helper is live/spawning, false if the
+   * emulator isn't booted yet (the next real press will warm it, as before).
+   */
+  warm(): boolean {
+    return this.ensure();
+  }
+
   /** Ensure a live helper exists for the CURRENT pypkjs port; (re)spawn if needed. */
   private ensure(): boolean {
     const port = this.deps.readPort();

@@ -45,6 +45,27 @@ describe("WinInputChannel", () => {
     expect(fake.writes).toEqual(["click select\n"]);
   });
 
+  it("warm() pre-spawns the helper for the current port (so the first press is instant)", () => {
+    const fake = makeFakeChild();
+    const spawnChild = vi.fn(() => fake.child);
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild });
+
+    expect(ch.warm()).toBe(true);
+    expect(spawnChild).toHaveBeenCalledTimes(1);
+    expect(spawnChild).toHaveBeenCalledWith("py.exe", ["C:/h/pb-input-helper.py", "5555"]);
+    // A subsequent press reuses the warmed helper — no second spawn.
+    expect(ch.send("click select")).toBe(true);
+    expect(spawnChild).toHaveBeenCalledTimes(1);
+    expect(fake.writes).toEqual(["click select\n"]);
+  });
+
+  it("warm() is a no-op (returns false) when the emulator isn't booted yet", () => {
+    const spawnChild = vi.fn();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => null, spawnChild });
+    expect(ch.warm()).toBe(false);
+    expect(spawnChild).not.toHaveBeenCalled();
+  });
+
   it("reuses the same child across sends while the port is unchanged", () => {
     const fake = makeFakeChild();
     const spawnChild = vi.fn(() => fake.child);

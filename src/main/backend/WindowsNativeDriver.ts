@@ -118,6 +118,12 @@ export class WindowsNativeDriver implements BackendDriver {
     // callers don't depend on whatever makeWinBootDeps' boot fn returns (mirrors
     // WslDriver, where WSL2 also forwards to the Windows loopback).
     const endpoint = await this.inner.start(id, token, onStep);
+    // Pre-warm the persistent input helper now that the emulator is live and the
+    // state file holds the pypkjs port. Without this, the helper is spawned lazily
+    // on the FIRST button press and the ~300–700ms python-start + connect window
+    // swallows those early presses ("takes a few presses to get going"). Best-
+    // effort + non-blocking: never delays returning the endpoint.
+    this.deps.inputChannel?.warm();
     return { ...endpoint, host: "localhost" };
   }
 
