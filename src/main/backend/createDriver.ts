@@ -115,6 +115,27 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
     // bundled qemu; we just hand qemu the control-file path. System time writes
     // "<now> 1" to it; an absent/empty file is treated as real time by qemu.
     const ftLogPath = winQemuFakeTimeLogPath();
+    const simEnvFile = simEnvPath(ctx.userDataDir);
+
+    // ROOT FIX for the Frozen custom-time "random time" bug:
+    // pebble-tool's commands/base.py post_connect sends SetUTC(int(time.time()))
+    // on EVERY libpebble2 connect. The bundled python's sitecustomize only fakes
+    // time.time() when PEBBLE_FAKETIME_FILE is present in that process's env; any
+    // connecting child spawned WITHOUT it (the long-lived emu-control supervisor
+    // and its reconnects, future helpers) pushes the REAL host time onto the
+    // watch. At 1×/2×/… qemu re-jams the RTC from the fake clock every tick and
+    // erases that clobber; a FROZEN clock never re-jams, so the host-time SetUTC
+    // sticks on the watchface until a manual repaint (menu→back) — i.e. the
+    // displayed time goes "random". Exporting these into THIS process's env makes
+    // every inherited spawn (spawnRunner / input helper / health / emu-control)
+    // clobber-immune: their post_connect now carries the FAKE custom time. Safe
+    // for System time — its control file reads as real time, so post_connect
+    // sends real time exactly as before. (The per-command env below is kept as an
+    // explicit belt-and-suspenders for the discrete `pebble` invocations.)
+    process.env.PEBBLE_FAKETIME_FILE = ctlPath;
+    process.env.PEBBLE_FAKETIME_LOG = ftLogPath;
+    process.env.PEBBLE_SIM_ENV_FILE = simEnvFile;
+
     const pebble = (args: string[]) => {
       const c = pebbleCmd(args, ctx);
       // PEBBLE_FAKETIME_LOG: qemu records (to %TEMP%) that the control file arrived
@@ -126,7 +147,7 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
         // Path to the simulated location/weather control file, read by the bundled
         // python's sitecustomize -> pebble_studio_sim. Always set; the file's
         // presence + `enabled` flag decide whether interception is active.
-        PEBBLE_SIM_ENV_FILE: simEnvPath(ctx.userDataDir),
+        PEBBLE_SIM_ENV_FILE: simEnvFile,
       };
       return c;
     };

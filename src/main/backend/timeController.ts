@@ -5,6 +5,28 @@ export type Rate = "frozen" | "1x" | "2x" | "4x" | "10x";
 export const RATE_MULT: Record<Rate, number> = { frozen: 0, "1x": 1, "2x": 2, "4x": 4, "10x": 10 };
 
 /**
+ * The rate actually WRITTEN to qemu's control file for "Frozen" — a tiny non-zero
+ * value, NOT 0.
+ *
+ * WHY (proven live on basalt, v3.0.3-test9): an exactly-0 rate freezes the RTC
+ * dead, and the session-8 freeze-fix firmware (`rtc_alarm_get_elapsed_ticks()`
+ * falling back to the commanded wakeup duration when the RTC doesn't advance) then
+ * fires the MINUTE-tick alarm, re-arms it, and "elapses" it again instantly → a
+ * tight minute-tick loop. A STATIC watchface shows nothing (so this looked like
+ * "frozen just stops repaint"), but an animated face (e.g. JR-Shinkansen, which
+ * animates on each minute rollover) replays its animation many times per second.
+ *
+ * A tiny rate makes the RTC inch forward so the tick alarm sees real progress and
+ * never re-fires in a loop, while the user still perceives a frozen clock: at
+ * 1e-3 the displayed minute changes only once every ~16.7 h of real time. The
+ * controller keeps the LOGICAL rate at 0 (RATE_MULT.frozen) everywhere else —
+ * currentWatchUnix, the heal gate — so only the value qemu sees changes. Empirically
+ * validated static at 1e-3 and 1e-2; do NOT lower toward 0 without re-testing (too
+ * small re-enters the firmware's zero-delta fallback).
+ */
+export const QEMU_FROZEN_RATE = 1e-3;
+
+/**
  * EMULATOR TIME CONTRACT — v0.0.13 control-file model:
  *
  *   - The qemu firmware clock is continuously re-jammed from the qemu PROCESS's
@@ -135,6 +157,30 @@ export interface TimeController {
 /** How often the legacy virtual-clock pusher recomputes (it only sends on minute change). */
 const VCLOCK_TICK_MS = 1000;
 
+/**
+ * FROZEN SetUTC RE-ASSERT — delays (ms after a frozen custom apply) at which the
+ * watch time is re-pushed so the LAST SetUTC it sees is the correct custom time.
+ *
+ * WHY (verified live on emery/QEMU10): while the clock is FROZEN the watch's
+ * displayed time is whatever the most recent SetUTC carried — NOT qemu's RTC. A
+ * running clock re-jams the RTC from the fake clock every tick (self-correcting),
+ * but a frozen clock does not, so a stray SetUTC sticks and a control-file write
+ * canNOT dislodge it (tested: `- 0`, `- 1`, even a fresh absolute target leave the
+ * wedged time unchanged). The ONLY things that move it are another SetUTC or a
+ * watchface reload (menu→back). pebble-tool's post_connect sends a SetUTC on every
+ * libpebble2 connect using time.time(); the bundled python's sitecustomize fakes
+ * that to the custom time only when PEBBLE_FAKETIME_FILE is in the process env, so
+ * a connect missing it (or one landing just after our own push) can leave a stray
+ * time on the frozen face — the "custom Frozen time shows a random time" bug.
+ *
+ * The fix is to make OUR correct SetUTC the last word: re-running timeFormat()
+ * fires pebble-tool's post_connect, which (with the fake-time env now exported to
+ * every child — see createDriver.ts) re-pushes SetUTC(custom time). This was
+ * proven to recover an already-wedged frozen face. Two staggered re-asserts cover
+ * a slow/contended connect that lands after the first.
+ */
+const FROZEN_HEAL_DELAYS_MS = [1500, 3500];
+
 export function makeTimeController(
   getDriver: () => TimeDriver | null,
   deps: { now?: () => number; hostTz?: () => string } = {},
@@ -163,6 +209,14 @@ export function makeTimeController(
   let lastPushed: number | null = null;  // last offset minutes actually sent
   let timer: ReturnType<typeof setInterval> | null = null;
   let pushing = false;
+  // Pending FROZEN_HEAL_DELAYS_MS re-jam timers (see that constant). Cleared at
+  // the start of every apply() and on stop() so they never fire after a newer
+  // config is applied or after teardown.
+  let healTimers: ReturnType<typeof setTimeout>[] = [];
+  function clearHealTimers(): void {
+    for (const t of healTimers) clearTimeout(t);
+    healTimers = [];
+  }
   // In-flight guard for the apply()/reassert host-offset push. setTzOffset opens a
   // connection to the single-client pypkjs bridge; without this, a slow/contended
   // push fired on every boot/install/relaunch overlaps with the next one and they
@@ -241,6 +295,7 @@ export function makeTimeController(
    */
   async function apply(): Promise<void> {
     clearTimer();
+    clearHealTimers();
     legacyActive = false;
     const d = getDriver();
     if (!d) return;
@@ -274,9 +329,12 @@ export function makeTimeController(
       const target = isCustom ? fakeTargetUnix(cfg.customWallMs, hostTz(), now()) : null;
       const rate = isCustom ? RATE_MULT[cfg.rate] : 1;
       fakeTarget = target ?? Math.trunc(now() / 1000); // currentWatchUnix anchor: system tracks real now
-      fakeRate = rate;
+      fakeRate = rate; // LOGICAL rate (0 for frozen) — keeps currentWatchUnix truly frozen
       fakeAppliedAtMs = now();
-      try { await d.setFakeTime(target, rate); } catch { /* ignore */ }
+      // QEMU rate: substitute the tiny QEMU_FROZEN_RATE for an exactly-0 (frozen)
+      // rate so the firmware's minute-tick alarm doesn't loop (see QEMU_FROZEN_RATE).
+      const qemuRate = rate === 0 ? QEMU_FROZEN_RATE : rate;
+      try { await d.setFakeTime(target, qemuRate); } catch { /* ignore */ }
     }
     // System with no shim: nothing to write — skip.
 
@@ -287,6 +345,21 @@ export function makeTimeController(
       // host-offset push here would clobber its virtual-clock offset.
       const tzName = cfg.source === "custom" ? hostTz() : cfg.timezone;
       void pushTzOffsetGuarded(d, offsetMinutesFor(cfg, now(), hostTz()), tzName);
+    }
+
+    // FROZEN SetUTC RE-ASSERT (see FROZEN_HEAL_DELAYS_MS): only a shim-backed
+    // FROZEN custom clock needs it — running rates re-jam every tick (self-
+    // healing), and the legacy fallback drives the display via the offset pusher.
+    // Each timer re-runs timeFormat(): its post_connect re-pushes SetUTC(custom
+    // time) so OUR correct time is the last SetUTC the frozen watch sees, undoing
+    // any stray push that landed just after apply().
+    if (cfg.source === "custom" && shimReady && RATE_MULT[cfg.rate] === 0) {
+      for (const delayMs of FROZEN_HEAL_DELAYS_MS) {
+        healTimers.push(setTimeout(() => {
+          const dd = getDriver();
+          if (dd) void dd.timeFormat(cfg.hour24).catch(() => { /* emulator gone — non-fatal */ });
+        }, delayMs));
+      }
     }
   }
 
@@ -315,6 +388,6 @@ export function makeTimeController(
     currentWatchUnix(): number {
       return Math.trunc(fakeTarget + ((now() - fakeAppliedAtMs) / 1000) * fakeRate);
     },
-    stop(): void { clearTimer(); },
+    stop(): void { clearTimer(); clearHealTimers(); },
   };
 }

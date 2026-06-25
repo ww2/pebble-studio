@@ -64,6 +64,37 @@ _SUNLIGHT_SNAP = [(0,85,170,255)[min(3,(v+42)//85)] for v in range(256)]
 # the pure-input path pays nothing.
 _pebble = None
 _pebble_lock = threading.Lock()
+# We only SEND on this websocket (button/tap/pin relays), but pypkjs BROADCASTS
+# everything to every client: the watchface's constant traffic AND, on each Clay
+# gear open, a ~98KB AppConfigURL frame. If nobody reads our socket, those frames
+# back up until pypkjs's server-side send blocks — which freezes its single JS
+# runtime greenlet, so showConfiguration stops firing and Clay dies with
+# "No config page" after a couple of opens. So a background thread continuously
+# drains (reads + discards) the socket. When a framebuffer screenshot needs the
+# libpebble2 read loop, we hand the socket over (two readers would corrupt it).
+_drain_stop = threading.Event()
+
+
+def _drain_loop(transport):
+    while not _drain_stop.is_set():
+        try:
+            transport.read_packet()  # consume + discard one inbound frame
+        except Exception:
+            # WebSocketTimeoutException (idle, expected) -> keep draining;
+            # a real close -> exit so we don't spin.
+            if not transport.connected():
+                return
+
+
+def _start_drain(transport):
+    _drain_stop.clear()
+    try:
+        transport.ws.settimeout(0.5)  # so read_packet returns ~0.5s when idle
+    except Exception:
+        pass
+    t = threading.Thread(target=_drain_loop, args=(transport,))
+    t.daemon = True
+    t.start()
 
 
 def _get_pebble(transport):
@@ -73,10 +104,24 @@ def _get_pebble(transport):
     global _pebble
     with _pebble_lock:
         if _pebble is None:
-            from libpebble2.communication import PebbleConnection
-            p = PebbleConnection(transport)
-            p.run_async()  # background read loop; also fetches watch info
-            _pebble = p
+            # Stop the raw drain and let it exit (recv timeout is 0.5s) so the
+            # PebbleConnection read loop is the SOLE reader of this socket.
+            _drain_stop.set()
+            time.sleep(0.7)
+            try:
+                transport.ws.settimeout(None)  # blocking reads for the real reader
+            except Exception:
+                pass
+            try:
+                from libpebble2.communication import PebbleConnection
+                p = PebbleConnection(transport)
+                p.run_async()  # background read loop; also fetches watch info
+                _pebble = p
+            except Exception:
+                # Screenshot reader failed to start — resume draining so the
+                # socket keeps being emptied, then report the failure upward.
+                _start_drain(transport)
+                raise
         return _pebble
 
 
@@ -132,6 +177,9 @@ def main():
     port = int(sys.argv[1])
     transport = WebsocketTransport('ws://localhost:%d/' % port)
     transport.connect()
+    # Keep the inbound stream drained so a pypkjs broadcast can never block on our
+    # socket (which would wedge its JS runtime and break Clay). See _drain_loop.
+    _start_drain(transport)
 
     BTN = {'back': QemuButton.Button.Back, 'up': QemuButton.Button.Up,
            'select': QemuButton.Button.Select, 'down': QemuButton.Button.Down}

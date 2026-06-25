@@ -16,6 +16,18 @@ Covers (validated Phase 1b, 2026-06-13/14):
                      terminal windows) instead of the POSIX-only start_new_session
   10   emulator.py  - bind qemu serial/gdb/monitor/vnc + websockify to 127.0.0.1
   11   websocket.py - bind the pypkjs WSGIServer to 127.0.0.1
+  14   runtime.py   - JS event loop survives a non-JSError in a queued callback
+                     (a Clay config round-trip otherwise wedges showConfiguration
+                     => "No config page" on every later open). Logs the traceback.
+  15   websocket.py - per-socket send lock + resilient broadcast(): fixes the
+                     gevent "socket already used by another greenlet" collision
+                     between the JS-runtime config-URL broadcast and watch traffic.
+  16   websocket.py - broadcast send timeout (1.5s) = THE Clay re-open fix's safety
+                     net. A non-draining client (e.g. a mis-behaving websocket
+                     consumer) whose socket buffer fills would block ws.send
+                     forever, freezing the JS runtime => "No config page". The real
+                     fix is the input helper draining (winHelpers.ts); this drops
+                     any still-stuck client so the runtime never freezes.
 (Patches 9-11 remove the Windows Defender firewall prompts for qemu-pebble.exe and
  python.exe, and the trio of console windows, by keeping every emulator listener on
  loopback and every child windowless. readline is handled by installing pyreadline3.)
@@ -44,6 +56,7 @@ def main(sp):
     manager  = os.path.join(sp, "pebble_tool", "sdk", "manager.py")
     sdkinit  = os.path.join(sp, "pebble_tool", "sdk", "__init__.py")
     wsock    = os.path.join(sp, "pypkjs", "runner", "websocket.py")
+    runtime  = os.path.join(sp, "pypkjs", "javascript", "runtime.py")
     browser  = os.path.join(sp, "pebble_tool", "util", "browser.py")
 
     print(f"emulator.py:")
@@ -269,6 +282,128 @@ def main(sp):
          'pywsgi.WSGIServer(("", self.port)',
          'pywsgi.WSGIServer(("127.0.0.1", self.port)',
          '("127.0.0.1", self.port)'),
+        # Patch 15 (a) — make gevent.lock importable for the per-socket send lock.
+        ("websocket.py import gevent.lock",
+         "import gevent\nfrom gevent import pywsgi",
+         "import gevent\nimport gevent.lock\nfrom gevent import pywsgi",
+         "import gevent.lock"),
+        # Patch 15 (b) — THE Clay re-open root cause. broadcast() does ws.send()
+        # from whichever greenlet calls it; it is called BOTH from the JS runtime
+        # (open_config_page broadcasting a large ~98KB Clay config URL, which
+        # blocks/yields mid-send) AND from the pebble in/outbound handlers
+        # broadcasting the watchface's constant traffic. Two concurrent ws.send()
+        # on one socket raise gevent's uncaught "This socket is already used by
+        # another greenlet" AssertionError -> the config-URL broadcast aborts so
+        # Studio never receives the URL ("No config page"), and pre-patch-14 it
+        # also killed the JS runtime. A per-socket send lock serializes sends so
+        # the big config send and watch-traffic sends take turns.
+        ("websocket.py per-socket send lock",
+         "    def __init__(self, ws):\n"
+         "        self.ws = ws\n"
+         "        self.authed = False\n"
+         "\n"
+         "    def send(self, message):\n"
+         "        self.ws.send(message)\n",
+         "    def __init__(self, ws):\n"
+         "        self.ws = ws\n"
+         "        self.authed = False\n"
+         "        self._send_lock = gevent.lock.Semaphore()\n"
+         "\n"
+         "    def send(self, message):\n"
+         "        # Pebble Studio patch 15: serialize sends per socket so the JS\n"
+         "        # runtime's large Clay config-URL broadcast and the watch-traffic\n"
+         "        # broadcasts can't collide on one socket (gevent 'already used by\n"
+         "        # another greenlet'), which otherwise aborts the broadcast and\n"
+         "        # drops the Clay URL => 'No config page' on rapid re-opens.\n"
+         "        with self._send_lock:\n"
+         "            self.ws.send(message)\n",
+         "_send_lock"),
+        # Patch 15 (c) — defense in depth: one socket's send error must never
+        # abort the whole broadcast loop (so the other clients, incl. Studio's
+        # Clay socket, still get the frame) nor propagate to the caller.
+        ("websocket.py broadcast resilient",
+         "                try:\n"
+         "                    ws.send(message)\n"
+         "                except (WebSocketError, ssl.SSLError):\n"
+         "                    to_remove.append(i)\n",
+         "                try:\n"
+         "                    ws.send(message)\n"
+         "                except (WebSocketError, ssl.SSLError):\n"
+         "                    to_remove.append(i)\n"
+         "                except Exception:\n"
+         "                    # Pebble Studio patch 15: never let one socket's send\n"
+         "                    # error abort the broadcast to the others or bubble up.\n"
+         "                    to_remove.append(i)\n",
+         "never let one socket's send"),
+        # Patch 16 — bound each broadcast send with a timeout (defense in depth on
+        # top of the input helper now draining its socket — see winHelpers.ts). A
+        # client that cannot absorb a frame within 1.5s is not draining; its full
+        # socket buffer would otherwise block ws.send FOREVER, freezing pypkjs's
+        # single JS-runtime greenlet so showConfiguration stops firing => Clay
+        # "No config page" after a few opens. Drop the stuck client instead.
+        ("websocket.py broadcast send timeout",
+         "                try:\n"
+         "                    ws.send(message)\n"
+         "                except (WebSocketError, ssl.SSLError):\n"
+         "                    to_remove.append(i)\n"
+         "                except Exception:\n"
+         "                    # Pebble Studio patch 15: never let one socket's send\n"
+         "                    # error abort the broadcast to the others or bubble up.\n"
+         "                    to_remove.append(i)\n",
+         "                try:\n"
+         "                    with gevent.Timeout(1.5):\n"
+         "                        ws.send(message)\n"
+         "                except gevent.Timeout:\n"
+         "                    # Patch 16: client can't absorb this frame in 1.5s =>\n"
+         "                    # not draining; a blocked send freezes the JS runtime\n"
+         "                    # greenlet and wedges Clay. Drop the stuck client.\n"
+         "                    try:\n"
+         "                        ws.close()\n"
+         "                    except Exception:\n"
+         "                        pass\n"
+         "                    to_remove.append(i)\n"
+         "                except (WebSocketError, ssl.SSLError):\n"
+         "                    to_remove.append(i)\n"
+         "                except Exception:\n"
+         "                    # Pebble Studio patch 15: never let one socket's send\n"
+         "                    # error abort the broadcast to the others or bubble up.\n"
+         "                    to_remove.append(i)\n",
+         "with gevent.Timeout(1.5)"),
+    ])
+
+    print(f"pypkjs/javascript/runtime.py:")
+    # Patch 14 — JS event-loop resilience. event_loop() only caught
+    # (v8.JSError, JSRuntimeException) per queued callback; ANY other exception
+    # (e.g. a Clay config round-trip raising a Python/struct/gevent error) broke
+    # the for-loop, ran run()'s finally (shutdown + group.kill -> "JS finished"),
+    # and left self.js pointing at a DEAD queue. do_config() then enqueued
+    # showConfiguration into nothing => no openURL => no AppConfigURL broadcast =>
+    # Studio timed out with "No config page" on EVERY subsequent open until the
+    # app's JS was relaunched. (Matches the user's "works 1-2x, then consistently
+    # fails on rapid Clay re-opens".) Catch broad exceptions, log the traceback
+    # (broadcast as a 0x02 log frame so it's visible), and keep servicing the
+    # queue. GreenletExit/LoopExit are NOT Exception subclasses raised by fn(),
+    # so stop()/kill() and the outer LoopExit handler still work unchanged.
+    patch_file(runtime, [
+        ("runtime.py event_loop resilience",
+         '                try:\n'
+         '                    fn(*args, **kwargs)\n'
+         '                except (v8.JSError, JSRuntimeException) as e:\n'
+         '                    self.log_output("Error running asynchronous JavaScript:")\n'
+         '                    self.log_output(e.stackTrace)\n',
+         '                try:\n'
+         '                    fn(*args, **kwargs)\n'
+         '                except (v8.JSError, JSRuntimeException) as e:\n'
+         '                    self.log_output("Error running asynchronous JavaScript:")\n'
+         '                    self.log_output(e.stackTrace)\n'
+         '                except Exception:\n'
+         '                    # Pebble Studio (win port) patch 14: a non-JS error in a\n'
+         '                    # queued callback must NOT kill the runtime (that wedges\n'
+         '                    # Clay/showConfiguration -> "No config page" forever).\n'
+         '                    import traceback as _pbtb\n'
+         '                    self.log_output("Unhandled exception in JS event loop (continuing):")\n'
+         '                    self.log_output(_pbtb.format_exc())\n',
+         "Unhandled exception in JS event loop"),
     ])
 
     print("util/browser.py:")

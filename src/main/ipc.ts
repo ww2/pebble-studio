@@ -10,6 +10,7 @@ import { EMU_INFO_PATH } from "./backend/hostPaths.js";
 import { openClayWindow, parsePhonesimPort } from "./clayWindow.js";
 import { createBacklightController, parseMonitorPort } from "./backend/backlight.js";
 import { makeTimeController, isNonSystemTime, detectHostTimezone, type TimeConfig } from "./backend/timeController.js";
+import { installWithBridgeRetry } from "./backend/installRetry.js";
 import { makeBatteryController } from "./backend/batteryController.js";
 import { makeBridgeMonitor } from "./backend/bridgeMonitor.js";
 import { buildHealthCommand, interpretHealth } from "./backend/bridgeHealth.js";
@@ -184,9 +185,18 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
    * emulator already running"). We drop the log stream for the duration, then
    * resume it WITHOUT clearing the buffer so captured lines survive the op.
    */
+  // After killing the log stream, pypkjs needs a beat to release that client's
+  // bridge slot before the paused op (install/health) connects — otherwise the op
+  // can hit the "emulator already running" cap-reject. This short settle only runs
+  // when a stream was actually active; the install retry (installWithBridgeRetry)
+  // remains the real safety net if the slot is still busy after it.
+  const BRIDGE_SLOT_SETTLE_MS = 250;
   const withAppLogPaused = async <T>(fn: () => Promise<T>): Promise<T> => {
     const wasRunning = logHandle != null;
-    if (wasRunning) stopAppLog();
+    if (wasRunning) {
+      stopAppLog();
+      await new Promise<void>((resolve) => setTimeout(resolve, BRIDGE_SLOT_SETTLE_MS));
+    }
     try {
       return await fn();
     } finally {
@@ -270,7 +280,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   ipcMain.handle("lib:installAll", async () => {
     await withAppLogPaused(async () => {
       for (const p of library.list()) {
-        await driver!.install(p);
+        await installWithBridgeRetry(() => driver!.install(p));
         loaded.add(p);
       }
     });
@@ -470,7 +480,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
         },
         reinstall: async () => {
           await withAppLogPaused(async () => {
-            for (const p of library.list()) { await driver!.install(p); loaded.add(p); }
+            for (const p of library.list()) { await installWithBridgeRetry(() => driver!.install(p)); loaded.add(p); }
           });
           // Re-assert the chosen battery level so a weather change doesn't revert it
           // to the firmware default. Before reassertTime() because emu-battery's
@@ -487,7 +497,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     }
   });
   ipcMain.handle("emu:install", async (_e, pbwPath: string) => {
-    await withAppLogPaused(() => driver!.install(pbwPath));
+    await withAppLogPaused(() => installWithBridgeRetry(() => driver!.install(pbwPath)));
     loaded.add(pbwPath);
     reassertTime();
   });

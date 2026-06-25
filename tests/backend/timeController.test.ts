@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   tzOffsetMinutes, offsetMinutesFor, fakeTargetUnix, detectHostTimezone, makeTimeController,
-  OFFSET_MAX_MINUTES, DEFAULT_TIME_CONFIG, isNonSystemTime, type TimeConfig,
+  OFFSET_MAX_MINUTES, DEFAULT_TIME_CONFIG, isNonSystemTime, QEMU_FROZEN_RATE, type TimeConfig,
 } from "../../src/main/backend/timeController.js";
 
 // A fixed winter instant (no US DST): 2026-01-15T12:00:00Z — LA is PST (−480).
@@ -103,7 +103,8 @@ describe("makeTimeController — shim-backed (primary path)", () => {
     await tc.setConfig(cfg({ source: "custom", rate: "frozen", customWallMs: wall, hour24: true }));
     expect(d.fmts).toEqual([true]);
     expect(d.tz).toEqual([[-480, HOST]]);
-    expect(d.fake).toEqual([[fakeTargetUnix(wall, HOST, t0), 0]]);
+    // Frozen writes the tiny QEMU_FROZEN_RATE (not 0) — see that constant.
+    expect(d.fake).toEqual([[fakeTargetUnix(wall, HOST, t0), QEMU_FROZEN_RATE]]);
     expect(d.ensureCalls).toBe(1); // awaited exactly once per apply
     tc.stop();
   });
@@ -122,7 +123,7 @@ describe("makeTimeController — shim-backed (primary path)", () => {
     // setConfig MUST resolve promptly even though both pypkjs calls hang forever;
     // the connection-free control-file write is what custom time actually needs.
     await tc.setConfig(cfg({ source: "custom", rate: "frozen", customWallMs: wall }));
-    expect(fake).toEqual([[fakeTargetUnix(wall, HOST, t0), 0]]);
+    expect(fake).toEqual([[fakeTargetUnix(wall, HOST, t0), QEMU_FROZEN_RATE]]);
     tc.stop();
   });
 
@@ -278,6 +279,42 @@ describe("makeTimeController — legacy fallback (shim unavailable)", () => {
     t += 10 * 60_000;
     await vi.advanceTimersByTimeAsync(5000);
     expect(d.tz.length).toBe(count);
+    tc.stop();
+  });
+});
+
+describe("custom frozen avoids the qemu rate-0 firmware minute-tick loop", () => {
+  // Writing an exactly-0 rate to qemu makes the freeze-fix firmware fire MINUTE
+  // ticks in a tight loop (rtc_alarm_get_elapsed_ticks falls back to the commanded
+  // duration when the RTC doesn't advance), so animated watchfaces replay their
+  // minute-change animation many times/sec. A tiny non-zero rate gives the alarm
+  // forward progress while the watch stays visually frozen (minute changes only
+  // every several hours of real time). Proven live on basalt (v3.0.3-test9).
+  const t0 = WINTER.getTime();
+  const deps = { now: () => t0, hostTz: () => HOST };
+
+  it("writes a tiny non-zero rate (QEMU_FROZEN_RATE), never 0, to the control file", async () => {
+    const d = fakeDriver();
+    const tc = makeTimeController(() => d, deps);
+    const wall = t0 + 3600_000;
+    await tc.setConfig(cfg({ source: "custom", rate: "frozen", customWallMs: wall }));
+    const [tgt, rate] = d.fake[d.fake.length - 1];
+    expect(tgt).toBe(fakeTargetUnix(wall, HOST, t0));
+    expect(rate).toBe(QEMU_FROZEN_RATE);
+    expect(rate).toBeGreaterThan(0);   // 0 is the bug — loops the firmware tick alarm
+    expect(rate).toBeLessThan(0.01);   // small enough to stay visually frozen
+    tc.stop();
+  });
+
+  it("keeps the watch's LOGICAL time frozen despite the tiny qemu rate", async () => {
+    let nowMs = t0;
+    const d = fakeDriver();
+    const tc = makeTimeController(() => d, { now: () => nowMs, hostTz: () => HOST });
+    const wall = t0 + 3600_000;
+    await tc.setConfig(cfg({ source: "custom", rate: "frozen", customWallMs: wall }));
+    const target = fakeTargetUnix(wall, HOST, t0);
+    nowMs = t0 + 600_000; // 10 real minutes later
+    expect(tc.currentWatchUnix()).toBe(target); // unchanged — frozen for sample-pin timing
     tc.stop();
   });
 });
