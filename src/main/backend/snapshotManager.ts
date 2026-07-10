@@ -22,9 +22,8 @@
  * disk, no sockets, and no real qemu.
  *
  * Safety contract:
- *  - Gated by board: only {@link SNAPSHOT_BOARDS} (the STM32 family, whose device
- *    vmstate is proven to restore) ever get a bundle. Adding an M33 board later is
- *    a one-line change to that set.
+ *  - Gated by board: only {@link SNAPSHOT_BOARDS} (boards whose device vmstate
+ *    is proven to restore on the patched exe) ever get a bundle.
  *  - Kill switch: PEBBLE_STUDIO_NO_SNAPSHOT=1 makes every entry point a no-op.
  *  - Creation NEVER throws to its caller and always cleans up a partial bundle.
  *  - Restore is transparent: a missing/stale/corrupt bundle => cold boot, and a
@@ -46,17 +45,22 @@ import { connect as netConnect } from "node:net";
 import type { PlatformId } from "../../shared/types.js";
 
 /**
- * Boards eligible for snapshot restore. Initially the STM32 (Cortex-M4/M3) family
- * — aplite/basalt/chalk/diorite — whose peripheral + TIM vmstate the patched exe
- * saves/restores correctly (proven live on basalt; the others share the same
- * device models). The Cortex-M33 boards (emery/gabbro/flint) are excluded until
- * their restore paints reliably; adding one here is the only change needed.
+ * Boards eligible for snapshot restore. The STM32 (Cortex-M4/M3) family —
+ * aplite/basalt/chalk/diorite — was proven first (live on basalt; the others
+ * share the same device models). The M33/generic family — emery/gabbro/flint —
+ * was enabled after the qemu-pebble-m33-vmstate patch round verified all three
+ * live (restore running +0.5s, frame +0.5–0.6s, minute ticks + buttons, stable
+ * 150s+, faketime intact). M33 bundles are ~35 MB because the extflash storage
+ * buffer is migrated (writes only hit the backing file on SYNC).
  */
 export const SNAPSHOT_BOARDS: ReadonlySet<PlatformId> = new Set<PlatformId>([
   "aplite",
   "basalt",
   "chalk",
   "diorite",
+  "emery",
+  "gabbro",
+  "flint",
 ]);
 
 /** The env kill-switch checked at every creation/restore entry point. */

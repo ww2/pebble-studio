@@ -152,9 +152,10 @@ describe("SnapshotManager.bundleFor validation", () => {
     expect(b).toEqual({ migr: winPath.join(dir, "vm.migr"), spi: winPath.join(dir, "spi.bin") });
   });
 
-  it("returns null (no cleanup) for an ineligible M33 board", async () => {
+  it("returns null (no cleanup) for a board outside SNAPSHOT_BOARDS", async () => {
     const mgr = new SnapshotManager(ctxDeps(fs, fakeMonitor()));
-    expect(await mgr.bundleFor("emery")).toBeNull();
+    // All current boards are eligible; the gate still protects future/unknown ids.
+    expect(await mgr.bundleFor("futureboard" as PlatformId)).toBeNull();
   });
 
   it("returns null when the kill switch is set", async () => {
@@ -273,10 +274,10 @@ describe("SnapshotManager.createAfterLive", () => {
     expect(await fs.exists(snapshotBundleDir(PERSIST, VER, BOARD))).toBe(false);
   });
 
-  it("is a no-op for an ineligible board (no monitor connect)", async () => {
+  it("is a no-op for a board outside SNAPSHOT_BOARDS (no monitor connect)", async () => {
     const mon = fakeMonitor();
     const mgr = new SnapshotManager(ctxDeps(fs, mon));
-    await mgr.createAfterLive("emery", 5555);
+    await mgr.createAfterLive("futureboard" as PlatformId, 5555);
     expect(mon.connectCount).toBe(0);
   });
 

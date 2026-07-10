@@ -15,7 +15,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   // WSL-connected track. 2.0.1 is the first native release. 3.0.0 is the first
   // public open-source release.
   { version: "3.0.5", date: "2026-07-10", changes: [
-    "The emulator now launches almost instantly on the classic watches (Pebble Classic, Pebble Time, Pebble Time Round, Pebble 2): Pebble Studio keeps a ready-to-run snapshot of a booted watch and restores it instead of booting from scratch, and warm-starts your last-used watch in the background so it's already prepared when you open Studio. The boot pipeline is faster overall on every board.",
+    "The emulator now launches almost instantly on every watch model: Pebble Studio keeps a ready-to-run snapshot of a booted watch and restores it instead of booting from scratch, and warm-starts your last-used watch in the background so it's already prepared when you open Studio. The boot pipeline is faster overall on every board. (The first launch of each watch after this update boots normally once while its snapshot is created.)",
     "Language packs: install a different watch language from an official catalog on the supported boards, or sideload your own .pbl language pack (Settings → Language). Your chosen language sticks across launches.",
   ]},
   { version: "3.0.4", date: "2026-07-09", changes: [
