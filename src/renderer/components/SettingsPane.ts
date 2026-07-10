@@ -76,7 +76,7 @@ const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
 const AUTO_RELAUNCH_KEY = "pebble-studio:auto-relaunch";
 const EMU_LOGS_KEY = "pebble-studio:emu-logs";
 /** Warm-standby pre-boot on app start (Task 5). main.ts reads this to decide
- * whether to pass a `prebootBoard` to initBackend. Default ON. */
+ * whether to pass a `prebootBoard` to initBackend. Default OFF (opt-in). */
 const PREBOOT_STARTUP_KEY = "pebble-studio:preboot-startup";
 
 const TIME_SOURCE_KEY = "pebble-studio:time-source";
@@ -428,11 +428,11 @@ export class SettingsPane {
     // Pre-boot on app start (Task 5): warm-boot the startup watch in the
     // background right after launch so the first Launch attaches near-instantly.
     // main.ts reads PREBOOT_STARTUP_KEY at startup and passes the board to
-    // initBackend when this is on. Default ON.
+    // initBackend when this is on. Default OFF (opt-in).
     const prebootRow = this.makeSwitchRow(
       "Pre-boot emulator on app start",
-      "Start the last-used watch booting in the background as soon as the app opens, so your first Launch is near-instant. Turn off to save resources until you launch.",
-      localStorage.getItem(PREBOOT_STARTUP_KEY) !== "false", // default ON
+      "Start the last-used watch booting in the background as soon as the app opens, so your first Launch is near-instant. Off by default; turn on for instant first launches.",
+      localStorage.getItem(PREBOOT_STARTUP_KEY) === "true", // default OFF (opt-in)
       (on) => localStorage.setItem(PREBOOT_STARTUP_KEY, on ? "true" : "false"),
     );
 
