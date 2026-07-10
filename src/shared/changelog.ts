@@ -14,6 +14,10 @@ export const CHANGELOG: ChangelogEntry[] = [
   // The 2.x line is the native-Windows track (no WSL); the 1.x line is the
   // WSL-connected track. 2.0.1 is the first native release. 3.0.0 is the first
   // public open-source release.
+  { version: "3.0.5", date: "2026-07-10", changes: [
+    "The emulator now launches almost instantly on the classic watches (Pebble Classic, Pebble Time, Pebble Time Round, Pebble 2): Pebble Studio keeps a ready-to-run snapshot of a booted watch and restores it instead of booting from scratch, and warm-starts your last-used watch in the background so it's already prepared when you open Studio. The boot pipeline is faster overall on every board.",
+    "Language packs: install a different watch language from an official catalog on the supported boards, or sideload your own .pbl language pack (Settings → Language). Your chosen language sticks across launches.",
+  ]},
   { version: "3.0.4", date: "2026-07-09", changes: [
     "Fixed: Pebble Studio could get permanently stuck on \"Killing stale emulator…\" / \"Stopping…\" (seen on Pebble Round 2), and even fully restarting Studio wouldn't clear it. An emulator left over from a previous session could survive every shutdown attempt: Studio's force-kill used a Windows command whose process-tree scan times out when the machine is busy (for example a watchface pegging the CPU), so it silently failed and the old emulator kept holding the ports a new one needs. Studio now terminates emulator processes directly — which can't time out that way — and keeps retrying until the ports are actually free.",
     "Pebble Studio now clears any leftover emulator processes from a previous session at startup, so relaunching reliably gives you a clean slate even if the last session crashed or was force-closed.",
