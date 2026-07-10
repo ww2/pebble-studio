@@ -473,6 +473,77 @@ describe("bootEmulator retry-once", () => {
   });
 });
 
+describe("bootEmulator pre-spawn probes run concurrently", () => {
+  /** Minimal external-resolvable deferred (no library) for overlap assertions. */
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+  const DEAD_PROBE = { qemuAlive: false, stateFile: false, rfbOpen: false, wsOpen: false };
+
+  it("starts diagnose AND preflight before either resolves (overlap, not sequential)", async () => {
+    let diagnoseStarted = false;
+    let preflightStarted = false;
+    const diagD = deferred<typeof DEAD_PROBE>();
+    const preD = deferred<void>();
+
+    const boot = bootEmulator("basalt", {
+      killAll: async () => {},
+      ensureKeymap: async () => {},
+      bootControl: async () => {},
+      waitForEmuInfo: async () => {},
+      waitForPort: async () => {},
+      diagnose: () => { diagnoseStarted = true; return diagD.promise; },
+      preflight: () => { preflightStarted = true; return preD.promise; },
+    });
+
+    // Let the boot reach the probe stage and start BOTH probes. Neither deferred
+    // has resolved yet, so a SEQUENTIAL impl (await diagnose, then preflight) would
+    // still be blocked inside diagnose and never have started preflight.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(diagnoseStarted).toBe(true);
+    expect(preflightStarted).toBe(true);
+
+    // Release both; the boot completes.
+    diagD.resolve(DEAD_PROBE);
+    preD.resolve();
+    await expect(boot).resolves.toEqual({ host: "localhost", port: 6080, wsPath: "/" });
+  });
+
+  it("probe wall-clock ≈ max(diagnose, preflight), not their sum", async () => {
+    const SLEEP = 120;
+    const start = Date.now();
+    await bootEmulator("basalt", {
+      killAll: async () => {},
+      ensureKeymap: async () => {},
+      bootControl: async () => {},
+      waitForEmuInfo: async () => {},
+      waitForPort: async () => {},
+      diagnose: async () => { await new Promise((r) => setTimeout(r, SLEEP)); return DEAD_PROBE; },
+      preflight: async () => { await new Promise((r) => setTimeout(r, SLEEP)); },
+    });
+    const elapsed = Date.now() - start;
+    // Parallel ⇒ ~one SLEEP; sequential ⇒ ~two. Ceiling well below the sum.
+    expect(elapsed).toBeLessThan(SLEEP * 1.8);
+  });
+
+  it("still surfaces a foreign-port preflight error (propagates, not swallowed)", async () => {
+    await expect(
+      bootEmulator("basalt", {
+        killAll: async () => {},
+        ensureKeymap: async () => {},
+        bootControl: async () => {},
+        waitForEmuInfo: async () => {},
+        waitForPort: async () => {},
+        diagnose: async () => DEAD_PROBE,
+        preflight: async () => { throw new Error("Emulator port 5901 is already in use by another process — likely a WSL Pebble emulator or a second Pebble Studio instance. Close it, then try again."); },
+      }),
+    ).rejects.toThrow(/already in use by another process/);
+  });
+});
+
 describe("bootControl wrapper routing (PEBBLE_QEMU_PATH)", () => {
   beforeEach(() => {
     calls.length = 0;

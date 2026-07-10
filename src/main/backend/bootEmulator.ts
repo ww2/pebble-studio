@@ -612,21 +612,25 @@ export async function bootEmulator(
   // 1. Tear down any prior emulator so we own a clean stack.
   step("Killing stale emulator…");
   await d.killAll();
-  // Probe right after teardown: if RFB:5901 / ws:6080 are STILL open here, a
-  // stale listener survived the kill and the fresh qemu will die on
-  // "address already in use" — the classic stuck-boot cause. Surface it.
-  try {
-    const after = await d.diagnose();
-    step(`Stale stack cleared · ${fmtProbe(after)}`);
-  } catch { /* probe is best-effort */ }
-  // 1b. Fail-fast preflight (native): if a FOREIGN process still holds the VNC/ws
-  // ports after our teardown, abort now with a clear error rather than letting the
-  // fresh qemu die on "address already in use" three attempts in a row. Runs once,
-  // before the retry loop; a throw here propagates straight out (not retried).
-  if (d.preflight) {
-    step("Checking emulator ports…");
-    await d.preflight();
-  }
+  // 1b. Post-teardown probes, run CONCURRENTLY (single Promise.all). Both do
+  // bounded (~1s) port connects, so overlapping them makes probe wall-clock ≈ max
+  // not sum:
+  //   - diagnose: best-effort health snapshot. If RFB:5901 / ws:6080 are STILL
+  //     open here, a stale listener survived the kill and the fresh qemu will die
+  //     on "address already in use" — the classic stuck-boot cause; we surface it
+  //     as a note. Its failure is swallowed (diagnostics only).
+  //   - preflight (native/win only; omitted on POSIX/WSL): if a FOREIGN process
+  //     still holds the VNC/ws ports after our teardown, abort now with a clear
+  //     error rather than letting the fresh qemu die three attempts in a row. Runs
+  //     once, before the retry loop; a throw here propagates straight out (not
+  //     retried) — Promise.all rejects with it while the diagnose note stays
+  //     best-effort (its own catch keeps it from ever rejecting the group).
+  if (d.preflight) step("Checking emulator ports…");
+  const diagnoseNote = d.diagnose().then(
+    (after) => { step(`Stale stack cleared · ${fmtProbe(after)}`); },
+    () => { /* probe is best-effort */ },
+  );
+  await Promise.all([diagnoseNote, d.preflight ? d.preflight() : Promise.resolve()]);
   // 2. Make the tool's VNC keymap path valid.
   step("Preparing keymap…");
   await d.ensureKeymap();
