@@ -24,7 +24,7 @@
  */
 
 import { win32 as winPath } from "node:path";
-import { readFile, writeFile, copyFile, mkdir, stat } from "node:fs/promises";
+import { readFile, writeFile, copyFile, mkdir, stat, rename } from "node:fs/promises";
 import type { RunResult } from "./BackendDriver.js";
 import { spawnRunner } from "./spawnRunner.js";
 
@@ -51,7 +51,12 @@ const HTTP_TIMEOUT_MS = 10_000;
 const HELPER_TIMEOUT_MS = 15_000;
 
 /** Install retry — mirrors HEALTH_ACTIVATE_* (activateHealth): the pypkjs bridge
- * lags "Live" for a few seconds after boot, so retry connection-class failures. */
+ * lags "Live" for a few seconds after boot, so retry connection-class failures.
+ * Worst case with a WEDGED (accepting-but-dead) bridge: each attempt burns the
+ * helper's ~12s self-watchdog before failing, so 8 attempts ≈ 100s total — unlike
+ * activateHealth's fast/slow-miss decision. Acceptable because installs run off
+ * the boot critical path (reassertOnLive is fire-and-forget) and the common
+ * failure (connection refused before the bridge binds) fails in milliseconds. */
 const INSTALL_MAX_ATTEMPTS = 8;
 const INSTALL_RETRY_MS = 400;
 
@@ -124,6 +129,8 @@ export interface LangFs {
   /** File size, or null when the path is missing. */
   stat(p: string): Promise<{ size: number } | null>;
   exists(p: string): Promise<boolean>;
+  /** Atomic move (replace an existing destination) — temp-file commit step. */
+  rename(src: string, dst: string): Promise<void>;
 }
 
 /** Minimal fetch surface (Node's global fetch Response satisfies it structurally). */
@@ -249,6 +256,7 @@ export function realLangFs(): LangFs {
     mkdirp: async (dir) => { await mkdir(dir, { recursive: true }); },
     stat: async (p) => stat(p).then((s) => ({ size: s.size })).catch(() => null),
     exists: async (p) => stat(p).then(() => true).catch(() => false),
+    rename: async (src, dst) => { await rename(src, dst); },
   };
 }
 
@@ -331,20 +339,41 @@ export function makeLanguageController(deps: LanguageControllerDeps): LanguageCo
   // -- install ---------------------------------------------------------------
 
   /** Resolve a PackRef to a local `.pbl` path, downloading a catalog pack (once)
-   * into `<userData>\lang-packs\<board>\` when needed. */
+   * into `<userData>\lang-packs\<board>\` when needed.
+   *
+   * A downloaded body is HEADER-VALIDATED before it is committed (temp file →
+   * validate → rename into place), and an already-present file is only trusted if
+   * it ALSO passes the header check. Without both, a 200 response with a
+   * truncated/HTML body (captive portal, CDN error page) would be cached forever
+   * by the size>0 skip — every later install would push garbage to the watch and
+   * surface the misleading NACK firmware/flash hint, with no way to re-fetch. */
   async function resolveLocalPack(board: string, pack: PackRef): Promise<string> {
     if (pack.source === "sideload") return pack.path;
     const { entry } = pack;
     const boardDir = winPath.join(langPacksDir, board);
     const dst = winPath.join(boardDir, baseName(entry.file));
     const existing = await fs.stat(dst);
-    if (existing && existing.size > 0) return dst; // already downloaded
+    if (existing && existing.size > 0) {
+      // Trust the cached download only if it still looks like a pbpack; a bad
+      // earlier write (or manual tampering) falls through to a re-download.
+      const cached = await fs.readFile(dst).catch(() => null);
+      if (cached && validatePbpackHeader(cached)) return dst;
+    }
     const url = /^https?:\/\//i.test(entry.file) ? entry.file : new URL(entry.file, REBBLE_ORIGIN).toString();
     const res = await withTimeout((signal) => doFetch(url, { signal }), HTTP_TIMEOUT_MS);
     if (!res.ok) throw new Error(`Couldn't download the language pack (HTTP ${res.status}).`);
     const bytes = Buffer.from(await res.arrayBuffer());
+    if (!validatePbpackHeader(bytes)) {
+      // Do NOT write the bad body — leave nothing on disk so the next attempt
+      // re-downloads. Distinct message from NACK_HINT: the watch never saw this.
+      throw new Error("The downloaded language pack was corrupt or invalid — please try again.");
+    }
     await fs.mkdirp(boardDir).catch(() => {});
-    await fs.writeFile(dst, bytes);
+    // Temp-write + rename so a crash mid-write can't leave a torn file that the
+    // size>0 check above would half-trust.
+    const tmp = `${dst}.download`;
+    await fs.writeFile(tmp, bytes);
+    await fs.rename(tmp, dst);
     return dst;
   }
 
@@ -414,7 +443,11 @@ export function makeLanguageController(deps: LanguageControllerDeps): LanguageCo
 
   async function writeSelections(map: Record<string, Selection>): Promise<void> {
     await fs.mkdirp(langPacksDir).catch(() => {});
-    await fs.writeText(selectionsPath, JSON.stringify(map, null, 2));
+    // Temp-write + rename: a crash mid-write must not corrupt selections.json
+    // (readSelections would silently treat a torn file as "no selections").
+    const tmp = `${selectionsPath}.tmp`;
+    await fs.writeText(tmp, JSON.stringify(map, null, 2));
+    await fs.rename(tmp, selectionsPath);
   }
 
   async function selection(board: string): Promise<Selection | null> {

@@ -51,6 +51,12 @@ function memFs(seed: Record<string, Buffer | string> = {}): {
       return b ? { size: b.length } : null;
     },
     exists: async (p) => files.has(p),
+    rename: async (src, dst) => {
+      const b = files.get(src);
+      if (!b) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      files.delete(src);
+      files.set(dst, b);
+    },
   };
   return { fs, files };
 }
@@ -259,19 +265,52 @@ describe("installPack", () => {
     expect(spawn).toHaveBeenCalledTimes(8); // INSTALL_MAX_ATTEMPTS
   });
 
-  it("downloads a catalog pack once before installing, skipping re-download", async () => {
+  const deEntry = { source: "catalog" as const, entry: { isoLocal: "de_DE", name: "German", localName: "Deutsch", version: 12, file: "https://lp.rebble.io/packs/de.pbl" } };
+  const dePath = winPath.join(USER, "lang-packs", "basalt", "de.pbl");
+
+  it("downloads a catalog pack once — a second install reuses the VALID cached file", async () => {
     const fetchFn = vi.fn<FetchFn>(async () => bytesResponse(Buffer.from([0x13, 0, 0, 0, 9, 9, 9, 9])));
     const spawn = helperSpawn([{ code: 0, stdout: okLine("de_DE"), stderr: "" }]);
     const { ctl, fs } = make({
       fetchFn,
       spawn: spawn as unknown as LanguageControllerDeps["spawn"],
     });
-    const entry = { source: "catalog" as const, entry: { isoLocal: "de_DE", name: "German", localName: "Deutsch", version: 12, file: "https://lp.rebble.io/packs/de.pbl" } };
-    const r = await ctl.installPack("basalt", entry);
+    const r = await ctl.installPack("basalt", deEntry);
     expect(r.language).toBe("de_DE");
     expect(fetchFn).toHaveBeenCalledOnce();
-    const dst = winPath.join(USER, "lang-packs", "basalt", "de.pbl");
-    expect(await fs.exists(dst)).toBe(true);
+    expect(await fs.exists(dePath)).toBe(true);
+    // No leftover temp file from the atomic download commit.
+    expect(await fs.exists(`${dePath}.download`)).toBe(false);
+    // Second install: the valid cached file is reused — NO second download.
+    const r2 = await ctl.installPack("basalt", deEntry);
+    expect(r2.language).toBe("de_DE");
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a corrupt download body (HTML/truncated) WITHOUT caching it, with a clear error (not the NACK hint)", async () => {
+    const fetchFn = vi.fn<FetchFn>(async () => bytesResponse(Buffer.from("<html>captive portal</html>", "utf8")));
+    const spawn = vi.fn();
+    const { ctl, fs } = make({ fetchFn, spawn: spawn as unknown as LanguageControllerDeps["spawn"] });
+    await expect(ctl.installPack("basalt", deEntry)).rejects.toThrow(/corrupt or invalid/);
+    await expect(ctl.installPack("basalt", deEntry)).rejects.not.toThrow(NACK_HINT);
+    // Nothing was committed to disk — the bad body must not poison future installs.
+    expect(await fs.exists(dePath)).toBe(false);
+    expect(await fs.exists(`${dePath}.download`)).toBe(false);
+    // The helper was never spawned with a garbage pack.
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("re-downloads when the existing cached file is invalid (self-heals a poisoned cache)", async () => {
+    const { fs, files } = memFs({ [dePath]: Buffer.from("<html>old bad cache</html>", "utf8") });
+    const good = Buffer.from([0x13, 0, 0, 0, 7, 7, 7, 7]);
+    const fetchFn = vi.fn<FetchFn>(async () => bytesResponse(good));
+    const spawn = helperSpawn([{ code: 0, stdout: okLine("de_DE"), stderr: "" }]);
+    const { ctl } = make({ fs, fetchFn, spawn: spawn as unknown as LanguageControllerDeps["spawn"] });
+    const r = await ctl.installPack("basalt", deEntry);
+    expect(r.language).toBe("de_DE");
+    expect(fetchFn).toHaveBeenCalledOnce(); // invalid cache → re-download
+    expect(files.get(dePath)).toEqual(good); // replaced with the valid bytes
   });
 });
 
