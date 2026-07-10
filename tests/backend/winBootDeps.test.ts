@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { EventEmitter } from "node:events";
-import { makeWinBootDeps, tasklistPids } from "../../src/main/backend/winBootDeps.js";
+import { makeWinBootDeps, tasklistPids, anythingAlive } from "../../src/main/backend/winBootDeps.js";
 
 /** Minimal stand-in for a spawned child process (stdout + close/error + kill). */
 function fakeChild() {
@@ -227,11 +227,73 @@ describe("makeWinBootDeps killAll — process-leak fix", () => {
       pebble,
       run: vi.fn(async (cmd: string, args: string[]) => { calls.push({ cmd, args }); return { code: 0, stdout: "", stderr: "" }; }),
       readFile: vi.fn(async () => ""),
+      // A live image makes the fast-path gate report "alive", so the graceful
+      // `pebble kill` still fires (this test asserts the graceful-first ordering).
+      pidsByImage: vi.fn(async (img: string) => (img === "qemu-pebble.exe" ? [4242] : [])),
       rm: vi.fn(async () => {}),
       portOpen: vi.fn(async () => false),
     });
     await makeWinBootDeps(d).killAll();
     expect(calls.some((c) => c.cmd === "C:\\py\\python.exe" && c.args.includes("kill"))).toBe(true);
+  });
+
+  it("FAST PATH: skips the graceful pebble kill spawn when nothing is alive", async () => {
+    // No state file, no images running, both ports free → nothing to gracefully
+    // kill, so we must NOT pay the bundled-interpreter spawn cost for `pebble kill`.
+    const d = deps({
+      readFile: vi.fn(async () => ""),
+      pidsByImage: vi.fn(async () => [] as number[]),
+      rm: vi.fn(async () => {}),
+      portOpen: vi.fn(async () => false),
+    });
+    await makeWinBootDeps(d).killAll();
+    // Graceful kill (any argv containing "kill" through the runner) never spawned.
+    expect(d.run.mock.calls.some(([, args]: [string, string[]]) => args?.includes("kill"))).toBe(false);
+    // The unconditional force-reap still ran (state file cleared).
+    expect(d.rm).toHaveBeenCalled();
+  });
+
+  it("still force-reaps (sweep + settle) when a port is occupied but no pids are found", async () => {
+    // A foreign owner (e.g. WSL emulator) holds the port with none of OUR pids.
+    // The gate reads "alive" (port busy), so graceful kill fires, AND the reap
+    // sweep + settle still run unconditionally.
+    const d = deps({
+      readFile: vi.fn(async () => ""),
+      pidsByImage: vi.fn(async () => [] as number[]),
+      rm: vi.fn(async () => {}),
+      portOpen: vi.fn(async () => true),
+    });
+    await makeWinBootDeps(d).killAll();
+    expect(d.run.mock.calls.some(([, args]: [string, string[]]) => args?.includes("kill"))).toBe(true);
+    expect(d.pidsByImage).toHaveBeenCalled(); // sweep enumerated our images
+    expect(d.rm).toHaveBeenCalled();
+  });
+});
+
+describe("anythingAlive — killAll fast-path gate", () => {
+  const base = {
+    readState: async () => "",
+    pidsByImage: async (_img: string) => [] as number[],
+    portOpen: async (_h: string, _p: number) => false,
+  };
+  it("false when there are no state pids, no image pids, and both ports are free", async () => {
+    expect(await anythingAlive({ ...base })).toBe(false);
+  });
+  it("true when the state file names a pid", async () => {
+    const readState = async () => JSON.stringify({ emery: { "4.9": { qemu: { pid: 1001 } } } });
+    expect(await anythingAlive({ ...base, readState })).toBe(true);
+  });
+  it("true when one of our images is running", async () => {
+    const pidsByImage = async (img: string) => (img === "qemu-pebble.exe" ? [123] : []);
+    expect(await anythingAlive({ ...base, pidsByImage })).toBe(true);
+  });
+  it("true when the ws port (6080) is occupied", async () => {
+    const portOpen = async (_h: string, p: number) => p === 6080;
+    expect(await anythingAlive({ ...base, portOpen })).toBe(true);
+  });
+  it("true when the RFB port (5901) is occupied", async () => {
+    const portOpen = async (_h: string, p: number) => p === 5901;
+    expect(await anythingAlive({ ...base, portOpen })).toBe(true);
   });
 });
 

@@ -175,6 +175,42 @@ function portOpen(host: string, port: number): Promise<boolean> {
   });
 }
 
+/** Probes for {@link anythingAlive} — the SAME injectable probes killAll/reap use. */
+export interface AliveProbeDeps {
+  /** Read the emulator state file as utf8 ("" if missing). */
+  readState: () => Promise<string>;
+  /** Enumerate the pids of one of OUR images (bounded tasklist). */
+  pidsByImage: (image: string) => Promise<number[]>;
+  /** Probe whether a TCP port is open. */
+  portOpen: (host: string, port: number) => Promise<boolean>;
+}
+
+/**
+ * Best-effort "is any of our emulator stack alive?" — true iff one of OUR images
+ * is running, OR the state file names a pid, OR either fixed port (5901/6080) is
+ * occupied. Cheap gate for killAll's FAST PATH: when everything reads dead we skip
+ * the graceful `pebble kill` bundled-interpreter spawn (~0.3–1s wasted per boot
+ * with nothing running). It reuses ONLY the probes killAll/reap already perform.
+ *
+ * Correctness is NOT critical: a false "alive" costs one harmless graceful kill; a
+ * false "dead" still gets force-reaped by killSweep afterward. Short-circuits —
+ * pids first (cheap image/state check), and only probes ports if still unknown, so
+ * it adds no port I/O on the common "already have pids" path.
+ */
+export async function anythingAlive(deps: AliveProbeDeps): Promise<boolean> {
+  const [stateRaw, perImage] = await Promise.all([
+    deps.readState(),
+    Promise.all(EMU_IMAGES.map((img) => deps.pidsByImage(img))),
+  ]);
+  if (perImage.some((pids) => pids.length > 0)) return true;
+  if (parseStatePids(stateRaw).length > 0) return true;
+  const [rfb, ws] = await Promise.all([
+    deps.portOpen("127.0.0.1", VNC_RFB_PORT),
+    deps.portOpen("127.0.0.1", WS_PORT),
+  ]);
+  return rfb || ws;
+}
+
 function stateHasLivePid(json: string, id: PlatformId): boolean {
   try {
     const o = JSON.parse(json) as Record<string, Record<string, { qemu?: { pid?: number } }>>;
@@ -331,11 +367,22 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps & { reap: () =
 
   const killAll = async (): Promise<void> => {
     // 1. Ask pebble-tool to kill the emulator FIRST (graceful supervisor
-    //    shutdown). BOUNDED: under load the bundled-interpreter spawn can be slow,
-    //    and a hung `pebble kill` used to wedge teardown on "stopping…"; we never
-    //    wait more than PEBBLE_KILL_TIMEOUT_MS for it. Best-effort, non-fatal.
-    const k = pebble(["kill"]);
-    await withTimeout(run(k.cmd, k.args, k.env), PEBBLE_KILL_TIMEOUT_MS).catch(() => {});
+    //    shutdown) — but ONLY when something is actually alive. FAST PATH: a fresh
+    //    boot with no prior emulator has nothing to gracefully kill, so spawning
+    //    the bundled interpreter for a no-op `pebble kill` just wastes ~0.3–1s.
+    //    When anythingAlive reads dead we skip straight to the (idempotent) reap.
+    //    BOUNDED: under load the bundled-interpreter spawn can be slow, and a hung
+    //    `pebble kill` used to wedge teardown on "stopping…"; we never wait more
+    //    than PEBBLE_KILL_TIMEOUT_MS for it. Best-effort, non-fatal.
+    const alive = await anythingAlive({
+      readState: () => readFile(paths.emuInfo),
+      pidsByImage,
+      portOpen: checkPortOpen,
+    });
+    if (alive) {
+      const k = pebble(["kill"]);
+      await withTimeout(run(k.cmd, k.args, k.env), PEBBLE_KILL_TIMEOUT_MS).catch(() => {});
+    }
     // 2. Force-kill OUR stack via direct TerminateProcess (NOT taskkill /T, whose
     //    tree-walk times out and silently fails under load — the orphan bug) and
     //    settle the ports with re-sweep retry.
