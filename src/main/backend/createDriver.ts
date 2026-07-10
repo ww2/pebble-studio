@@ -1,4 +1,5 @@
 import { access } from "node:fs/promises";
+import { closeSync, openSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { spawnRunner } from "./spawnRunner.js";
 import { selectDriverKind, type ProbeResult, type DriverKind } from "./driverFactory.js";
@@ -112,8 +113,10 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
     // launcher.exe, no AV-blockable CreateRemoteThread.
     const ctlPath = winFakeTimeCtlPath();
     // The pebble invocation: pebbleCmd already points PEBBLE_QEMU_PATH at the
-    // bundled qemu; we just hand qemu the control-file path. System time writes
-    // "<now> 1" to it; an absent/empty file is treated as real time by qemu.
+    // bundled qemu; we just hand qemu the control-file path. A live switch to System
+    // writes an absolute "<now> 1"; the file is also reset to "- 1" at each boot
+    // (WindowsNativeDriver.start) so a fresh qemu reads "-" as real time. An
+    // absent/empty file is likewise treated as real time by qemu.
     const ftLogPath = winQemuFakeTimeLogPath();
     const simEnvFile = simEnvPath(ctx.userDataDir);
 
@@ -161,8 +164,19 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
     // on Windows a non-detached child also outlives the parent (no cascade
     // kill), and teardown is by PID via killAll. unref() keeps Node's event
     // loop from waiting on it. (Job Object assignment is a later increment.)
+    //
+    // The supervisor's output is redirected to EMU_LOG_PATH (truncated per boot,
+    // mirroring the POSIX path's `>` redirect) so a failed boot can be mined for
+    // the real qemu-launch error by readBootLog/extractBootErrors; with
+    // stdio:"ignore" nothing wrote that file and the diagnostic never fired.
     const detachSpawn = async (cmd: string, args: string[], env?: Record<string, string>): Promise<void> => {
-      const child = spawn(cmd, args, { windowsHide: true, stdio: "ignore", env: { ...process.env, ...env } });
+      let logFd: number | undefined;
+      try { logFd = openSync(winHostPaths().emuLog, "w"); } catch { /* diagnostics are best-effort */ }
+      const stdio = logFd === undefined
+        ? (["ignore", "ignore", "ignore"] as const)
+        : (["ignore", logFd, logFd] as const);
+      const child = spawn(cmd, args, { windowsHide: true, stdio: [...stdio], env: { ...process.env, ...env } });
+      if (logFd !== undefined) { try { closeSync(logFd); } catch { /* child owns it now */ } }
       child.unref();
       child.on("error", () => { /* readiness is checked via ports/state file */ });
     };
@@ -181,8 +195,11 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
       pebble,
       boot: (id, token, onStep) => bootEmulator(id, winDeps, token, onStep),
       stop: () => stopEmulator({ killAll: winDeps.killAll }),
+      // Startup orphan reaper (no graceful pebble kill) — backend:init calls this
+      // before enabling Launch to self-heal a prior session's leftover stack.
+      reap: () => winDeps.reap(),
       inputChannel,
-      timeShim: { ctlPath },
+      timeShim: { ctlPath, ftLogPath },
     });
   } else if (kind === "native") {
     driver = new NativeDriver({ run: spawnRunner }); // native default boot/stop

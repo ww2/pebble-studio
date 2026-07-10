@@ -27,12 +27,23 @@ const devStaged: WinRuntimeCtx = {
   exists: () => true,
 };
 
-/** A dev context where vendor bundles are NOT yet staged (use C:\tmp fallbacks). */
+/** A dev context where vendor bundles are NOT staged and NO dev-dir opt-in is set:
+ * the python bundle must resolve to the (absent) vendor path — never a fallback. */
 const devUnstaged: WinRuntimeCtx = {
   packaged: false,
   resourcesPath: "C:\\ignored",
   repoRoot: "C:\\repo",
   userDataDir: "C:\\data",
+  exists: () => false,
+};
+
+/** Dev, vendor not staged, but the developer opted in via PEBBLE_STUDIO_PY_DEV_DIR. */
+const devOptIn: WinRuntimeCtx = {
+  packaged: false,
+  resourcesPath: "C:\\ignored",
+  repoRoot: "C:\\repo",
+  userDataDir: "C:\\data",
+  pyDevDir: "C:\\tmp\\pebble-py-build\\python",
   exists: () => false,
 };
 
@@ -61,8 +72,12 @@ describe("winRuntime path resolution", () => {
     expect(sdkBundleRoot(devStaged)).toBe("C:\\repo\\vendor\\pebble-sdk");
   });
 
-  it("falls back to the C:\\tmp build location for the python bundle in dev when unstaged", () => {
-    expect(pebblePyExe(devUnstaged)).toBe("C:\\tmp\\pebble-py-build\\python\\PebbleStudioEmu.exe");
+  it("does NOT fall back to any dev dir when unstaged and no opt-in is set (returns the absent vendor path)", () => {
+    expect(pebblePyExe(devUnstaged)).toBe("C:\\repo\\vendor\\pebble-py\\PebbleStudioEmu.exe");
+  });
+
+  it("uses the opt-in dev dir (PEBBLE_STUDIO_PY_DEV_DIR) for the python bundle when unstaged", () => {
+    expect(pebblePyExe(devOptIn)).toBe("C:\\tmp\\pebble-py-build\\python\\PebbleStudioEmu.exe");
   });
 
   it("pebbleDataDir is the writable app-data persist root under userData", () => {

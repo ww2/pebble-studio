@@ -132,6 +132,27 @@ describe("WindowsNativeDriver", () => {
       expect(await d.ensureTimeShim()).toBe(true);
     });
 
+    it("resets the control file to '- 1' at BOOT (before qemu realizes) and truncates the diagnostic log", async () => {
+      const ctlPath = join(tmpdir(), `pb-faketime-boot-${process.pid}.ctl`);
+      const ftLogPath = join(tmpdir(), `pb-qemu-ft-boot-${process.pid}.log`);
+      // Seed a stale custom target + a fat log from a prior session.
+      const { writeFile } = await import("node:fs/promises");
+      await writeFile(ctlPath, "1577836800 0.001");
+      await writeFile(ftLogPath, "x".repeat(5000));
+      const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+      const d = new WindowsNativeDriver({
+        run, boot: async () => ep, stop: async () => {},
+        timeShim: { ctlPath, ftLogPath },
+      });
+      await d.start("basalt", { cancelled: false });
+      // A fresh qemu anchors "-" to real time, so "- 1" reads as real time (the
+      // stale custom target is gone) while keeping the f2xx boot-seed correct.
+      expect(await readFile(ctlPath, "utf8")).toBe("- 1");
+      expect(await readFile(ftLogPath, "utf8")).toBe(""); // truncated per boot
+      await rm(ctlPath, { force: true });
+      await rm(ftLogPath, { force: true });
+    });
+
     it("setFakeTime writes the control file qemu reads ('<target> <rate>')", async () => {
       const ctlPath = join(tmpdir(), `pb-faketime-${process.pid}.ctl`);
       await rm(ctlPath, { force: true });
@@ -304,5 +325,19 @@ describe("WindowsNativeDriver", () => {
     const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {}, inputChannel: channel });
     await d.deleteSamplePin();
     expect(deletePin).toHaveBeenCalledWith("studio-sample-pin");
+  });
+
+  it("reap() delegates to the injected reap dep (startup orphan reaper)", async () => {
+    const reap = vi.fn(async () => {});
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {}, reap });
+    await d.reap();
+    expect(reap).toHaveBeenCalledOnce();
+  });
+
+  it("reap() is a safe no-op when no reap dep is wired", async () => {
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {} });
+    await expect(d.reap()).resolves.toBeUndefined();
   });
 });

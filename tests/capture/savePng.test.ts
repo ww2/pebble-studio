@@ -11,4 +11,9 @@ describe("encodePng", () => {
     expect(decoded.height).toBe(2);
     expect(decoded.data[0]).toBe(255); // first pixel red channel
   });
+
+  it("rejects an RGBA buffer whose length doesn't match width*height*4", () => {
+    const rgba = new Uint8Array(10); // 2x2 needs 16 bytes
+    expect(() => encodePng(rgba, 2, 2)).toThrow(/expected 16 RGBA bytes, got 10/);
+  });
 });

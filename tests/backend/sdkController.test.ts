@@ -4,6 +4,9 @@ import {
   locateSdkCore,
   looksLikeArchive,
   applyFullLauncherFirmware,
+  isPathInside,
+  EXTRACT_PY,
+  EXTRACT_OK_TOKEN,
   type SdkFsProbe,
 } from "../../src/main/backend/sdkController.js";
 import {
@@ -36,6 +39,47 @@ describe("looksLikeArchive", () => {
     for (const f of ["C:\\Users\\me\\sdk-folder", "manifest.json", "readme.txt", "app.pbw"]) {
       expect(looksLikeArchive(f)).toBe(false);
     }
+  });
+});
+
+describe("isPathInside (self-delete / containment guard)", () => {
+  it("treats an identical path as inside (source === target must be rejected)", () => {
+    expect(isPathInside("C:\\data\\SDKs\\4.3\\sdk-core", "C:\\data\\SDKs\\4.3\\sdk-core")).toBe(true);
+  });
+  it("detects a nested child", () => {
+    expect(isPathInside("C:\\data\\pebble-sdk", "C:\\data\\pebble-sdk\\SDKs\\4.3\\sdk-core")).toBe(true);
+  });
+  it("is case-insensitive and separator-tolerant (win32)", () => {
+    expect(isPathInside("C:\\Data\\Pebble-SDK", "c:\\data\\pebble-sdk\\SDKs")).toBe(true);
+  });
+  it("rejects a sibling / unrelated path", () => {
+    expect(isPathInside("C:\\data\\pebble-sdk", "C:\\data\\other")).toBe(false);
+    expect(isPathInside("C:\\data\\SDKs\\4.3", "C:\\Downloads\\sdk")).toBe(false);
+  });
+  it("rejects a parent (child is above, not inside)", () => {
+    expect(isPathInside("C:\\data\\pebble-sdk\\SDKs", "C:\\data\\pebble-sdk")).toBe(false);
+  });
+});
+
+describe("EXTRACT_PY (hardened archive extraction)", () => {
+  it("prints the unique success token and requires it, not a loose 'ok'", () => {
+    expect(EXTRACT_OK_TOKEN).toBe("PB_EXTRACT_OK");
+    expect(EXTRACT_PY).toContain(`print('${EXTRACT_OK_TOKEN}')`);
+  });
+  it("has NO unfiltered extractall fallback (drops the zip-slip path)", () => {
+    // The old code had `except TypeError: t.extractall(dst)` — an unfiltered
+    // extraction. It must be gone; only the filtered form remains.
+    expect(EXTRACT_PY).not.toContain("except TypeError");
+    expect(EXTRACT_PY).toContain("filter='data'");
+  });
+  it("fails loudly on an interpreter too old for the tar data filter", () => {
+    expect(EXTRACT_PY).toContain("hasattr(tarfile,'data_filter')");
+    expect(EXTRACT_PY).toContain("Python too old");
+  });
+  it("closes both archive handles via `with` and guards zip size", () => {
+    expect(EXTRACT_PY).toContain("with zipfile.ZipFile(src) as z:");
+    expect(EXTRACT_PY).toContain("with tarfile.open(src) as t:");
+    expect(EXTRACT_PY).toContain("possible zip bomb");
   });
 });
 

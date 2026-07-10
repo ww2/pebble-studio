@@ -2,6 +2,21 @@ import type { PlatformId } from "../../shared/types.js";
 import { PLATFORMS } from "../../main/backend/emulatorRegistry.js"; // pure module, bundled by Vite
 
 /**
+ * First-letter type-ahead: index of the next option (cyclically, AFTER `current`)
+ * whose label begins with `ch`, case-insensitively. Returns `current` when nothing
+ * else matches. Pure + unit-tested; the combo maps the result to setActive().
+ */
+export function nextTypeAheadIndex(labels: readonly string[], current: number, ch: string): number {
+  const c = ch.toLowerCase();
+  const n = labels.length;
+  for (let off = 1; off <= n; off++) {
+    const i = (current + off) % n;
+    if (labels[i].toLowerCase().startsWith(c)) return i;
+  }
+  return current;
+}
+
+/**
  * Accessible custom combobox listing every Pebble platform. Replaces the native
  * `<select>` (whose option list could not be themed, producing white-on-white in
  * one theme) with a fully theme-controlled button + popup listbox.
@@ -78,6 +93,9 @@ export class VersionSwitcher {
     document.addEventListener("click", (e) => {
       if (this.open && !root.contains(e.target as Node)) this.close();
     });
+    // Close the popup when the window loses focus (alt-tab / click-away to another
+    // app) so it doesn't linger open over an unfocused window.
+    window.addEventListener("blur", () => { if (this.open) this.close(); });
 
     root.append(button, popup);
 
@@ -191,6 +209,21 @@ export class VersionSwitcher {
       case "Escape":
         if (this.open) { e.preventDefault(); this.close(); }
         break;
+      default:
+        // First-letter type-ahead: jump to the next option whose label starts with
+        // the typed character (only meaningful while the list is open).
+        if (this.open && e.key.length === 1 && /\S/.test(e.key)) {
+          e.preventDefault();
+          this.typeAhead(e.key);
+        }
+        break;
     }
+  }
+
+  /** Move the active highlight to the next option (cyclic, after the current one)
+   * whose label begins with `ch`, case-insensitively. No-op if none match. */
+  private typeAhead(ch: string): void {
+    const i = nextTypeAheadIndex(PLATFORMS.map((p) => p.label), this.activeIndex, ch);
+    if (i !== this.activeIndex) this.setActive(i);
   }
 }

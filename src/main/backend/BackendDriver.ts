@@ -16,6 +16,10 @@ export interface BackendDriver {
    * a label before each major boot step (for diagnostic boot notes). */
   start(id: PlatformId, token?: BootToken, onStep?: OnStep): Promise<VncEndpoint>;
   stop(): Promise<void>;
+  /** Reap orphaned emulator processes left by a prior session (crash / "End
+   * process" / a failed teardown). Called once at startup before the first boot.
+   * Optional: only the windows-native driver implements it. */
+  reap?(): Promise<void>;
   install(pbwPath: string): Promise<void>;
   button(id: ButtonId, action: ButtonAction): Promise<void>;
   accelTap(): Promise<void>;

@@ -171,7 +171,6 @@ export class EmulatorView {
   private readonly timelineBtn: HTMLButtonElement;
   private readonly backlightBtn: HTMLButtonElement;
   private timelinePeek = false;
-  private readonly zoomSelect: HTMLSelectElement;
   private readonly frameWrapper: HTMLElement;
   private readonly frame: HTMLElement;
   private readonly stage: HTMLElement;
@@ -212,6 +211,13 @@ export class EmulatorView {
    * promise may still be settling.
    */
   private bootGen = 0;
+  /**
+   * The VNC endpoint returned by the last successful boot's start(). Cached so an
+   * external-reboot reconnect (reconnectAfterClear) reuses the real endpoint
+   * instead of assuming the backend's pinned host/port (this project has a
+   * documented history of port 6080 conflicts). null until the first boot.
+   */
+  private lastEp: { host: string; port: number; wsPath: string } | null = null;
   /** One-shot guard for the first-load pop-out: the frame-wrapper starts scaled
    * down + transparent so the watch isn't shown at a default size before its
    * geometry is known; the first applyGeometry reveals it (scale→1, opacity→1).
@@ -299,6 +305,11 @@ export class EmulatorView {
   private emuLogsExpanded = false;
   private readonly emuLogLines: string[] = [];
   private appLogDispose: (() => void) | null = null;
+  /** Throttle for the collapsed-panel line-count summary (coalesces bursts). */
+  private emuLogSummaryThrottle: ReturnType<typeof setTimeout> | null = null;
+  /** Guards the one-shot history back-fill so overlapping syncEmuLogsPanel calls
+   * can't inject the history twice. Reset when the line buffer is cleared (boot). */
+  private emuLogsBackfilled = false;
   private readonly onEmuLogsChanged = (): void => {
     this.emuLogsEnabled = localStorage.getItem(EMU_LOGS_KEY) === "true";
     // Tell main to start/stop the actual `pebble logs` stream. The stream only runs
@@ -402,8 +413,6 @@ export class EmulatorView {
     this.caption = this.el.querySelector<HTMLElement>("#emu-caption")!;
     this.relaunchBtn = this.el.querySelector<HTMLButtonElement>("#emu-relaunch")!;
     this.forceCloseBtn = this.el.querySelector<HTMLButtonElement>("#emu-force-close")!;
-    // The zoom select element is kept for compatibility but we use the segmented control
-    this.zoomSelect = document.createElement("select"); // hidden, not appended
     this.frameWrapper = this.el.querySelector<HTMLElement>(".emu-frame-wrapper")!;
     this.frame = this.el.querySelector<HTMLElement>(".emu-frame")!;
     this.stage = this.el.querySelector<HTMLElement>("#emu-stage")!;
@@ -443,6 +452,10 @@ export class EmulatorView {
       const overflow = this.emuLogLines.length - EMU_LOGS_CAP;
       if (overflow > 0) this.emuLogLines.splice(0, overflow);
       if (this.emuLogsEnabled && this.emuLogsExpanded) this.renderEmuLog();
+      // Keep the collapsed header's "· N lines" count live as lines stream in —
+      // it's the "is anything happening?" affordance. Throttled so a burst of
+      // lines doesn't thrash layout (renderEmuLog already refreshes it when open).
+      else if (this.emuLogsEnabled) this.scheduleEmuLogSummary();
     });
     // Push the persisted toggle state to main so the stream's on/off matches the UI
     // from the first boot (main defaults to off until told otherwise).
@@ -467,7 +480,9 @@ export class EmulatorView {
     shakeBtn.addEventListener("click", () => {
       if (this.state !== "live") return;
       void window.studio.accelTap();
-      setTimeout(() => void window.studio.accelTap(), 120);
+      // Re-check live before the delayed second tap: the emulator may have stopped
+      // within 120ms, and firing IPC at a dead backend is a no-op at best.
+      setTimeout(() => { if (this.state === "live") void window.studio.accelTap(); }, 120);
     });
     this.timelineBtn.addEventListener("click", () => {
       if (this.state !== "live") return;
@@ -477,12 +492,17 @@ export class EmulatorView {
       this.timelineBtn.classList.toggle("emu-action--on", next);
       window.studio.timelineQuickView(next)
         .then(() => {
+          // Guard the async status write: a Relaunch/Force-close between the click
+          // and this resolution must keep its "Stopping…"/"Stopped" — don't clobber.
+          if (this.state !== "live") return;
           this.status.textContent = next ? "Timeline peek on — sample pin added" : "Timeline peek off";
         })
         .catch((e: unknown) => {
-          // Roll back the optimistic toggle and surface why.
+          // Roll back the optimistic toggle and surface why — but only while still
+          // live, so a lifecycle status (Stopping…/Stopped) isn't overwritten.
           this.timelinePeek = !next;
           this.timelineBtn.classList.toggle("emu-action--on", !next);
+          if (this.state !== "live") return;
           this.status.textContent = `Timeline peek failed: ${e instanceof Error ? e.message : String(e)}`;
         });
     });
@@ -626,7 +646,12 @@ export class EmulatorView {
    */
   private handleKeyDown(e: KeyboardEvent): void {
     if (this.state !== "live") return;
-    if (e.ctrlKey || e.altKey || e.metaKey) return;
+    // A modal (e.g. the What's New / changelog dialog) owns the keyboard while
+    // open — don't let a key press leak through and drive the watch behind it.
+    if (document.querySelector(".cl-overlay")) return;
+    // Any modifier chord (incl. Shift) belongs to app shortcuts, not the emulator —
+    // Shift+ArrowUp must not drive the watch's Up button.
+    if (e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
     const t = e.target as HTMLElement | null;
     if (t) {
       const tag = t.tagName;
@@ -647,12 +672,22 @@ export class EmulatorView {
         void window.studio.accelTap();
         break;
       case "shake":
-        // Mirror the Shake button: a double-tap.
+        // Mirror the Shake button: a double-tap. Re-check live before the delayed
+        // second tap so it doesn't fire IPC at an emulator stopped within 120ms.
         void window.studio.accelTap();
-        setTimeout(() => void window.studio.accelTap(), 120);
+        setTimeout(() => { if (this.state === "live") void window.studio.accelTap(); }, 120);
         break;
       case "light":
         void window.studio.backlightPulse();
+        break;
+      case "screenshot":
+        // Drive the Capture bar via a window event so the shortcut works even when
+        // the Capture pane isn't the visible inspector. (Event name mirrored in
+        // CaptureBar.) Only reached when live (guarded above).
+        window.dispatchEvent(new Event("pebble-studio:capture-screenshot"));
+        break;
+      case "record":
+        window.dispatchEvent(new Event("pebble-studio:capture-record"));
         break;
     }
   }
@@ -1035,15 +1070,33 @@ export class EmulatorView {
   private syncEmuLogsPanel(): void {
     const el = this.el.querySelector<HTMLElement>("#emu-logs")!;
     el.hidden = !this.emuLogsEnabled;
-    if (this.emuLogsEnabled && this.emuLogLines.length === 0) {
+    if (this.emuLogsEnabled && !this.emuLogsBackfilled && this.emuLogLines.length === 0) {
+      this.emuLogsBackfilled = true; // set optimistically so a second sync can't re-query
       void window.studio.getAppLogHistory().then((lines) => {
-        if (this.emuLogLines.length === 0) this.emuLogLines.push(...lines);
+        // Live lines can stream in (via onAppLog) between this query being issued
+        // and it resolving. The old `length === 0` recheck then dropped the whole
+        // history; instead PREPEND the (older) history in front of any live lines
+        // so nothing is lost, then re-apply the cap.
+        if (lines.length > 0) {
+          this.emuLogLines.unshift(...lines);
+          const overflow = this.emuLogLines.length - EMU_LOGS_CAP;
+          if (overflow > 0) this.emuLogLines.splice(0, overflow);
+        }
         if (this.emuLogsExpanded) this.renderEmuLog();
         this.renderEmuLogSummary();
       });
     }
     this.renderEmuLogSummary();
     if (this.zoom === "fit") this.applyFitScale();
+  }
+
+  /** Refresh the collapsed emu-logs line-count summary at most ~every 250ms. */
+  private scheduleEmuLogSummary(): void {
+    if (this.emuLogSummaryThrottle !== null) return;
+    this.emuLogSummaryThrottle = setTimeout(() => {
+      this.emuLogSummaryThrottle = null;
+      this.renderEmuLogSummary();
+    }, 250);
   }
 
   private setEmuLogsExpanded(expanded: boolean): void {
@@ -1259,6 +1312,7 @@ export class EmulatorView {
 
     this.state = "booting";
     this.emuLogLines.length = 0;
+    this.emuLogsBackfilled = false; // fresh boot → allow a re-backfill if re-shown
     if (this.emuLogsEnabled && this.emuLogsExpanded) this.renderEmuLog();
     this.currentPlatform = platformId;
     // The session log is NOT wiped on boot (it persists across launch/crash so a
@@ -1301,7 +1355,8 @@ export class EmulatorView {
     this.status.textContent = "● Live";
     this.status.classList.remove("emu-status--dead");
     this.status.classList.add("emu-status--live");
-    this.vnc = connectVnc(this.screenHost, ep as { host: string; port: number; wsPath: string }, info.touch);
+    this.lastEp = ep as { host: string; port: number; wsPath: string };
+    this.vnc = connectVnc(this.screenHost, this.lastEp, info.touch);
     this.updateLifecycleButtons();
     // If this boot followed an auto-relaunch, give it a chance to prove healthy:
     // staying live past AUTO_RELAUNCH_HEALTHY_MS resets the consecutive-crash
@@ -1426,6 +1481,11 @@ export class EmulatorView {
       this.clearAutoRelaunchResetTimer();
     }
     const id = this.currentPlatform;
+    // Capture the boot generation up front so a force-close during the "Stopping…"
+    // phase (which bumps bootGen) cancels the reboot: boot() re-captures the
+    // generation on entry, so without this guard the awaited stop() would always be
+    // followed by an un-cancellable boot of the emulator the user just killed.
+    const gen = this.bootGen;
     this.resetTimelinePeek();
     this.state = "stopping";
     this.disconnectVnc();
@@ -1438,6 +1498,9 @@ export class EmulatorView {
     } catch (err) {
       console.warn("[emu] stop() during relaunch failed (ignored):", err);
     }
+    // A force-close (or another boot) superseded this relaunch while stop() was in
+    // flight — abandon the reboot; the new owner already drives the UI/backend.
+    if (gen !== this.bootGen) return;
     // Backend cleared "loaded" on stop — clear the pills now; the reboot's
     // libInstallAll will repopulate them once the apps re-install.
     window.dispatchEvent(new Event("pebble-studio:apps-changed"));
@@ -1662,6 +1725,13 @@ export class EmulatorView {
    */
   async show(platformId: PlatformId, opts: { boot: boolean }): Promise<void> {
     if (!opts.boot) {
+      // Manual mode: switching the model must not orphan a running backend.
+      // loadChrome() only disconnects VNC — it leaves qemu/pypkjs/websockify alive
+      // holding the VNC ports, and updateLifecycleButtons() then disables
+      // Force-close (state goes "stopped"), so the user loses all control of it.
+      // Fully stop it first. forceClose() no-ops when already stopped and swallows
+      // errors if the backend is already down, so it can't wedge the switch.
+      if (this.state !== "stopped") await this.forceClose();
       this.loadChrome(platformId);
       return;
     }
@@ -1714,8 +1784,9 @@ export class EmulatorView {
     this.status.textContent = "● Live";
     this.status.classList.remove("emu-status--dead");
     this.status.classList.add("emu-status--live");
-    // The IPC handler already rebooted — re-use the same VNC endpoint.
-    const ep = { host: "localhost", port: 6080, wsPath: "/" };
+    // The IPC handler already rebooted — re-use the endpoint from the last boot's
+    // start() (falls back to the backend's pinned default only if we never booted).
+    const ep = this.lastEp ?? { host: "localhost", port: 6080, wsPath: "/" };
     this.vnc = connectVnc(this.screenHost, ep, info.touch);
     this.updateLifecycleButtons();
   }

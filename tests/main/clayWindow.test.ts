@@ -127,6 +127,13 @@ describe("rewriteClayConfigUrl", () => {
     expect(rewriteClayConfigUrl(u)).toBe(u);
   });
 
+  it("falls back to the original URL on a malformed percent-encoded fragment", () => {
+    // A third-party watchface can hand us an invalid escape; decodeURIComponent
+    // throws URIError, which must NOT propagate (it would orphan a blank window).
+    expect(rewriteClayConfigUrl(clayUrl("%"))).toBe(clayUrl("%"));
+    expect(rewriteClayConfigUrl(clayUrl("%E0%A4"))).toBe(clayUrl("%E0%A4"));
+  });
+
   it("leaves a clay URL with no fragment unchanged (defensive)", () => {
     const u = "http://clay.pebble.com.s3-website-us-west-2.amazonaws.com/";
     expect(rewriteClayConfigUrl(u)).toBe(u);

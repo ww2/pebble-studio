@@ -12,7 +12,6 @@ const studio = {
   install: (pbwPath: string) => ipcRenderer.invoke("emu:install", pbwPath),
   button: (id: string, action?: string) => ipcRenderer.invoke("emu:button", id, action),
   accelTap: () => ipcRenderer.invoke("emu:accelTap"),
-  screenshot: (out: string) => ipcRenderer.invoke("emu:screenshot", out),
   // Backlight-free framebuffer screenshot. Pass a capture filename; resolves with
   // the saved absolute path, or null on ANY failure (renderer then falls back to
   // the VNC-canvas + backlight grab).
@@ -67,8 +66,8 @@ const studio = {
   // only when the user cancels the picker.
   sdkInfo: (): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }> =>
     ipcRenderer.invoke("sdk:info"),
-  sdkInstall: (): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean } | null> =>
-    ipcRenderer.invoke("sdk:install"),
+  sdkInstall: (mode?: "file" | "folder"): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean } | null> =>
+    ipcRenderer.invoke("sdk:install", mode),
   sdkReset: (): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }> =>
     ipcRenderer.invoke("sdk:reset"),
   // App version (v1.0.0) — for the Help → What's New modal header.

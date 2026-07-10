@@ -1,5 +1,6 @@
-import { app, BrowserWindow, ipcMain, Menu, dialog } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, dialog, session } from "electron";
 import { writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { registerIpc } from "./ipc.js";
 import { createQuitHandler } from "./quitHandler.js";
@@ -10,9 +11,23 @@ import { buildMenuTemplate } from "./menu.js";
 // under the ESM (nodenext) tsconfig used for `npm run typecheck`.
 declare const __dirname: string;
 
-// Under WSLg the chromium sandbox typically cannot initialize; disable it so
-// the app actually starts. Harmless on platforms where the sandbox works.
-app.commandLine.appendSwitch("no-sandbox");
+// The chromium OS sandbox cannot initialize under WSL/WSLg, so the app won't
+// start there without this switch. It is PROCESS-WIDE — it also strips the
+// sandbox from the untrusted Clay config window — so gate it to the only host
+// that needs it (Linux under WSL) or an explicit opt-in. Never on win32/darwin,
+// where the sandbox must stay up to contain that child window.
+function shouldDisableSandbox(): boolean {
+  if (process.env.PEBBLE_DISABLE_SANDBOX === "1") return true;
+  if (process.platform !== "linux") return false;
+  try {
+    return /microsoft/i.test(readFileSync("/proc/version", "utf8"));
+  } catch {
+    return false; // /proc/version unreadable — assume a working sandbox
+  }
+}
+if (shouldDisableSandbox()) {
+  app.commandLine.appendSwitch("no-sandbox");
+}
 
 // Single-instance lock (Task H). A second app instance would launch a second
 // competing emulator (the cause of the inconsistent-FPS report), so we refuse it
@@ -52,7 +67,9 @@ function createWindow(): void {
       preload: join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      // The preload only uses contextBridge/ipcRenderer/webUtils — all available
+      // in a sandboxed preload — so it can run inside the OS sandbox.
+      sandbox: true,
       // Keep the renderer running at full rate even when the window loses focus.
       // A runtime toggle (app:setBackgroundThrottling) lets the user re-enable
       // throttling from Settings if they want to conserve CPU when unfocused.
@@ -91,6 +108,19 @@ function createWindow(): void {
     if (!win.isDestroyed()) win.show();
   });
 
+  // Failsafe for the `show: false` gate above: if the initial load fails or the
+  // renderer crashes, did-finish-load never fires, leaving an invisible running
+  // process. Surface the error and show the window so the user can quit/retry.
+  win.webContents.on("did-fail-load", (_e, errorCode, errorDescription, url, isMainFrame) => {
+    if (!isMainFrame || errorCode === -3) return; // sub-resource / user-aborted load
+    console.error(`[main] load failed (${errorCode} ${errorDescription}) ${url}`);
+    if (!win.isDestroyed()) win.show();
+  });
+  win.webContents.on("render-process-gone", (_e, details) => {
+    console.error(`[main] render process gone: ${details.reason}`);
+    if (!win.isDestroyed()) win.show();
+  });
+
   // Forward renderer console output to the terminal (useful for headless dev).
   win.webContents.on("console-message", (_e, _lvl, message) =>
     console.log(`[renderer] ${message}`),
@@ -122,7 +152,8 @@ function createWindow(): void {
                 `(() => {
                   const btn = document.querySelector('.version-combo .version-combo-btn');
                   if (btn) btn.click();
-                  const opt = document.querySelector('.version-combo-option[data-id="${wantPlatform}"]');
+                  const id = ${JSON.stringify(wantPlatform)};
+                  const opt = document.querySelector('.version-combo-option[data-id="' + CSS.escape(id) + '"]');
                   if (opt) opt.click();
                 })()`,
               );
@@ -197,6 +228,14 @@ function setupApplicationMenu(): void {
 // second instance has already called app.quit() above.
 if (gotSingleInstanceLock) {
   app.whenReady().then(() => {
+    // Deny every renderer permission request by default (camera, mic, geolocation,
+    // notifications, …). The app needs none of them, and the Clay config window
+    // hosts untrusted third-party pages that must not reach getUserMedia et al.
+    session.defaultSession.setPermissionRequestHandler((_wc, _permission, callback) =>
+      callback(false),
+    );
+    session.defaultSession.setPermissionCheckHandler(() => false);
+
     const { shutdown } = registerIpc(() => mainWindow);
     // before-quit fires for the X button, app.quit(), and Task Manager "End
     // task" (all WM_CLOSE). Bounded so "End task"'s short grace window doesn't
@@ -210,10 +249,10 @@ if (gotSingleInstanceLock) {
       // macOS: re-create a window when the dock icon is clicked and none are open.
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
+
+    app.on("window-all-closed", () => {
+      // Quit on Windows/Linux; on macOS apps typically stay active.
+      if (process.platform !== "darwin") app.quit();
+    });
   });
 }
-
-app.on("window-all-closed", () => {
-  // Quit on Windows/Linux; on macOS apps typically stay active.
-  if (process.platform !== "darwin") app.quit();
-});

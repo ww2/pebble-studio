@@ -1,10 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { tasklistArgs, parseTasklistAlive, taskkillByImageArgs, taskkillByPidArgs, parseStatePids } from "../../src/main/backend/winProc.js";
+import { tasklistArgs, tasklistPidArgs, parseTasklistAlive, parseTasklistPids, parseTasklistImage, parseStatePids } from "../../src/main/backend/winProc.js";
 
 const TASKLIST_CSV_ALIVE =
   `"Image Name","PID","Session Name","Session#","Mem Usage"\r\n` +
   `"qemu-pebble.exe","12345","Console","1","250,000 K"\r\n`;
 const TASKLIST_CSV_NONE = `INFO: No tasks are running which match the specified criteria.\r\n`;
+// Headerless CSV (the /NH form winBootDeps uses): two matching rows.
+const TASKLIST_CSV_TWO =
+  `"PebbleStudioEmu.exe","14952","Console","1","60,000 K"\r\n` +
+  `"PebbleStudioEmu.exe","63240","Console","1","61,000 K"\r\n`;
 
 describe("winProc", () => {
   it("tasklistArgs filters by image name in CSV mode", () => {
@@ -23,12 +27,26 @@ describe("winProc", () => {
     expect(parseTasklistAlive("")).toBe(false);
   });
 
-  it("taskkillByImageArgs force-kills the whole tree by image", () => {
-    expect(taskkillByImageArgs("qemu-pebble.exe")).toEqual(["/IM", "qemu-pebble.exe", "/T", "/F"]);
+  it("parseTasklistPids extracts every pid from headerless CSV rows", () => {
+    expect(parseTasklistPids(TASKLIST_CSV_TWO)).toEqual([14952, 63240]);
   });
 
-  it("taskkillByPidArgs force-kills the whole tree by pid", () => {
-    expect(taskkillByPidArgs(12345)).toEqual(["/PID", "12345", "/T", "/F"]);
+  it("parseTasklistPids returns [] for the 'No tasks' banner and empty output", () => {
+    expect(parseTasklistPids(TASKLIST_CSV_NONE)).toEqual([]);
+    expect(parseTasklistPids("")).toEqual([]);
+  });
+
+  it("tasklistPidArgs filters by pid in headerless CSV mode", () => {
+    expect(tasklistPidArgs(12345)).toEqual(["/FI", "PID eq 12345", "/FO", "CSV", "/NH"]);
+  });
+
+  it("parseTasklistImage returns the image name of the first row", () => {
+    expect(parseTasklistImage(TASKLIST_CSV_TWO)).toBe("PebbleStudioEmu.exe");
+  });
+
+  it("parseTasklistImage returns '' for the 'No tasks' banner and empty output", () => {
+    expect(parseTasklistImage(TASKLIST_CSV_NONE)).toBe("");
+    expect(parseTasklistImage("")).toBe("");
   });
 });
 

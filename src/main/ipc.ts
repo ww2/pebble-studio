@@ -1,4 +1,4 @@
-import { ipcMain, app, dialog, BrowserWindow } from "electron";
+import { ipcMain, app, dialog, BrowserWindow, type IpcMainInvokeEvent } from "electron";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { AppLogStream } from "./backend/appLogStream.js";
@@ -23,8 +23,11 @@ import { currentSdkInfo, installCustomSdk, resetToBundledSdk } from "./backend/s
 import { readSimEnv, writeSimEnv } from "./backend/simEnv.js";
 import { clearWeatherCacheArgv, refreshWeatherAfterSimChange } from "./backend/weatherCacheRefresh.js";
 import { spawnRunner } from "./backend/spawnRunner.js";
+import { getPlatform } from "./backend/emulatorRegistry.js";
+import { applyCircularMaskToPngFile } from "./backend/circularMaskPng.js";
 import type { PlatformId, ButtonId, ButtonAction } from "../shared/types.js";
 import type { SimEnvConfig } from "../shared/simEnv.js";
+import { isButtonId, isButtonAction, normalizeSimEnv } from "../shared/validate.js";
 import { LibraryStore } from "./library.js";
 
 let driver: BackendDriver | null = null;
@@ -66,6 +69,15 @@ let captureDir: string | null = null;
  */
 const loaded = new Set<string>();
 
+/** Hard cap on the windows-native startup reap so backend:init can never hang on
+ * it (the renderer awaits backend:init before enabling Launch). */
+const STARTUP_REAP_TIMEOUT_MS = 8000;
+
+/** Ceiling on a `capture:save` payload (64 MiB). A screenshot/GIF is far smaller;
+ * this just stops a hostile/buggy renderer from asking main to buffer an
+ * unbounded blob to disk. */
+const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
+
 /**
  * Resolve + validate a capture filename against a configured directory.
  *
@@ -78,9 +90,21 @@ export function resolveCapturePath(dir: string, name: string): string {
   if (!/^[\w.\- ]+\.(png|gif)$/i.test(safeName)) {
     throw new Error(`invalid capture filename: ${name}`);
   }
+  // Reject Windows reserved device names (CON, NUL, COM1…, LPT1…) and any base
+  // ending in a space or dot: Windows can't create such files (they map to a
+  // device or get silently trimmed), so a write there would fail or misfire.
+  const stem = safeName.slice(0, safeName.lastIndexOf("."));
+  if (/[ .]$/.test(stem) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem)) {
+    throw new Error(`invalid capture filename: ${name}`);
+  }
   const base = path.resolve(dir);
   const out = path.resolve(base, safeName);
-  if (out !== path.join(base, safeName) || !out.startsWith(base + path.sep)) {
+  // Confirm the result stays inside the configured dir. path.resolve strips a
+  // trailing separator EXCEPT at a filesystem/drive root ("D:\\", "/"), so
+  // derive the prefix separator-normalized rather than always appending sep —
+  // otherwise a drive-root capture dir yields "D:\\\\" and every save fails.
+  const prefix = base.endsWith(path.sep) ? base : base + path.sep;
+  if (out !== path.join(base, safeName) || !out.startsWith(prefix)) {
     throw new Error("capture path escapes capture directory");
   }
   return out;
@@ -113,6 +137,30 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // Default capture target is the user's Downloads; settings:setCaptureDir can
   // repoint it. Resolved here (not at module load) so app paths are ready.
   captureDir = path.resolve(app.getPath("downloads"));
+
+  /**
+   * Reject an IPC invoke from any frame that isn't the MAIN window's top frame
+   * (defense-in-depth). Applied to the write/spawn-capable handlers. The Clay
+   * config child window carries NO preload (see clayWindow.ts), so it never
+   * invokes IPC at all; the clay:* channels are driven by the MAIN window and
+   * are deliberately left un-gated here. Before the main window exists (or if the
+   * frame was disposed) the strict !== check rejects, which is correct: no
+   * legitimate handler here runs before the window is up.
+   */
+  const assertMainSender = (e: IpcMainInvokeEvent): void => {
+    const main = getMainWindow();
+    if (!main || e.senderFrame !== main.webContents.mainFrame) {
+      throw new Error("ipc: rejected sender (not the main window)");
+    }
+  };
+
+  /** Return the active driver or throw a clean, typed error — instead of the raw
+   * TypeError a `driver!` deref produces — when a write/spawn handler is invoked
+   * before `backend:init`. Mirrors emu:activateHealth's null-guard. */
+  const requireDriver = (): BackendDriver => {
+    if (!driver) throw new Error("emulator backend not initialized");
+    return driver;
+  };
 
   // Backlight keepalive (Task K). The "back" wake reads the qemu HMP monitor port
   // from the emulator state file. windows-native MUST read %TEMP% via Node fs: a
@@ -293,6 +341,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
 
   ipcMain.handle("loaded:list", async () => Array.from(loaded));
   ipcMain.handle("loaded:clear", async (_e, platformId: PlatformId) => {
+    getPlatform(platformId); // reject an unknown/injected platform id before it reaches a bash -lc line
     // Stop the bridge-health monitor before teardown so it doesn't poll a dead
     // emulator during the wipe window (mirrors emu:stop). It is re-started after
     // the clean reboot below via bridgeMonitor.start(platformId).
@@ -327,15 +376,23 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     driver = d;
     driverKind = kind;
     console.log(`[backend] initialized kind=${kind}`);
-    // NOTE: no startup reap here. Orphans from a prior session killed via Task
-    // Manager "End process" (TerminateProcess — can't run before-quit) are reaped
-    // by the boot path instead: bootEmulator runs killAll ("Killing stale
-    // emulator…") before EVERY boot, freeing ports 5901/6080 + the stale state
-    // file. Reaping here too would block the renderer's first watch morph behind a
-    // `pebble kill` interpreter spawn (a visible startup slowdown), and a
-    // fire-and-forget reap could race a quick Launch and kill the fresh emulator.
-    // before-quit covers graceful closes (incl. "End task"); boot-time killAll
-    // covers the hard-kill aftermath when it matters (the next boot).
+    // STARTUP REAP (windows-native): clear orphaned emulator processes left by a
+    // prior session — a crash, Task Manager "End process" (TerminateProcess can't
+    // run before-quit), or a teardown that failed (e.g. the historic `taskkill /T`
+    // tree-walk timeout). driver.reap() force-kills our stack DIRECTLY (no graceful
+    // `pebble kill` interpreter spawn, so no startup slowdown). AWAITED here — and
+    // the renderer awaits backend:init before enabling Launch — so it finishes
+    // before any boot, which means it can NEVER race a fresh emulator (the old race
+    // concern that argued against reaping here). before-quit still covers graceful
+    // closes; boot-time killAll remains a backstop.
+    if (kind === "windows-native" && driver.reap) {
+      // Bounded: reap force-kills directly and enumerates via a bounded tasklist,
+      // but we still race it against a hard cap so a startup reap can NEVER wedge
+      // backend:init (which the renderer awaits before enabling Launch). On
+      // timeout we proceed — boot-time killAll is the backstop.
+      const reapDone = driver.reap().catch((e) => console.error(`[backend] startup reap failed: ${String(e)}`));
+      await Promise.race([reapDone, new Promise<void>((r) => setTimeout(r, STARTUP_REAP_TIMEOUT_MS))]);
+    }
     // First-run SDK provisioning for the native-Windows stack: the bundled SDK is
     // read-only, so we materialise a writable copy under the app-data persist dir
     // (the XDG_DATA_HOME the invocation contract points at) BEFORE any boot. Runs
@@ -367,6 +424,8 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // App version (v1.0.0) — surfaced in the Help → What's New modal.
   ipcMain.handle("app:version", () => app.getVersion());
   ipcMain.handle("emu:start", async (e, id: PlatformId) => {
+    assertMainSender(e);
+    getPlatform(id); // reject an unknown/injected platform id before it reaches a bash -lc line
     currentPlatform = id; // remembered for clay:phonesimPort's state-file lookup
     // Fresh token per boot, stored as current so abort/stop can cancel it.
     const token: BootToken = { cancelled: false };
@@ -379,7 +438,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     // falls back to the legacy offset path. (Optional chaining: a null driver is
     // handled by the start() call below, same as before.)
     await driver?.ensureTimeShim().catch(() => false);
-    const ep = await driver!.start(id, token, onStep);
+    const ep = await requireDriver().start(id, token, onStep);
     await battery.reassert(); // re-assert the chosen battery level on the fresh emulator (before the time push, since emu-battery's connect re-syncs host time)
     void time.applyAll(); // re-assert time settings on the fresh emulator (fire-and-forget)
     // Arm the health monitor only if this boot wasn't superseded by a force-close
@@ -408,7 +467,8 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
       stopAppLog();
     }
   });
-  ipcMain.handle("emu:stop", async () => {
+  ipcMain.handle("emu:stop", async (e) => {
+    assertMainSender(e);
     // Shared teardown (also used by the app-quit handler). Deliberately does NOT
     // clear `loaded`: a stop/kill reaps processes + the state file but leaves
     // installed apps on disk (removed only by `pebble wipe`).
@@ -435,7 +495,12 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // which the emulator picks up live (sitecustomize re-reads on mtime change).
   ipcMain.handle("sim:get", async (): Promise<SimEnvConfig> =>
     readSimEnv(app.getPath("userData")));
-  ipcMain.handle("sim:set", async (_e, cfg: SimEnvConfig): Promise<{ rebooted: boolean }> => {
+  ipcMain.handle("sim:set", async (e, rawCfg: SimEnvConfig): Promise<{ rebooted: boolean }> => {
+    assertMainSender(e);
+    // Normalize the untrusted renderer object (finite lat/lon in range, allowed
+    // condition/units, clamped tempC) before persisting — the bundled python
+    // reads sim-env.json and trusts it. Never throws: bad fields fall back/clamp.
+    const cfg = normalizeSimEnv(rawCfg);
     await writeSimEnv(app.getPath("userData"), cfg);
     // Make weather watchfaces reflect the new values NOW rather than waiting out
     // their internal fetch throttle (faces commonly cache their last fetch for
@@ -496,13 +561,20 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
       return { rebooted: false };
     }
   });
-  ipcMain.handle("emu:install", async (_e, pbwPath: string) => {
-    await withAppLogPaused(() => installWithBridgeRetry(() => driver!.install(pbwPath)));
+  ipcMain.handle("emu:install", async (e, pbwPath: string) => {
+    assertMainSender(e);
+    await withAppLogPaused(() => installWithBridgeRetry(() => requireDriver().install(pbwPath)));
     loaded.add(pbwPath);
     reassertTime();
   });
   ipcMain.handle("emu:button", async (_e, id: ButtonId, action?: ButtonAction) => {
-    await driver!.button(id, action ?? "press");
+    // ButtonId/ButtonAction are erased at runtime; validate against the real
+    // allowed sets so a crafted id can't inject into the input-helper stdin
+    // protocol (`click <id>` / `hold <id>`; see winInputChannel.writeCommand).
+    if (!isButtonId(id)) throw new Error(`invalid button id: ${String(id)}`);
+    const act = action ?? "press";
+    if (!isButtonAction(act)) throw new Error(`invalid button action: ${String(action)}`);
+    await requireDriver().button(id, act);
     reassertTime();
   });
   ipcMain.handle("emu:accelTap", async () => {
@@ -523,7 +595,6 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     console.log(`[health] activate: ok=${r.ok} status=${r.status} ${r.detail}`);
     return r;
   });
-  ipcMain.handle("emu:screenshot", async (_e, out: string) => driver!.screenshot(out));
   // Backlight-free framebuffer screenshot (over the watch protocol). The renderer
   // passes a capture filename; main resolves it under the configured capture dir
   // (same whitelist/traversal guard as capture:save), asks the driver to write the
@@ -531,7 +602,8 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // tells the renderer to fall back to the VNC-canvas + backlight grab. Never
   // throws (a thrown handler would surface as a renderer rejection, defeating the
   // graceful fallback). The framebuffer path is unverified-live; see winHelpers.ts.
-  ipcMain.handle("emu:screenshotFramebuffer", async (_e, name: string): Promise<string | null> => {
+  ipcMain.handle("emu:screenshotFramebuffer", async (e, name: string): Promise<string | null> => {
+    assertMainSender(e);
     if (!driver) return null;
     try {
       const dir = captureDir ?? path.resolve(app.getPath("downloads"));
@@ -541,6 +613,17 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
       // Confirm the file actually landed before claiming success.
       const stat = await fs.stat(out).catch(() => null);
       if (!stat || !stat.isFile() || stat.size === 0) return null;
+      // Round boards (chalk, gabbro): the framebuffer PNG is a plain rectangle
+      // with black corners. Mask them to transparent so the saved shot is a
+      // circle, matching the renderer's canvas path. Best-effort: a mask failure
+      // must not lose the (otherwise valid) screenshot.
+      if (currentPlatform && getPlatform(currentPlatform).round) {
+        try {
+          await applyCircularMaskToPngFile(out);
+        } catch (e) {
+          console.warn(`[capture] circular mask failed (keeping square PNG): ${String(e)}`);
+        }
+      }
       console.log(`[capture] saved (framebuffer) ${out}`);
       return out;
     } catch (e) {
@@ -613,7 +696,8 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0];
   });
 
-  ipcMain.handle("settings:setCaptureDir", async (_e, dir: string) => {
+  ipcMain.handle("settings:setCaptureDir", async (e, dir: string) => {
+    assertMainSender(e);
     // Validate: must be an absolute path that exists and is a directory.
     if (typeof dir !== "string" || !path.isAbsolute(dir)) {
       throw new Error(`capture dir must be an absolute path: ${dir}`);
@@ -636,19 +720,30 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   ipcMain.handle("sdk:info", async () => {
     return currentSdkInfo(await defaultCtx());
   });
-  ipcMain.handle("sdk:install", async () => {
-    const result = await dialog.showOpenDialog({
-      title: "Select a Pebble SDK (archive or folder)",
-      properties: ["openFile"],
-      filters: [
-        { name: "Pebble SDK archive", extensions: ["bz2", "tbz2", "gz", "tgz", "tar", "zip"] },
-        { name: "All files", extensions: ["*"] },
-      ],
-    });
+  ipcMain.handle("sdk:install", async (e, mode?: "file" | "folder") => {
+    assertMainSender(e);
+    // Windows' openFile dialog can't select a directory, so a folder SDK needs a
+    // separate openDirectory picker. installCustomSdk handles either path shape;
+    // the renderer chooses via `mode` (default "file", the archive picker).
+    const result = await dialog.showOpenDialog(
+      mode === "folder"
+        ? { title: "Select a Pebble SDK folder", properties: ["openDirectory"] }
+        : {
+            title: "Select a Pebble SDK archive",
+            properties: ["openFile"],
+            filters: [
+              { name: "Pebble SDK archive", extensions: ["bz2", "tbz2", "gz", "tgz", "tar", "zip"] },
+              { name: "All files", extensions: ["*"] },
+            ],
+          },
+    );
     if (result.canceled || result.filePaths.length === 0) return null;
-    // Installing a new SDK changes what the NEXT boot resolves; if an emulator is
-    // live, tear it down first so it isn't left on the old SDK mid-swap.
-    if (emuLive) await teardownEmulator();
+    // Installing a new SDK changes what the NEXT boot resolves. Cancel any
+    // in-flight boot first — the `emuLive` gate alone misses a boot still in
+    // progress (emuLive flips true only once it completes), which the swap would
+    // otherwise race — then tear down so nothing is left straddling the old SDK.
+    if (currentBootToken) currentBootToken.cancelled = true;
+    await teardownEmulator();
     return installCustomSdk(await defaultCtx(), result.filePaths[0], { run: spawnRunner, onProgress: sdkProgress });
   });
   ipcMain.handle("sdk:reset", async () => {
@@ -667,7 +762,13 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     return `${safeBase}-${max + 1}.${safeExt}`;
   });
 
-  ipcMain.handle("capture:save", async (_e, name: string, bytes: Uint8Array) => {
+  ipcMain.handle("capture:save", async (e, name: string, bytes: Uint8Array) => {
+    assertMainSender(e);
+    // Cap the payload so a hostile/buggy renderer can't make main buffer an
+    // unbounded blob to disk (a real screenshot/GIF is far under this).
+    if (!ArrayBuffer.isView(bytes) || bytes.byteLength > MAX_CAPTURE_BYTES) {
+      throw new Error("capture payload too large or not binary");
+    }
     // Resolve + sanitize against the configured capture dir (filename whitelist +
     // path stays inside the dir). Falls back to Downloads if unset.
     const dir = captureDir ?? path.resolve(app.getPath("downloads"));

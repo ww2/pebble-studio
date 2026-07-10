@@ -4,8 +4,11 @@
  * Electron fires `before-quit` synchronously and quits as soon as the handler
  * returns — there is no async await point. So the FIRST quit is deferred with
  * preventDefault(), the async `shutdown()` runs (reap qemu/python + log stream),
- * and only then do we actually exit. A `cleaning` guard makes repeated quit
- * attempts (and the exit-triggered re-fire) no-ops so shutdown runs exactly once.
+ * and only then do we actually exit. A `cleaning` guard makes shutdown run
+ * exactly once; while cleaning we KEEP deferring (preventDefault) every further
+ * quit attempt so a second X-click / "End task" mid-teardown can't quit early
+ * and orphan the children. Only the deliberate exit() path (guarded by
+ * `exiting`) is allowed through, so it is never blocked.
  *
  * TERMINATION PATHS: the X button, app.quit(), and Task Manager "End task" all
  * send WM_CLOSE → before-quit fires here. "End task" hard-kills after a short
@@ -21,12 +24,16 @@ export function createQuitHandler(
   timeoutMs = 3000,
 ): (e: { preventDefault(): void }) => void {
   let cleaning = false;
+  let exiting = false;
   return (e: { preventDefault(): void }): void => {
-    if (cleaning) return; // already tearing down (or the exit() re-fire) — let it proceed
+    if (exiting) return; // the deliberate exit() is underway — let the quit proceed
+    if (cleaning) {
+      e.preventDefault(); // still tearing down — keep deferring so children aren't orphaned
+      return;
+    }
     cleaning = true;
     e.preventDefault();
-    let exited = false;
-    const exitOnce = (): void => { if (!exited) { exited = true; exit(); } };
+    const exitOnce = (): void => { if (!exiting) { exiting = true; exit(); } };
     const timer = setTimeout(exitOnce, timeoutMs);
     void shutdown()
       .catch(() => { /* never block exit on a teardown error */ })

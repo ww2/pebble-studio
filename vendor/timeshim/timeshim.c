@@ -30,6 +30,7 @@ static int64_t anchor_fake = 0;   /* fake ns at anchor */
 static double rate = 1.0;
 static const char *ctl_file = NULL;
 static time_t ctl_mtime = 0;
+static long ctl_mtime_nsec = -1;   /* sub-second mtime; -1 = never read */
 static int64_t last_check_mono = 0;
 static int ready = 0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -51,8 +52,12 @@ static void check_ctl_file(int64_t real) {
     last_check_mono = mono;
     struct stat st;
     if (stat(ctl_file, &st) != 0) return;
-    if (st.st_mtime == ctl_mtime) return;
+    /* Compare BOTH whole-second and nanosecond mtime: two writes within the same
+     * second (rapid time changes, and fix #1's two-write System switch) share
+     * st_mtime, so a whole-second-only check silently drops the second write. */
+    if (st.st_mtime == ctl_mtime && st.st_mtim.tv_nsec == ctl_mtime_nsec) return;
     ctl_mtime = st.st_mtime;
+    ctl_mtime_nsec = st.st_mtim.tv_nsec;
     FILE *f = fopen(ctl_file, "r");
     if (!f) return;
     char tgt[64]; double r;

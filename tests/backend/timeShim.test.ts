@@ -4,6 +4,7 @@ import {
   setFakeTimeCmd, parseSelfTest, STUDIO_DIR, CTL_PATH,
   isShimReady, _resetShimState, ensureTimeShim,
 } from "../../src/main/backend/timeShim.js";
+import { QEMU_FROZEN_RATE } from "../../src/main/backend/timeController.js";
 
 const noQuotes = (s: string) => { expect(s).not.toMatch(/['"]/); };
 
@@ -54,9 +55,26 @@ describe("timeShim command builders", () => {
     noQuotes(setFakeTimeCmd(null, 10).args[1]);
   });
 
-  it("setFakeTimeCmd formats target and rate", () => {
-    expect(setFakeTimeCmd(1577836800, 2).args[1]).toContain(`echo 1577836800 2 > ${CTL_PATH}`);
-    expect(setFakeTimeCmd(null, 1).args[1]).toContain(`echo - 1 > ${CTL_PATH}`);
+  it("setFakeTimeCmd formats an integer target and a fixed-decimal rate", () => {
+    expect(setFakeTimeCmd(1577836800, 2).args[1]).toContain(`echo 1577836800 2.000000 > ${CTL_PATH}`);
+    expect(setFakeTimeCmd(null, 1).args[1]).toContain(`echo - 1.000000 > ${CTL_PATH}`);
+  });
+
+  it("setFakeTimeCmd truncates a fractional target but preserves a fractional rate", () => {
+    expect(setFakeTimeCmd(1577836800.9, 10).args[1]).toContain(`echo 1577836800 10.000000`);
+  });
+
+  it("does NOT collapse QEMU_FROZEN_RATE to 0 (Math.trunc would — the frozen-loop bug)", () => {
+    // A rate-0 write re-triggers the firmware minute-tick loop; the frozen clock uses
+    // the tiny QEMU_FROZEN_RATE (1e-3) instead, which must survive as a non-zero token.
+    const arg = setFakeTimeCmd(1577836800, QEMU_FROZEN_RATE).args[1];
+    expect(arg).toContain("echo 1577836800 0.001000");
+    expect(arg).not.toMatch(/ 0 >/);   // never the bare rate-0 the fix avoids
+    noQuotes(arg);                      // digits + "." only → still shell-safe
+  });
+
+  it("non-finite rate degrades to a shell-safe 0", () => {
+    expect(setFakeTimeCmd(1, Number.NaN).args[1]).toContain("echo 1 0 >");
   });
 
   it("parseSelfTest accepts ±120s around the expected faked epoch", () => {

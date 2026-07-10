@@ -18,7 +18,6 @@ interface StudioApi {
   install(pbwPath: string): Promise<unknown>;
   button(id: string, action?: string): Promise<unknown>;
   accelTap(): Promise<unknown>;
-  screenshot(out: string): Promise<unknown>;
   // Backlight-free framebuffer screenshot. Resolves with the saved absolute path,
   // or null on ANY failure (renderer falls back to the canvas + backlight grab).
   screenshotFramebuffer(name: string): Promise<string | null>;
@@ -69,7 +68,7 @@ interface StudioApi {
   // sdkInstall opens a picker then installs ("Replace & persist", null = cancel);
   // sdkReset returns to the bundled SDK.
   sdkInfo(): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }>;
-  sdkInstall(): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean } | null>;
+  sdkInstall(mode?: "file" | "folder"): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean } | null>;
   sdkReset(): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }>;
   // v1.0.0: app version + application-menu action subscription.
   appVersion(): Promise<string>;

@@ -59,6 +59,16 @@ export const FW_REFRESH_BOARDS = ["basalt", "chalk", "diorite", "emery", "gabbro
 /** The two per-board qemu firmware blobs the `.fw-rev` marker versions. */
 export const FW_REFRESH_BLOBS = ["qemu_micro_flash.bin", "qemu_spi_flash.bin.bz2"] as const;
 
+/**
+ * Strip a Windows extended-length path prefix (`\\?\` or `\\?\UNC\`) so an
+ * extended-length link target compares equal to a normal one. PURE.
+ */
+export function stripExtendedPrefix(p: string): string {
+  if (p.startsWith("\\\\?\\UNC\\")) return "\\\\" + p.slice(8);
+  if (p.startsWith("\\\\?\\")) return p.slice(4);
+  return p;
+}
+
 function compareVersions(a: string, b: string): number {
   const pa = a.split(".").map(Number);
   const pb = b.split(".").map(Number);
@@ -120,6 +130,17 @@ export function parseSdkCoreManifest(raw: string): { version: string } | null {
 export const ACTIVE_SDK_MARKER = ".active-sdk";
 
 /**
+ * Sentinel written INTO a provisioned `sdk-core\` ONLY after its full tree has
+ * copied and its manifest re-validated. Completeness can't be judged from
+ * `manifest.json` alone: `cp` copies in directory order and `manifest.json`
+ * sorts before the large `pebble\` firmware tree, so a crash/disk-full mid-copy
+ * leaves a manifest that validates over a tree whose firmware is missing. The
+ * sentinel closes that window — a copy that never finished never gets it, so the
+ * next launch self-heals by re-copying. Holds the version string it certifies.
+ */
+export const SDK_COMPLETE_MARKER = ".complete";
+
+/**
  * Read + validate the user SDK override. Returns the version when the marker
  * names a version whose persist-side `sdk-core\manifest.json` validates; null
  * otherwise — a missing, stale, or corrupt override silently falls back to the
@@ -151,6 +172,8 @@ export interface WinSdkPaths {
   targetSdkCore: string;
   /** `<targetSdkCore>\manifest.json` */
   targetManifest: string;
+  /** `<targetSdkCore>\.complete` completeness sentinel (see SDK_COMPLETE_MARKER). */
+  targetComplete: string;
   /** `<persist>\pebble-sdk\SDKs\<ver>\toolchain\lib\pc-bios\keymaps` */
   targetKeymaps: string;
   /** `<persist>\pebble-sdk\SDKs\current` (junction → targetVersionDir). */
@@ -187,6 +210,7 @@ export function planWinSdkProvision(ctx: WinRuntimeCtx, version: string): WinSdk
     targetVersionDir,
     targetSdkCore,
     targetManifest: winPath.join(targetSdkCore, "manifest.json"),
+    targetComplete: winPath.join(targetSdkCore, SDK_COMPLETE_MARKER),
     targetKeymaps: winPath.join(targetVersionDir, "toolchain", "lib", "pc-bios", "keymaps"),
     currentLink: winPath.join(persistSdks, "current"),
     bundleFwRev: winPath.join(bundleSdkCore, ".fw-rev"),
@@ -278,7 +302,10 @@ export function realProvisionFs(): ProvisionFs {
       // otherwise remove whatever is there and create a fresh junction.
       try {
         const cur = await readlink(link);
-        if (winPath.resolve(cur) === winPath.resolve(target)) return;
+        // readlink on a Windows junction returns a `\\?\C:\…` extended-length
+        // target; strip that prefix before comparing or the compare never matches
+        // and we needlessly delete+recreate the junction on every boot.
+        if (winPath.resolve(stripExtendedPrefix(cur)) === winPath.resolve(target)) return;
       } catch {
         /* not a link / missing — fall through to (re)create */
       }
@@ -378,8 +405,8 @@ export async function provisionWinSdk(
   // Its sdk-core already lives in the persist dir (the upload put it there), so
   // the copy/keymaps steps below see a valid target and no-op, the junction
   // points `current` at it, and the bundle-keyed firmware refresh is skipped
-  // (the override version has no bundle source). A missing/corrupt override
-  // falls back to the bundled version, so a bad upload can't wedge boot.
+  // (step 4 gates on `!override`). A missing/corrupt override falls back to the
+  // bundled version, so a bad upload can't wedge boot.
   const persistSdkRoot = winPath.join(pebbleDataDir(ctx), "pebble-sdk");
   const override = await readActiveSdkOverride(fs, persistSdkRoot);
   const version = override ?? pickSdkVersion(await fs.list(bundleSdksDir));
@@ -395,16 +422,33 @@ export async function provisionWinSdk(
     refreshedFirmware: false,
   };
 
-  // 1. sdk-core — copy when the target manifest is missing or invalid.
-  if (!isSdkCoreManifestValid(await fs.readText(p.targetManifest), version)) {
-    log(`Provisioning Pebble SDK ${version}…`);
-    await fs.mkdirp(p.targetVersionDir);
-    // Remove a partial/corrupt prior copy before re-copying so cp can't merge.
-    await fs.copyTree(p.bundleSdkCore, p.targetSdkCore);
-    if (!isSdkCoreManifestValid(await fs.readText(p.targetManifest), version)) {
-      throw new Error(`sdk-core copy failed validation at ${p.targetSdkCore}`);
+  // 1. sdk-core — (re)copy unless the target is COMPLETE: a valid manifest AND
+  // the `.complete` sentinel (see SDK_COMPLETE_MARKER). The manifest alone can
+  // validate over a torn tree, so the sentinel is what gates "done".
+  const manifestValid = isSdkCoreManifestValid(await fs.readText(p.targetManifest), version);
+  const complete = manifestValid && (await fs.exists(p.targetComplete));
+  if (!complete) {
+    // An override's sdk-core lives in the persist dir with no bundle to copy FROM
+    // (its version differs from the bundle's). If its manifest validates, the
+    // tree is the upload's own — heal the missing sentinel WITHOUT a destructive
+    // re-copy (which would delete the upload and fail with no source).
+    const haveBundleSource = await fs.exists(p.bundleSdkCore);
+    if (manifestValid && !haveBundleSource) {
+      await fs.writeText(p.targetComplete, version);
+    } else {
+      log(`Provisioning Pebble SDK ${version}…`);
+      // Remove a partial/corrupt prior copy before re-copying so cp can't merge
+      // a stale tree with the fresh one (the self-heal the sentinel triggers).
+      await fs.remove(p.targetSdkCore);
+      await fs.mkdirp(p.targetVersionDir);
+      await fs.copyTree(p.bundleSdkCore, p.targetSdkCore);
+      if (!isSdkCoreManifestValid(await fs.readText(p.targetManifest), version)) {
+        throw new Error(`sdk-core copy failed validation at ${p.targetSdkCore}`);
+      }
+      // Stamp completeness LAST, once the whole tree copied + re-validated.
+      await fs.writeText(p.targetComplete, version);
+      actions.copiedSdkCore = true;
     }
-    actions.copiedSdkCore = true;
   }
 
   // 2. keymaps — qemu's `-L <ver>\toolchain\lib\pc-bios` needs keymaps\en-us.
@@ -432,10 +476,17 @@ export async function provisionWinSdk(
   // 4. firmware refresh — pick up updated emulator firmware for an already-
   // provisioned install when the bundled `.fw-rev` changed. Gated to a no-op in
   // the common case; wrapped so a refresh failure can never break provisioning.
-  try {
-    actions.refreshedFirmware = await refreshWinSdkFirmware(fs, p, actions.copiedSdkCore, log);
-  } catch (e) {
-    log(`Firmware refresh skipped (non-fatal): ${(e as Error)?.message ?? e}`);
+  // SKIPPED entirely under a user override: the refresh is keyed on the BUNDLE's
+  // firmware, and injecting it into an upload would violate the upload's
+  // replace-only firmware set (a same-version upload deliberately omits boards
+  // the bundle ships — see applyFullLauncherFirmware). The install path already
+  // overlaid the full-launcher firmware replace-only.
+  if (!override) {
+    try {
+      actions.refreshedFirmware = await refreshWinSdkFirmware(fs, p, actions.copiedSdkCore, log);
+    } catch (e) {
+      log(`Firmware refresh skipped (non-fatal): ${(e as Error)?.message ?? e}`);
+    }
   }
 
   log(`Pebble SDK ${version} ready.`);

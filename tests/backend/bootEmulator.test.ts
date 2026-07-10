@@ -255,7 +255,7 @@ describe("bootEmulator cancellation", () => {
     expect(elapsed).toBeLessThan(2000);
   });
 
-  it("does NOT retry when the first attempt aborts via BootAborted (cancel)", async () => {
+  it("does NOT retry when the first attempt aborts via BootAborted (cancel), but tears down the raced stack", async () => {
     const bootControl = vi.fn(async () => {});
     const killAll = vi.fn(async () => {});
     await expect(
@@ -270,8 +270,10 @@ describe("bootEmulator cancellation", () => {
         waitForPort: async () => {},
       }),
     ).rejects.toBeInstanceOf(BootAborted);
-    expect(bootControl).toHaveBeenCalledTimes(1);
-    expect(killAll).toHaveBeenCalledTimes(1); // only the initial teardown — no retry kill
+    expect(bootControl).toHaveBeenCalledTimes(1); // no retry launch
+    // Initial teardown + a best-effort cleanup of the stack this attempt spawned
+    // before the abort — so a cancelled boot never orphans qemu/pypkjs/websockify.
+    expect(killAll).toHaveBeenCalledTimes(2);
   });
 
   it("does NOT retry when the token is cancelled even if the failure is a plain Error", async () => {
@@ -500,7 +502,7 @@ describe("bootControl wrapper routing (PEBBLE_QEMU_PATH)", () => {
     calls.length = 0;
     const deps = makeNativeBootDeps();
     await deps.bootControl("basalt");
-    const call = calls.find((c) => c.cmd === "bash");
+    const call = calls.find((c) => c.cmd === "bash" && String(c.args[1]).includes("emu-control"));
     expect(call).toBeDefined();
     const wrapped = String(call!.args[1]);
     expect(wrapped).toContain(
@@ -509,10 +511,41 @@ describe("bootControl wrapper routing (PEBBLE_QEMU_PATH)", () => {
     expect(WRAPPER).toBe("$HOME/.pebble-studio/qemu-pebble");
   });
 
+  it("resets the fake-clock control file to real time before launching qemu", async () => {
+    // The shim anchors to real time at process start, so a relative "-" target
+    // read at realize seeds the f2xx RTC correctly; without this reset a prior
+    // session's absolute System write would be re-read one boot stale.
+    const nowMs = 1_750_000_000_000;
+    const selfTestOut = String(Math.floor(nowMs / 1000) + 86400);
+    await ensureTimeShim(
+      async () => ({ code: 0, stdout: selfTestOut, stderr: "" }),
+      { resources: async () => ({ so: Buffer.from("so"), src: Buffer.from("src") }), now: () => nowMs },
+    );
+
+    calls.length = 0;
+    const deps = makeNativeBootDeps();
+    await deps.bootControl("basalt");
+
+    const resetIdx = calls.findIndex((c) => String(c.args[1]).startsWith("echo - 1"));
+    const bootIdx = calls.findIndex((c) => String(c.args[1]).includes("emu-control"));
+    expect(resetIdx).toBeGreaterThanOrEqual(0);
+    expect(bootIdx).toBeGreaterThanOrEqual(0);
+    expect(resetIdx).toBeLessThan(bootIdx);
+    // Never a bare "0" rate — that re-enters the firmware minute-tick loop.
+    expect(String(calls[resetIdx].args[1])).toContain("1.000000");
+  });
+
+  it("does not touch the control file when the shim is not ready", async () => {
+    calls.length = 0;
+    const deps = makeNativeBootDeps();
+    await deps.bootControl("basalt");
+    expect(calls.some((c) => String(c.args[1]).startsWith("echo - 1"))).toBe(false);
+  });
+
   it("uses no prefix when the shim is not ready", async () => {
     const deps = makeNativeBootDeps();
     await deps.bootControl("basalt");
-    const call = calls.find((c) => c.cmd === "bash");
+    const call = calls.find((c) => c.cmd === "bash" && String(c.args[1]).includes("emu-control"));
     expect(call).toBeDefined();
     const wrapped = String(call!.args[1]);
     expect(wrapped).toContain("pebble emu-control --emulator basalt --vnc");

@@ -17,7 +17,16 @@ export async function writeSimEnv(userDataDir: string, cfg: SimEnvConfig): Promi
 export async function readSimEnv(userDataDir: string): Promise<SimEnvConfig> {
   try {
     const raw = await fs.readFile(simEnvPath(userDataDir), "utf-8");
-    return { ...DEFAULT_SIM_ENV, ...(JSON.parse(raw) as Partial<SimEnvConfig>) };
+    const stored = JSON.parse(raw) as Partial<SimEnvConfig>;
+    // Deep-merge the nested objects: a shallow spread would let an OLDER config's
+    // partial `weather`/`location` (missing fields added in a newer version)
+    // replace the default wholesale and drop those newer fields (e.g. isDay).
+    return {
+      ...DEFAULT_SIM_ENV,
+      ...stored,
+      location: { ...DEFAULT_SIM_ENV.location, ...stored.location },
+      weather: { ...DEFAULT_SIM_ENV.weather, ...stored.weather },
+    };
   } catch {
     return DEFAULT_SIM_ENV;
   }

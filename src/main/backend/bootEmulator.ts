@@ -3,11 +3,12 @@ import { connect as netConnect } from "node:net";
 import type { PlatformId } from "../../shared/types.js";
 import type { VncEndpoint } from "./BackendDriver.js";
 import { EMU_INFO_PATH, EMU_LOG_PATH, SDK_ROOT } from "./hostPaths.js";
+import { VNC_RFB_PORT, WS_PORT } from "./ports.js";
 // isShimReady() reads the module-level readiness cache populated by
 // ensureTimeShim() (driver.ensureTimeShim(), called from ipc before each boot).
 // bootEmulator never deploys the shim itself; it only reads the result to
 // decide whether to route qemu through the wrapper.
-import { isShimReady, WRAPPER } from "./timeShim.js";
+import { isShimReady, setFakeTimeCmd, WRAPPER } from "./timeShim.js";
 
 /**
  * Real-boot orchestration for the qemu-pebble emulator (Task 1.5).
@@ -46,8 +47,6 @@ import { isShimReady, WRAPPER } from "./timeShim.js";
 // boot-keymap details, not host-path policy.
 const PC_BIOS = `${SDK_ROOT}/toolchain/lib/pc-bios`;
 const STUB_KEYMAP = "$HOME/.pebble-qemu-data/keymaps/en-us";
-const VNC_RFB_PORT = 5901;
-const WS_PORT = 6080;
 
 /**
  * Cancellation token for an in-flight boot. The orchestrator and the poll
@@ -345,7 +344,17 @@ function makeBootControl(shell: Shell) {
     // pebble-tool's first-class PEBBLE_QEMU_PATH hook (emulator.py:279). The
     // env assignment is part of the (quote-free) cmdline so it crosses the
     // WSL boundary inside the same single shQuote layer as the rest.
-    const prefix = isShimReady() ? `PEBBLE_QEMU_PATH=${WRAPPER} ` : "";
+    const shim = isShimReady();
+    if (shim) {
+      // Reset the fake-clock control file to real time BEFORE qemu spawns. The
+      // shim anchors to real time at process start, so "-" reads as real then;
+      // this clears a prior session's custom/frozen target and keeps the f2xx
+      // RTC boot-seed correct while making timeController's absolute System
+      // write safe across restarts. Mirrors WindowsNativeDriver.start().
+      const [, resetCmdline] = setFakeTimeCmd(null, 1).args;
+      await shell.run(resetCmdline).catch(() => { /* best-effort */ });
+    }
+    const prefix = shim ? `PEBBLE_QEMU_PATH=${WRAPPER} ` : "";
     await shell.spawnDetached(`${prefix}pebble emu-control --emulator ${id} --vnc`);
   };
 }
@@ -361,10 +370,13 @@ function defaultPortFree(host: string, port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const sock = netConnect({ host, port });
     sock.setTimeout(1000);
-    const free = () => { sock.destroy(); resolve(true); };
+    // Only a REFUSED connect (error) proves the port is free. A timeout is NOT
+    // "free": on a loaded box a stale listener can be slow to accept, and calling
+    // it gone would let a relaunch race the not-yet-released port (the watchface
+    // hang). Treat timeout as occupied/unknown so waitUntilDead keeps polling.
     sock.once("connect", () => { sock.destroy(); resolve(false); });
-    sock.once("error", free);
-    sock.once("timeout", free);
+    sock.once("error", () => { sock.destroy(); resolve(true); });
+    sock.once("timeout", () => { sock.destroy(); resolve(false); });
   });
 }
 
@@ -447,12 +459,21 @@ function makeKillAll(shell: Shell) {
   // if killed alone, so we kill the supervisor FIRST, then qemu/websockify/pypkjs,
   // then `pebble kill` for any state-file pids. We sweep TWICE (with a short settle)
   // to catch anything that respawned in the race window, then delete the state file.
+  //
+  // ANCHORING (don't SIGKILL a stranger): each `-f` pattern must match ONLY our
+  // stack. websockify in particular is the generic noVNC proxy — a bare
+  // `[w]ebsockify` would kill an unrelated user's noVNC — so we anchor it to the
+  // fixed ports OUR websockify always carries in its argv
+  // (`websockify --heartbeat=30 6080 localhost:5901`). emu-control / qemu-pebble /
+  // `-m pypkjs` are already uniquely ours. `pebble kill` is BOUNDED by coreutils
+  // `timeout` (quote-free, like setTzOffsetCmd): a wedged pebble-tool would
+  // otherwise hang stop/boot forever — SIGTERM at 5s, SIGKILL at 7s.
   const sweep =
     `pkill -9 -f '[e]mu-control' 2>/dev/null; ` +
     `pkill -9 -f '[q]emu-pebble' 2>/dev/null; ` +
-    `pkill -9 -f '[w]ebsockify' 2>/dev/null; ` +
+    `pkill -9 -f '[w]ebsockify.*${WS_PORT} localhost:${VNC_RFB_PORT}' 2>/dev/null; ` +
     `pkill -9 -f '[m] pypkjs' 2>/dev/null; ` +
-    `pebble kill 2>/dev/null; true`;
+    `timeout -k 2 5 pebble kill 2>/dev/null; true`;
   return async function killAll(): Promise<void> {
     await shell.run(`${sweep}; sleep 0.4; ${sweep}; rm -f ${EMU_INFO_PATH} 2>/dev/null; true`);
     // Give the OS a beat to release the VNC display + ports…
@@ -613,6 +634,13 @@ export async function bootEmulator(
   // then wait for readiness: state file, raw RFB, and the websocket proxy. The
   // token threads into each wait so a cancel interrupts the active loop.
   const attempt = async (): Promise<VncEndpoint> => {
+    // Re-check RIGHT before spawning: teardown (ipc.stop) flips the token and runs
+    // driver.stop() concurrently. Without this recheck a cancel that lands after
+    // the retry-loop's top-of-iteration check would still spawn a fresh detached
+    // emu-control stack, which the concurrent stop has already swept past — the
+    // next wait then throws BootAborted and (before this fix) left qemu/pypkjs/
+    // websockify orphaned holding the ports while the UI said "stopped".
+    if (token?.cancelled) throw new BootAborted();
     step("Launching qemu (pebble emu-control --vnc)…");
     await d.bootControl(platformId);
     // Each wait emits periodic elapsed + health-snapshot notes so a stall shows
@@ -653,7 +681,13 @@ export async function bootEmulator(
       step("Ready");
       return ep;
     } catch (err) {
-      if (err instanceof BootAborted || token?.cancelled) throw err;
+      if (err instanceof BootAborted || token?.cancelled) {
+        // A stop raced this attempt: we may have spawned a fresh emu-control stack
+        // AFTER the concurrent stop's sweep finished. Best-effort tear it down so a
+        // cancelled boot never orphans qemu/pypkjs/websockify on the ports.
+        await d.killAll().catch(() => {});
+        throw err;
+      }
       lastErr = err;
       const msg = err instanceof Error ? err.message : String(err);
       step(`Attempt ${i} of ${MAX_BOOT_ATTEMPTS} failed: ${msg}`);
@@ -689,7 +723,10 @@ export async function bootEmulator(
       step("Ready (recovered after wipe)");
       return ep;
     } catch (err) {
-      if (err instanceof BootAborted || token?.cancelled) throw err;
+      if (err instanceof BootAborted || token?.cancelled) {
+        await d.killAll().catch(() => {}); // same orphan-cleanup as the retry loop
+        throw err;
+      }
       lastErr = err;
       const msg = err instanceof Error ? err.message : String(err);
       step(`Recovery attempt after wipe failed: ${msg}`);

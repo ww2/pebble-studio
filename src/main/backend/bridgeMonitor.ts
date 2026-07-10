@@ -147,7 +147,19 @@ export function makeBridgeMonitor(deps: BridgeMonitorDeps): BridgeMonitor {
       // Fire-and-forget inside the interval; errors are swallowed because a
       // poll step is best-effort — a transient shell error should not crash the
       // app. The next interval tick will retry.
-      poll().catch(() => {}).finally(() => { pollInFlight = false; });
+      //
+      // The latch is released via a race against a deadline: on the WSL path poll()
+      // awaits `wsl.exe -- bash -lc …` through an UNBOUNDED runner, so a single hung
+      // probe would never reach `.finally`, leave pollInFlight stuck true, and
+      // silently kill the monitor for the whole session. If a poll outlives the
+      // deadline we release the latch anyway (trading strict non-overlap for
+      // liveness — a subsequent overlapping poll is harmless; the sessionId guard
+      // still blocks stale mutation).
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      Promise.race([
+        poll().catch(() => {}),
+        new Promise<void>((resolve) => { deadline = setTimeout(resolve, pollMs * 2); }),
+      ]).finally(() => { if (deadline) clearTimeout(deadline); pollInFlight = false; });
     }, pollMs);
   }
 

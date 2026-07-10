@@ -27,6 +27,14 @@ export interface WinRuntimeCtx {
   repoRoot: string;
   /** electron app.getPath("userData") — the writable per-user app-data dir. */
   userDataDir: string;
+  /**
+   * Dev-only OPT-IN directory for the not-yet-staged python bundle. Populated from
+   * PEBBLE_STUDIO_PY_DEV_DIR (unset in packaged builds and by default). Gating the
+   * fallback behind this explicit env var closes a local-privilege hole: the old
+   * hardcoded `C:\tmp\pebble-py-build\python` is world-creatable, so any user could
+   * plant PebbleStudioEmu.exe there and have a dev machine execute it.
+   */
+  pyDevDir?: string;
   /** Existence predicate (injected in tests). Defaults to fs.existsSync. */
   exists?: (p: string) => boolean;
 }
@@ -44,26 +52,16 @@ const TIMESHIM_WIN_BUNDLE = "timeshim-win";
  * is safe. The build script (build-pebble-py.ps1) emits this name. */
 const PY_EXE_NAME = "PebbleStudioEmu.exe";
 
-/**
- * Dev-only fallback for the not-yet-staged python bundle: the build script
- * (`scripts/build-pebble-py.ps1`) stages to `vendor/pebble-py`, but until that
- * runs the relocatable bundle lives at this `C:\tmp` build output.
- */
-const TMP_PY_FALLBACK = "C:\\tmp\\pebble-py-build\\python";
-
 function exists(ctx: WinRuntimeCtx, p: string): boolean {
   return (ctx.exists ?? existsSync)(p);
 }
 
 /**
- * Resolve a bundle dir. Packaged → under resourcesPath. Dev → repo `vendor/<name>`
- * when present, else the optional `fallback` (used for bundles not yet staged).
+ * Resolve a bundle dir. Packaged → under resourcesPath. Dev → repo `vendor/<name>`.
  */
-function bundleDir(ctx: WinRuntimeCtx, name: string, fallback?: string): string {
+function bundleDir(ctx: WinRuntimeCtx, name: string): string {
   if (ctx.packaged) return winPath.join(ctx.resourcesPath, name);
-  const vendor = winPath.join(ctx.repoRoot, "vendor", name);
-  if (fallback && !exists(ctx, vendor)) return fallback;
-  return vendor;
+  return winPath.join(ctx.repoRoot, "vendor", name);
 }
 
 /** Absolute path to the bundled qemu-pebble.exe. */
@@ -71,9 +69,23 @@ export function qemuExe(ctx: WinRuntimeCtx): string {
   return winPath.join(bundleDir(ctx, QEMU_BUNDLE), "qemu-pebble.exe");
 }
 
-/** Directory of the relocatable bundled python (hosts pebble-tool). */
+/** Directory of the relocatable bundled python (hosts pebble-tool). Packaged →
+ * under resourcesPath. Dev → repo `vendor/pebble-py`, or the EXPLICIT opt-in dir
+ * (PEBBLE_STUDIO_PY_DEV_DIR → ctx.pyDevDir) when the vendor bundle isn't staged. */
 export function pebblePyDir(ctx: WinRuntimeCtx): string {
-  return bundleDir(ctx, PY_BUNDLE, TMP_PY_FALLBACK);
+  if (ctx.packaged) return winPath.join(ctx.resourcesPath, PY_BUNDLE);
+  const vendor = winPath.join(ctx.repoRoot, "vendor", PY_BUNDLE);
+  if (exists(ctx, vendor)) return vendor;
+  // Vendor bundle not staged. Only fall back to a dev dir if the developer
+  // explicitly opted in — and log loudly, since we're about to execute an
+  // interpreter from a non-standard location. With no opt-in we return the
+  // (absent) vendor path, so bundledToolsPresent reads the native stack as
+  // unavailable rather than silently running code from a world-writable path.
+  if (ctx.pyDevDir) {
+    console.warn(`[winRuntime] PEBBLE_STUDIO_PY_DEV_DIR set — using dev python bundle at ${ctx.pyDevDir}`);
+    return ctx.pyDevDir;
+  }
+  return vendor;
 }
 
 /** Absolute path to the bundled interpreter (PebbleStudioEmu.exe). */
@@ -144,5 +156,7 @@ export async function defaultCtx(): Promise<WinRuntimeCtx> {
     resourcesPath: process.resourcesPath,
     repoRoot: winPath.resolve(__dirname, "..", ".."),
     userDataDir: app.getPath("userData"),
+    // Opt-in only; unset (and ignored) in packaged builds, which short-circuit above.
+    pyDevDir: process.env.PEBBLE_STUDIO_PY_DEV_DIR,
   };
 }

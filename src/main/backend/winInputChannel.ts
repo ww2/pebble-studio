@@ -159,9 +159,7 @@ export class WinInputChannel {
   /** Write one command and resolve on the helper's OK/ERR ack (false on timeout,
    * broken pipe, busy slot, or an unavailable/stdout-less channel). */
   private awaitAck(line: string, timeoutMs: number): Promise<boolean> {
-    // The helper reads ONE command per stdin line, so an embedded CR/LF would let
-    // a caller's argument inject a second command. Refuse such lines outright.
-    if (/[\r\n]/.test(line)) return Promise.resolve(false);
+    if (/[\r\n]/.test(line)) return Promise.resolve(false); // see writeCommand
     if (!this.ensure() || !this.child || !this.child.onLine) return Promise.resolve(false);
     if (this.pendingAck) return Promise.resolve(false);
     return new Promise<boolean>((resolve) => {
@@ -178,15 +176,34 @@ export class WinInputChannel {
       }, timeoutMs);
       const settle = (ok: boolean): void => finish(ok);
       this.pendingAck = settle;
-      try {
-        this.child!.stdinWrite(line + "\n");
-      } catch {
-        this.child = null;
-        this.port = null;
+      if (!this.writeCommand(line)) {
+        // Channel unavailable / broken pipe (writeCommand dropped the child).
         if (this.pendingAck === settle) this.pendingAck = null;
         finish(false);
       }
     });
+  }
+
+  /**
+   * Write ONE command line to the helper's stdin (newline appended here). Returns
+   * true on success; false if the channel is unavailable or the write throws
+   * (broken pipe → drop the child so the next call respawns). Shared by send()
+   * and awaitAck() so BOTH reject a line containing CR/LF: the helper reads one
+   * command per line, so an embedded newline would let a caller's argument inject
+   * a SECOND helper command (e.g. `screenshot <path>`, an arbitrary file write).
+   */
+  private writeCommand(line: string): boolean {
+    if (/[\r\n]/.test(line)) return false;
+    if (!this.ensure() || !this.child) return false;
+    try {
+      this.child.stdinWrite(line + "\n");
+      return true;
+    } catch {
+      // Broken pipe — drop the child so the next call respawns it.
+      this.child = null;
+      this.port = null;
+      return false;
+    }
   }
 
   /** Insert a timeline pin (id, absolute unix time, title) via the helper. The id
@@ -212,16 +229,7 @@ export class WinInputChannel {
    * fall back to the per-press CLI path).
    */
   send(line: string): boolean {
-    if (!this.ensure() || !this.child) return false;
-    try {
-      this.child.stdinWrite(line + "\n");
-      return true;
-    } catch {
-      // Broken pipe — drop the child so the next send respawns it.
-      this.child = null;
-      this.port = null;
-      return false;
-    }
+    return this.writeCommand(line);
   }
 
   /** Terminate the helper (called on emulator stop). Idempotent. */

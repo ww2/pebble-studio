@@ -1,3 +1,10 @@
+# NOTE: no `electronFuses` block here. The installed electron-builder (25.1.8 /
+# app-builder-lib 25.1.8) has no fuses support (the key is absent from its config
+# schema), so adding it would fail validation rather than flip any fuse. Revisit
+# once electron-builder is upgraded to a version that supports electronFuses; when
+# doing so, keep `enableEmbeddedAsarIntegrityValidation` OFF — this project ships
+# unsigned (signAndEditExecutable: false) and integrity validation breaks unsigned
+# Windows builds.
 appId: com.jasonlin.pebblestudio
 productName: Pebble Studio
 directories:

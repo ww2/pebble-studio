@@ -51,6 +51,16 @@ describe("parseMonitorPort", () => {
     const json = JSON.stringify({ basalt: { "4.9": { qemu: { monitor: "nope" } } } });
     expect(parseMonitorPort(json)).toBeNull();
   });
+
+  it("with a platform arg, returns only that platform's monitor (ignores a stale other-platform entry)", () => {
+    const json = JSON.stringify({
+      basalt: { "4.9": { qemu: { monitor: 11111 } } }, // stale, dead qemu
+      emery: { "4.9": { qemu: { monitor: 22222 } } },  // the live one
+    });
+    expect(parseMonitorPort(json, "emery")).toBe(22222);
+    expect(parseMonitorPort(json, "basalt")).toBe(11111);
+    expect(parseMonitorPort(json, "chalk")).toBeNull(); // no entry for this platform
+  });
 });
 
 /**

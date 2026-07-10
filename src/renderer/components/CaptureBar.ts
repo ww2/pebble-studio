@@ -47,6 +47,13 @@ export class CaptureBar {
   private recording = false;
   private gif: InstanceType<typeof GIF> | null = null;
   private recTimer: ReturnType<typeof setInterval> | null = null;
+  /** Pending post-roll backlight release from stopRecord(); tracked so a new
+   * capture started within the post-roll window can cancel it before it releases
+   * the hold mid-capture (which would dim the new frames — the very thing the
+   * hold prevents). */
+  private backlightReleaseTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Auto-clear timer for a transient status message (errors / not-running). */
+  private statusClearTimer: ReturnType<typeof setTimeout> | null = null;
   /** Set once the backlight-free framebuffer screenshot has failed this session,
    * so later shots skip straight to the canvas path instead of re-timing-out. */
   private framebufferShotUnavailable = false;
@@ -126,6 +133,13 @@ export class CaptureBar {
     this.el.appendChild(this.recBtn);
     this.el.appendChild(this.lightBtn);
     this.el.appendChild(this.status);
+
+    // Keyboard shortcuts: EmulatorView dispatches these (only while the emulator is
+    // live, and not while a modal / rebind capture is active) so a bound key can
+    // capture without the Capture pane being the open inspector. Event names are
+    // mirrored in EmulatorView.handleKeyDown.
+    window.addEventListener("pebble-studio:capture-screenshot", () => void this.takeScreenshot());
+    window.addEventListener("pebble-studio:capture-record", () => void this.toggleRecord());
   }
 
   /** Selected duration in seconds, or 0 for Manual. */
@@ -135,6 +149,37 @@ export class CaptureBar {
 
   private factor(): number {
     return parseInt(this.select.value, 10);
+  }
+
+  /** True when the emulator screen is actually live (a noVNC <canvas> exists).
+   * The host element (#emu-screen) is always present, so its existence alone is
+   * not enough — grabbing before a canvas is attached throws "No canvas found". */
+  private hasLiveScreen(): boolean {
+    const host = this.getHost();
+    return !!host && !!host.querySelector("canvas");
+  }
+
+  /** Write the status line. `autoClear` transient messages (errors, "not running")
+   * wipe themselves after a few seconds so a stale error doesn't linger; steady
+   * messages ("Saved: …", "Recording…") persist and cancel any pending clear. */
+  private setStatus(text: string, autoClear = false): void {
+    if (this.statusClearTimer !== null) { clearTimeout(this.statusClearTimer); this.statusClearTimer = null; }
+    this.status.textContent = text;
+    if (autoClear) {
+      this.statusClearTimer = setTimeout(() => {
+        this.statusClearTimer = null;
+        this.status.textContent = "";
+      }, 4000);
+    }
+  }
+
+  /** Cancel a pending post-roll backlight release so it can't fire mid-capture and
+   * drop the hold that keeps frames bright. Called before each new hold. */
+  private cancelBacklightRelease(): void {
+    if (this.backlightReleaseTimer !== null) {
+      clearTimeout(this.backlightReleaseTimer);
+      this.backlightReleaseTimer = null;
+    }
   }
 
   /** K: true when "backlight during capture" is enabled (default ON when unset). */
@@ -186,7 +231,13 @@ export class CaptureBar {
 
   private async takeScreenshot(): Promise<void> {
     const host = this.getHost();
-    if (!host) { this.status.textContent = "No emulator screen"; return; }
+    if (!host) { this.setStatus("No emulator screen", true); return; }
+    // Friendly guard: without a live canvas the grab throws a raw "No canvas found
+    // inside host element". Tell the user to launch instead.
+    if (!this.hasLiveScreen()) { this.setStatus("Emulator isn't running — launch it first.", true); return; }
+    // A prior GIF's post-roll release must not fire during this shot's backlight
+    // hold; cancel it so the hold we take below owns the release.
+    this.cancelBacklightRelease();
 
     // Preferred path: a BACKLIGHT-FREE framebuffer grab over the watch protocol
     // (reads the firmware framebuffer, bright regardless of the LCD backlight), so
@@ -200,13 +251,18 @@ export class CaptureBar {
     // To avoid paying that timeout on EVERY shot, the first failure disables the
     // framebuffer attempt for the rest of the session — so at most one slow shot,
     // then straight to canvas.
-    if (this.sunlightCorrection() && !this.framebufferShotUnavailable) {
+    //
+    // Restricted to 1×: main writes the framebuffer PNG at native resolution and
+    // has no upscale hook, so taking this path with a factor > 1 would silently
+    // ignore the Upscale setting. The canvas path applies the same sunlight LUT and
+    // does honour the factor, so defer to it whenever an upscale is requested.
+    if (this.sunlightCorrection() && this.factor() === 1 && !this.framebufferShotUnavailable) {
       try {
         const base = `pebble-shot-${this.getPlatformId()}`;
         const name = await window.studio.nextCaptureName(base, "png");
         const saved = await window.studio.screenshotFramebuffer(name);
         if (saved) {
-          this.status.textContent = `Saved: ${saved}`;
+          this.setStatus(`Saved: ${saved}`);
           return;
         }
         // Returned null → framebuffer path unavailable here; stop trying it.
@@ -236,12 +292,12 @@ export class CaptureBar {
         const base = `pebble-shot-${this.getPlatformId()}`;
         const name = await window.studio.nextCaptureName(base, "png");
         const saved = await window.studio.saveCapture(name, bytes);
-        this.status.textContent = `Saved: ${saved}`;
+        this.setStatus(`Saved: ${saved}`);
       } finally {
         await this.setBacklightHold(false);
       }
     } catch (err) {
-      this.status.textContent = `Screenshot failed: ${String(err)}`;
+      this.setStatus(`Screenshot failed: ${String(err)}`, true);
       console.error("[capture] screenshot error", err);
     }
   }
@@ -256,14 +312,23 @@ export class CaptureBar {
 
   private async startRecord(): Promise<void> {
     const host = this.getHost();
-    if (!host) { this.status.textContent = "No emulator screen"; return; }
+    if (!host) { this.setStatus("No emulator screen", true); return; }
+    if (!this.hasLiveScreen()) { this.setStatus("Emulator isn't running — launch it first.", true); return; }
 
     // Mark recording immediately so the button reads "Stop GIF" and a second
     // click can't start a parallel recording during the pre-roll await below.
     this.recording = true;
     this.recBtn.textContent = "Stop GIF";
     this.recBtn.classList.add("capture-btn--recording");
+    // Latching happens below (factor/round/correct read once); the encoder's frame
+    // size is fixed from the first frame, so lock the Upscale + Duration selects
+    // while recording — changing Upscale mid-record would feed gif.js mismatched
+    // frame sizes (cropped/corrupt output).
+    this.select.disabled = true;
+    this.durationSelect.disabled = true;
 
+    // A prior GIF's post-roll release must not fire during this new recording.
+    this.cancelBacklightRelease();
     // K: hold the backlight on for the whole recording so frames aren't dim;
     // released (after a post-roll) in stopRecord(). Fire-and-forget.
     void this.setBacklightHold(true);
@@ -272,23 +337,29 @@ export class CaptureBar {
     // the GIF is lit from frame one (mirrors the screenshot pre-roll). If the
     // user hits Stop during this beat, stopRecord() flips `recording` off — bail.
     if (this.backlightDuringCapture()) {
-      this.status.textContent = "Lighting…";
+      this.setStatus("Lighting…");
       await new Promise((r) => setTimeout(r, GIF_BACKLIGHT_PREROLL_MS));
       if (!this.recording) return; // cancelled during pre-roll
     }
 
     const correct = this.sunlightCorrection();
+    // Latch the upscale factor once so every frame is grabbed at the SAME size the
+    // gif encoder was created with (the selects are disabled above, but a const is
+    // the unambiguous source of truth to match `correct`/`round`/`platformId`).
+    const factor = this.factor();
 
     // Grab a first frame to determine dimensions
     let firstFrame: RgbaImage;
     try {
-      firstFrame = grabUpscaled(host, this.factor());
+      firstFrame = grabUpscaled(host, factor);
       if (correct) applySunlightLut(firstFrame.data);
     } catch (err) {
-      this.status.textContent = `Grab failed: ${String(err)}`;
+      this.setStatus(`Grab failed: ${String(err)}`, true);
       this.recording = false;
       this.recBtn.textContent = "Record GIF";
       this.recBtn.classList.remove("capture-btn--recording");
+      this.select.disabled = false;
+      this.durationSelect.disabled = false;
       void this.setBacklightHold(false);
       return;
     }
@@ -324,12 +395,26 @@ export class CaptureBar {
         const base = `pebble-rec-${platformId}`;
         const name = await window.studio.nextCaptureName(base, "gif");
         const saved = await window.studio.saveCapture(name, bytes);
-        this.status.textContent = `GIF saved: ${saved}`;
+        this.setStatus(`GIF saved: ${saved}`);
       }).catch((err: unknown) => {
-        this.status.textContent = `GIF save failed: ${String(err)}`;
+        this.setStatus(`GIF save failed: ${String(err)}`, true);
         console.error("[capture] gif save error", err);
       });
     });
+
+    // Frames are grabbed on an interval, but under load the interval slips, so
+    // stamp each frame with its ACTUAL elapsed wall-clock time (not a fixed
+    // frameDelayMs) — otherwise the GIF plays back faster than real time.
+    let lastFrameAt = performance.now();
+    // Secondary safety bound: even if frame accounting somehow stalls, never run
+    // past the budgeted duration plus a small margin.
+    const startedAt = Date.now();
+    const hardStopMs = (maxSeconds + 2) * 1000;
+    // Once the live screen vanishes mid-recording (e.g. Force-close), every grab
+    // throws — tryAdd() never runs, isFull() never trips, and the interval would
+    // loop forever spamming the console. Bail after a few consecutive failures.
+    let consecutiveFailures = 0;
+    const MAX_CONSECUTIVE_FAILURES = 3;
 
     // Add the first frame immediately
     if (budget.tryAdd()) {
@@ -339,21 +424,30 @@ export class CaptureBar {
     }
 
     this.recTimer = setInterval(() => {
-      if (!this.recording || budget.isFull()) {
+      if (!this.recording || budget.isFull() || Date.now() - startedAt >= hardStopMs) {
         this.stopRecord();
         return;
       }
       try {
-        const raw = grabUpscaled(host, this.factor());
+        const raw = grabUpscaled(host, factor);
+        consecutiveFailures = 0;
         if (correct) applySunlightLut(raw.data);
         if (budget.tryAdd()) {
           const frame = this.maybeCircularMask(raw, true);
           const canvas = this.imageToCanvas(frame);
-          gifRef.addFrame(canvas, { delay: budget.frameDelayMs(), copy: true });
-          this.status.textContent = `Recording… ${budget.remaining()} frames left`;
+          const now = performance.now();
+          const delay = Math.max(10, Math.round(now - lastFrameAt));
+          lastFrameAt = now;
+          gifRef.addFrame(canvas, { delay, copy: true });
+          this.setStatus(`Recording… ${budget.remaining()} frames left`);
         }
       } catch (err) {
         console.error("[capture] gif frame error", err);
+        if (++consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          this.setStatus("Recording stopped — emulator screen unavailable.", true);
+          this.stopRecord();
+          return;
+        }
       }
       if (budget.isFull()) {
         this.stopRecord();
@@ -381,14 +475,23 @@ export class CaptureBar {
     this.recording = false;
     this.recBtn.textContent = "Record GIF";
     this.recBtn.classList.remove("capture-btn--recording");
+    // Re-enable the controls locked for the duration of the recording.
+    this.select.disabled = false;
+    this.durationSelect.disabled = false;
     // K (v0.0.13.5): keep the backlight held for a short post-roll after Stop,
     // then release — so the final frames (grabbed just before this) stay lit and
-    // the release never races a last in-flight grab. Fire-and-forget.
-    setTimeout(() => { void this.setBacklightHold(false); }, GIF_BACKLIGHT_POSTROLL_MS);
+    // the release never races a last in-flight grab. Fire-and-forget. The id is
+    // tracked (and cancelled by the next capture) so this stale release can't fire
+    // mid-way through a rapid Record→Stop→Record / screenshot and dim it.
+    this.cancelBacklightRelease();
+    this.backlightReleaseTimer = setTimeout(() => {
+      this.backlightReleaseTimer = null;
+      void this.setBacklightHold(false);
+    }, GIF_BACKLIGHT_POSTROLL_MS);
     if (this.gif) {
       this.gif.render();
       this.gif = null;
-      this.status.textContent = "Encoding GIF…";
+      this.setStatus("Encoding GIF…");
     }
   }
 }
