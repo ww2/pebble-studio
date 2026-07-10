@@ -75,6 +75,27 @@ export function shouldReconnectAfterReboot(
 }
 
 /**
+ * Decide whether a `show()` call is a redundant re-selection of the board that is
+ * already the active one, and therefore a no-op (no teardown, no reboot). True
+ * only when the requested platform matches the current one AND that emulator is
+ * either already `live` or has a boot in flight (`booting`) — re-selecting it
+ * would otherwise force-close a perfectly good backend, or fire a duplicate boot.
+ * A `stopped`/`stopping`/`unresponsive` same-board select is NOT skipped: those
+ * are relaunch/recovery requests that must fall through to the normal boot path.
+ * (Only model-selection and startup call `show()`; explicit Relaunch/retry and
+ * the weather-apply reboot drive `boot()`/`reconnectAfterClear()` directly, so
+ * they are never suppressed by this guard.)
+ */
+export function shouldSkipReselect(
+  currentPlatform: PlatformId | null,
+  requestedPlatform: PlatformId,
+  state: EmuState,
+): boolean {
+  if (currentPlatform !== requestedPlatform) return false;
+  return state === "live" || state === "booting";
+}
+
+/**
  * Decide which action-button GROUPS should draw their leading divider, given each
  * group's vertical offset (offsetTop). A divider sits BETWEEN two groups, so it's
  * only wanted when a group shares a row with the one before it. The first group
@@ -1724,6 +1745,13 @@ export class EmulatorView {
    * point used by startup and model switches.
    */
   async show(platformId: PlatformId, opts: { boot: boolean }): Promise<void> {
+    // Re-selecting the board that is already live (or mid-boot) is a no-op: don't
+    // tear down and reboot a perfectly good backend, and don't fire a duplicate
+    // boot for one already in flight. Applies to both manual and auto — the
+    // manual path also force-closes on a same-board select, which is just as
+    // disruptive. Relaunch/retry and weather-apply reboots don't route through
+    // show(), so they are never suppressed here (see shouldSkipReselect).
+    if (shouldSkipReselect(this.currentPlatform, platformId, this.state)) return;
     if (!opts.boot) {
       // Manual mode: switching the model must not orphan a running backend.
       // loadChrome() only disconnects VNC — it leaves qemu/pypkjs/websockify alive
