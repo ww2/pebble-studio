@@ -40,6 +40,15 @@ describe("LANG_HELPER_PY language-pack helper", () => {
     expect(LANG_HELPER_PY).toContain("t.join(_OVERALL_TIMEOUT)");
     expect(LANG_HELPER_PY).toContain("os._exit(1)");
   });
+  it("translates argparse SystemExit into the one-JSON-line contract", () => {
+    // Malformed invocations (bad --port, missing/unknown subcommand) must still
+    // print exactly one JSON line and exit 1 — bare argparse would exit(2) with
+    // nothing on stdout. Help is disabled so even -h/--help can't print
+    // argparse's help text to stdout ahead of the JSON line.
+    expect(LANG_HELPER_PY).toContain("except SystemExit:");
+    expect(LANG_HELPER_PY).toContain("invalid arguments (see stderr)");
+    expect(LANG_HELPER_PY).toContain("add_help=False");
+  });
   it("stays backslash-free so it embeds verbatim in the TS template literal", () => {
     expect(LANG_HELPER_PY).not.toContain("\\");
   });

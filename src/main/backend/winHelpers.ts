@@ -317,10 +317,12 @@ import sys, os, json, argparse, threading
 
 # Overall watchdog: the process is guaranteed to finish within this many seconds
 # (well under the caller's 15s spawn timeout). Individual round trips are bounded
-# too so a wedged bridge produces a clean "timeout" rather than a hang.
+# too so a wedged bridge produces a clean "timeout" rather than a hang. 12s is
+# deliberately BELOW libpebble2's default send_and_read timeout (15s): our
+# watchdog must fire (and emit the one JSON line) before any library timeout
+# surfaces or the caller's process kill hits.
 _OVERALL_TIMEOUT = 12.0
 _REQUERY_TIMEOUT = 4.0
-_QUERY_TIMEOUT = 8.0
 
 
 def _emit(obj):
@@ -397,13 +399,25 @@ def _do(args, result):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="pb-lang-helper.py")
+    # add_help=False everywhere: argparse's -h/--help prints help to STDOUT,
+    # which would break the exactly-one-JSON-line contract. Usage lives in the
+    # module docstring; the only consumer is the TS controller.
+    p = argparse.ArgumentParser(prog="pb-lang-helper.py", add_help=False)
     p.add_argument("--port", type=int, required=True)
     sub = p.add_subparsers(dest="command", required=True)
-    sub.add_parser("query")
-    ip = sub.add_parser("install")
+    sub.add_parser("query", add_help=False)
+    ip = sub.add_parser("install", add_help=False)
     ip.add_argument("pbl")
-    args = p.parse_args()
+    try:
+        args = p.parse_args()
+    except SystemExit:
+        # argparse prints its usage/error to stderr then raises SystemExit
+        # (code 2) BEFORE any of our machinery runs. The contract is
+        # unconditional: exactly one JSON line on stdout, exit 0/1 — so
+        # translate every parse-time exit into a JSON error.
+        _emit({"ok": False, "error": "invalid arguments (see stderr)",
+               "kind": "other"})
+        sys.exit(1)
 
     result = {}
     t = threading.Thread(target=_do, args=(args, result))
