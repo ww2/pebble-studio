@@ -64,4 +64,11 @@ export interface BackendDriver {
    * Optional: windows-native + native + WSL implement it; returns null when the
    * driver/stack can't stream (caller shows an empty panel). */
   streamLogs?(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null;
+  /**
+   * Create a QEMU snapshot bundle for `board` after a COLD boot reached Live, so
+   * the NEXT launch restores instantly. Fire-and-forget: reads the qemu monitor
+   * port, drives stop→migrate→cont, copies the SPI, and writes the bundle meta.
+   * NEVER throws. `isCancelled` aborts promptly if the emulator stops mid-create.
+   * Optional: only the windows-native driver implements it. */
+  createSnapshotAfterLive?(board: PlatformId, isCancelled?: () => boolean): Promise<void>;
 }

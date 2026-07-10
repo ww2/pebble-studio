@@ -154,6 +154,11 @@ export interface WinBootDepsImpl {
    * for tests. Default = fs.stat (best-effort; never throws).
    */
   statMtimeMs?: (path: string) => Promise<number>;
+  /**
+   * QEMU snapshot restore policy, forwarded onto SpawnDeps.restore (see there).
+   * Provided by createDriver from the SnapshotManager; absent ⇒ no restore.
+   */
+  restore?: { beforeAttempt: (attempt: number, board: PlatformId) => Promise<string | null> };
 }
 
 /**
@@ -408,12 +413,16 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps & { reap: () =
   };
 
   return {
-    bootControl: (id: PlatformId) => {
+    bootControl: (id: PlatformId, incoming?: string | null) => {
       // Stamp the launch time so readBootLog can reject a log left over from a
       // prior run (see readBootLog).
       lastBootAt = Date.now();
       const c = pebble(["emu-control", "--emulator", id, "--vnc"]);
-      return detachSpawn(c.cmd, c.args, c.env);
+      // Snapshot restore: thread the migration URI into THIS spawn's env only
+      // (PEBBLE_QEMU_INCOMING) so the patched pebble-tool appends `-incoming <uri>`
+      // and the guest restores instead of cold-booting. Inert on a normal boot.
+      const env = incoming ? { ...c.env, PEBBLE_QEMU_INCOMING: incoming } : c.env;
+      return detachSpawn(c.cmd, c.args, env);
     },
     ensureKeymap,
     preflight,
@@ -422,6 +431,7 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps & { reap: () =
     waitForEmuInfo,
     killAll,
     reap,
+    restore: impl.restore,
     wipe: async () => { const c = pebble(["wipe"]); await run(c.cmd, c.args, c.env).catch(() => {}); },
     readBootLog: async () => {
       // Guard against mining a STALE error: on windows-native the detached

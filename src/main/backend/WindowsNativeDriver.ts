@@ -57,6 +57,13 @@ export interface WindowsNativeDriverDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Streaming spawn for `streamLogs` (injectable for tests). */
   logSpawn?: typeof spawnLineStream;
+  /**
+   * QEMU snapshot creation hook (Tasks 6+7). Reads the qemu monitor port and
+   * drives the SnapshotManager to save a per-board bundle after a cold boot
+   * reaches Live. Fire-and-forget + never throws. Absent ⇒ snapshots disabled
+   * (no snapshot is ever created). Wired by createDriver from the SnapshotManager.
+   */
+  snapshotCreate?: (board: PlatformId, isCancelled?: () => boolean) => Promise<void>;
 }
 
 /**
@@ -317,6 +324,13 @@ export class WindowsNativeDriver implements BackendDriver {
   async deleteSamplePin(): Promise<void> {
     // Best-effort: nothing to remove if the channel is gone (emulator stopped).
     await this.deps.inputChannel?.deletePin(SAMPLE_PIN_ID);
+  }
+
+  /** Create a QEMU snapshot bundle for the board after a cold boot reached Live.
+   * Fire-and-forget + never throws (the hook itself is failure-swallowing); a
+   * no-op when no snapshot hook is wired (snapshots disabled). */
+  async createSnapshotAfterLive(board: PlatformId, isCancelled?: () => boolean): Promise<void> {
+    await this.deps.snapshotCreate?.(board, isCancelled);
   }
 
   streamLogs(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null {

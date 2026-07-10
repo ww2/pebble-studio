@@ -39,6 +39,7 @@ import {
 } from "node:fs/promises";
 import type { WinRuntimeCtx } from "./winRuntime.js";
 import { sdkBundleRoot, qemuExe, pebbleDataDir } from "./winRuntime.js";
+import { snapshotBundleDir } from "./snapshotManager.js";
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -373,6 +374,11 @@ export async function refreshWinSdkFirmware(
     }
     // Drop the stale decompressed spi so it regenerates from the new template.
     await fs.remove(winPath.join(p.persistSdkRoot, p.version, board, "qemu_spi_flash.bin"));
+    // Invalidate the board's QEMU snapshot bundle: its saved VM stream + SPI copy
+    // are keyed to the OLD firmware, so a new .fw-rev must discard it (a stale
+    // stream would be rejected at load anyway, but this frees the disk + avoids a
+    // doomed restore attempt). meta also mismatches, but delete the dir outright.
+    await fs.remove(snapshotBundleDir(p.persistSdkRoot, p.version, board));
   }
 
   // Stamp the bundle's revision onto the target so this is a no-op next launch.

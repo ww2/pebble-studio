@@ -506,6 +506,39 @@ describe("bootEmulator retry-once", () => {
     expect(steps[steps.length - 1]).toBe("Ready");
   });
 
+  it("restore hook: attempt 1 threads the incoming URI to bootControl; a failed restore retries cold", async () => {
+    // beforeAttempt returns a migration URI on attempt 1, null afterwards (the
+    // real manager also invalidates the bundle there). The restore attempt "fails"
+    // its readiness wait; the cold retry succeeds.
+    const seenIncoming: (string | null | undefined)[] = [];
+    const beforeAttempt = vi.fn(async (attempt: number, _board: string) =>
+      attempt === 1 ? "file:C:/snap/vm.migr" : null,
+    );
+    const bootControl = vi.fn(async (_id: string, incoming?: string | null) => { seenIncoming.push(incoming); });
+    let emuInfoCalls = 0;
+    const endpoint = await bootEmulator(
+      "basalt",
+      {
+        killAll: async () => {},
+        ensureKeymap: async () => {},
+        bootControl,
+        restore: { beforeAttempt },
+        diagnose: NOPROBE,
+        readBootLog: async () => "",
+        waitForEmuInfo: async () => {
+          emuInfoCalls += 1;
+          if (emuInfoCalls === 1) throw new Error("restore boot stalled"); // fail attempt 1
+        },
+        waitForPort: async () => {},
+      },
+      undefined,
+      () => {},
+    );
+    expect(endpoint).toEqual({ host: "localhost", port: 6080, wsPath: "/" });
+    expect(beforeAttempt.mock.calls.map((c) => c[0])).toEqual([1, 2]); // per-attempt
+    expect(seenIncoming).toEqual(["file:C:/snap/vm.migr", null]); // restore then cold
+  });
+
   it("after MAX_BOOT_ATTEMPTS stalls, wipes and retries once — recovering", async () => {
     const bootControl = vi.fn(async () => {});
     const killAll = vi.fn(async () => {});

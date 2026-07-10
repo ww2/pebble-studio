@@ -59,6 +59,15 @@ let currentPlatform: PlatformId | null = null;
 let currentBootToken: BootToken | null = null;
 
 /**
+ * Pending fire-and-forget QEMU snapshot-creation timer (Tasks 6+7). Armed ~8s
+ * after a cold boot reaches Live so post-live injections settle first; cleared on
+ * teardown so a stop cancels a not-yet-fired creation. Only ever holds ONE timer.
+ */
+let snapshotTimer: ReturnType<typeof setTimeout> | null = null;
+/** Delay after Live before creating a snapshot, so pypkjs/time/lang injections settle. */
+const SNAPSHOT_CREATE_DELAY_MS = 8000;
+
+/**
  * The directory captures are written to. Defaults to the user's Downloads; the
  * renderer can repoint it via `settings:setCaptureDir`.
  */
@@ -271,6 +280,9 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     backlight.stop();
     time.stop();
     bridgeMonitor.stop();
+    // Cancel a pending snapshot creation: the emulator is going away, so a delayed
+    // stop→migrate→cont must not fire against a dead/next monitor port.
+    if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
     if (currentBootToken) currentBootToken.cancelled = true;
     // Clear any warm-standby state: teardown stops the driver itself, so a later
     // claim must not attach to a pre-boot that this teardown just killed. reset()
@@ -531,6 +543,22 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // battery.reassert / time.applyAll are idempotent re-asserts, so running them
   // here after a claim — even if the emulator has been warm for a while — just
   // re-applies the chosen state (same as after a Clear/weather reboot).
+  // Arm a fire-and-forget QEMU snapshot creation for this boot, so the NEXT launch
+  // of this board restores instantly. Delayed so post-live injections settle, and
+  // guarded so it only fires while THIS exact boot is still the live one (a stop or
+  // a newer boot cancels it; the driver hook is a no-op off windows-native and
+  // ineligible boards, and skips when a current bundle already exists). Never on
+  // the boot critical path; never throws.
+  const scheduleSnapshotCreate = (id: PlatformId, token: BootToken): void => {
+    if (!driver?.createSnapshotAfterLive) return; // snapshots unsupported on this driver
+    if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
+    const stillLive = (): boolean => !token.cancelled && currentBootToken === token && emuLive;
+    snapshotTimer = setTimeout(() => {
+      snapshotTimer = null;
+      if (!stillLive()) return;
+      void driver?.createSnapshotAfterLive?.(id, () => !stillLive());
+    }, SNAPSHOT_CREATE_DELAY_MS);
+  };
   const runPostLive = async (id: PlatformId, token: BootToken): Promise<void> => {
     await battery.reassert(); // re-assert the chosen battery level (before the time push, since emu-battery's connect re-syncs host time)
     void time.applyAll(); // re-assert time settings (fire-and-forget)
@@ -547,6 +575,10 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     // polling an already-killed emulator (symmetric to the renderer's bootGen guard).
     if (!token.cancelled) bridgeMonitor.start(id);
     if (!token.cancelled) { emuLive = true; startAppLog(id); }
+    // Kick the delayed snapshot creation for this launch (cold boot / warm claim).
+    // The driver hook self-skips when a current bundle already exists, so this is a
+    // one-time-per-identity capture and never re-snapshots after a restore boot.
+    if (!token.cancelled) scheduleSnapshotCreate(id, token);
   };
   ipcMain.handle("emu:start", async (e, id: PlatformId) => {
     assertMainSender(e);

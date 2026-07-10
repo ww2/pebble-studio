@@ -145,8 +145,14 @@ export interface BootProbe {
 }
 
 export interface SpawnDeps {
-  /** Spawn `pebble emu-control --emulator <id> --vnc` detached; resolve once launched. */
-  bootControl: (id: PlatformId) => Promise<void>;
+  /**
+   * Spawn `pebble emu-control --emulator <id> --vnc` detached; resolve once
+   * launched. `incoming` (windows-native snapshot restore) is a qemu migration
+   * URI ("file:C:/…/vm.migr"): when present the spawn adds PEBBLE_QEMU_INCOMING so
+   * the patched pebble-tool appends `-incoming <uri>` and the guest restores a
+   * saved VM state instead of cold-booting. null/absent ⇒ a normal cold boot.
+   */
+  bootControl: (id: PlatformId, incoming?: string | null) => Promise<void>;
   /** Ensure the qemu keymap exists at the pc-bios path the tool's VNC boot uses. */
   ensureKeymap: () => Promise<void>;
   /**
@@ -182,6 +188,18 @@ export interface SpawnDeps {
    * it for the actual qemu-launch error to surface in the diagnostics. Optional.
    */
   readBootLog?: () => Promise<string>;
+  /**
+   * QEMU snapshot restore policy (windows-native only). Called ONCE at the start
+   * of every boot attempt with the 1-based attempt number and the board:
+   *   - attempt 1: may return a migration URI (a valid per-board snapshot exists,
+   *     with its SPI already copied over the working image) so the boot spawns
+   *     with `-incoming` and restores instantly.
+   *   - attempt ≥2 (a clean retry or the wipe recovery): returns null AND
+   *     invalidates the failed bundle, so the retry cold-boots cleanly (an
+   *     `-incoming` source is not valid after a killAll/wipe).
+   * Absent ⇒ no restore (POSIX/WSL, or snapshots disabled). Never throws.
+   */
+  restore?: { beforeAttempt: (attempt: number, board: PlatformId) => Promise<string | null> };
 }
 
 /**
@@ -693,7 +711,7 @@ export async function bootEmulator(
   // 3+4. Boot the full stack (qemu + pypkjs + websockify) under the pebble tool,
   // then wait for readiness: state file, raw RFB, and the websocket proxy. The
   // token threads into each wait so a cancel interrupts the active loop.
-  const attempt = async (): Promise<VncEndpoint> => {
+  const attempt = async (attemptNo: number): Promise<VncEndpoint> => {
     // Re-check RIGHT before spawning: teardown (ipc.stop) flips the token and runs
     // driver.stop() concurrently. Without this recheck a cancel that lands after
     // the retry-loop's top-of-iteration check would still spawn a fresh detached
@@ -701,8 +719,18 @@ export async function bootEmulator(
     // next wait then throws BootAborted and (before this fix) left qemu/pypkjs/
     // websockify orphaned holding the ports while the UI said "stopped".
     if (token?.cancelled) throw new BootAborted();
-    step("Launching qemu (pebble emu-control --vnc)…");
-    await d.bootControl(platformId);
+    // Snapshot restore policy: attempt 1 may hand back a migration URI (restore);
+    // a retry/wipe attempt returns null and invalidates the failed bundle so we
+    // cold-boot. Best-effort — a throwing hook must never break the boot.
+    let incoming: string | null = null;
+    if (d.restore) {
+      try {
+        incoming = await d.restore.beforeAttempt(attemptNo, platformId);
+      } catch { incoming = null; }
+    }
+    if (token?.cancelled) throw new BootAborted();
+    step(incoming ? "Launching qemu (restoring snapshot)…" : "Launching qemu (pebble emu-control --vnc)…");
+    await d.bootControl(platformId, incoming);
     // Each wait emits periodic elapsed + health-snapshot notes so a stall shows
     // which component is hung. waitForEmuInfo → the pebble state file gets a pid;
     // RFB :5901 → qemu's VNC is up; ws :6080 → websockify proxy is up (the slower,
@@ -737,7 +765,7 @@ export async function bootEmulator(
       await d.killAll();
     }
     try {
-      const ep = await attempt();
+      const ep = await attempt(i);
       step("Ready");
       return ep;
     } catch (err) {
@@ -779,7 +807,8 @@ export async function bootEmulator(
     }
     if (token?.cancelled) throw new BootAborted();
     try {
-      const ep = await attempt();
+      // Attempt index past MAX so the restore hook drops the env + invalidates.
+      const ep = await attempt(MAX_BOOT_ATTEMPTS + 1);
       step("Ready (recovered after wipe)");
       return ep;
     } catch (err) {
