@@ -5,7 +5,11 @@ import type { TimeConfig } from "./backend/timeController.js";
 import type { SimEnvConfig } from "../shared/simEnv.js";
 
 const studio = {
-  initBackend: (): Promise<{ kind: string }> => ipcRenderer.invoke("backend:init"),
+  // Task 5: `prebootBoard` (when passed) asks main to warm-boot that board right
+  // after provisioning so the first Launch attaches near-instantly. The renderer
+  // passes it only when the "Pre-boot emulator on app start" setting is on.
+  initBackend: (opts?: { prebootBoard?: string }): Promise<{ kind: string }> =>
+    ipcRenderer.invoke("backend:init", opts),
   start: (id: string) => ipcRenderer.invoke("emu:start", id),
   stop: () => ipcRenderer.invoke("emu:stop"),
   abort: (): Promise<void> => ipcRenderer.invoke("emu:abort"),

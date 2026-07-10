@@ -11,7 +11,7 @@ import { getPlatform, PLATFORMS } from "../main/backend/emulatorRegistry.js";
 import { detectHostTimezone, type TimeConfig } from "../main/backend/timeController.js";
 
 interface StudioApi {
-  initBackend(): Promise<{ kind: string }>;
+  initBackend(opts?: { prebootBoard?: string }): Promise<{ kind: string }>;
   start(id: string): Promise<{ host: string; port: number; wsPath: string }>;
   stop(): Promise<unknown>;
   abort(): Promise<void>;
@@ -284,7 +284,14 @@ async function init(): Promise<void> {
   }
 
   try {
-    const { kind } = await window.studio.initBackend();
+    // Warm-standby pre-boot (Task 5): when enabled (default on), ask main to boot
+    // the startup watch in the background right after provisioning so the first
+    // Launch attaches near-instantly. `switcher.value` is the resolved startup
+    // watch here. Passing no board leaves main cold (setting off).
+    const prebootEnabled = localStorage.getItem("pebble-studio:preboot-startup") !== "false";
+    const { kind } = await window.studio.initBackend(
+      prebootEnabled ? { prebootBoard: switcher.value } : {},
+    );
     kindEl.textContent = kind;
     await library.refresh();
     // Manual (default): load the chrome idle with a Launch button — do NOT boot.

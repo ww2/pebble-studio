@@ -5,6 +5,8 @@ import { AppLogStream } from "./backend/appLogStream.js";
 import { createDriver } from "./backend/createDriver.js";
 import type { BackendDriver } from "./backend/BackendDriver.js";
 import { makeNativeShell, makeWslShell, type BootToken } from "./backend/bootEmulator.js";
+import { WarmStandby } from "./backend/warmStandby.js";
+import type { VncEndpoint } from "./backend/BackendDriver.js";
 import type { DriverKind } from "./backend/driverFactory.js";
 import { EMU_INFO_PATH } from "./backend/hostPaths.js";
 import { openClayWindow, parsePhonesimPort } from "./clayWindow.js";
@@ -267,6 +269,10 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     time.stop();
     bridgeMonitor.stop();
     if (currentBootToken) currentBootToken.cancelled = true;
+    // Clear any warm-standby state: teardown stops the driver itself, so a later
+    // claim must not attach to a pre-boot that this teardown just killed. reset()
+    // flips the warm token and drops to idle WITHOUT a second stack kill.
+    warmStandby.reset();
     // Reset the "loaded" status: a stopped/force-closed emulator is running
     // nothing, so the App Library's "● loaded" pills must clear. The set is
     // repopulated by the renderer's libInstallAll on the next boot. (Apps stay
@@ -311,6 +317,28 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
       const win = getMainWindow();
       win?.webContents.send("emu:bridge-dead", reason);
     },
+  });
+
+  // Warm-standby pre-boot (Task 5). Right after `backend:init` finishes
+  // provisioning we kick a background boot of the last-used board so the first
+  // Launch attaches near-instantly. `emu:start` claims it (single boot, no
+  // double-start) when the launched board matches; otherwise it cancels the warm
+  // boot (freeing the single-instance VNC ports) before its own cold boot. Owns
+  // ONLY the boot-to-Live step — post-live work (battery/time/bridge/appLog) still
+  // runs once in `emu:start` after the claim. `enabled: () => true`: the renderer
+  // gates on the Settings checkbox by only passing a `prebootBoard` when it's on.
+  const warmStandby = new WarmStandby<VncEndpoint>({
+    enabled: () => true,
+    boot: async (id, token) => {
+      // Same pre-boot prep as emu:start's cold path: deploy the time shim before
+      // the emulator comes up (bootControl consults the shim-ready cache).
+      await driver?.ensureTimeShim().catch(() => false);
+      return requireDriver().start(id, token, (msg) => {
+        getMainWindow()?.webContents.send("emu:boot-progress", msg);
+      });
+    },
+    kill: async () => { try { await driver?.stop(); } catch { /* may already be stopped */ } },
+    onError: (err) => console.error(`[warm] pre-boot failed: ${String(err)}`),
   });
 
   ipcMain.handle("lib:add", async (_e, pbwPath: string) => { library.add(pbwPath); return library.list(); });
@@ -371,7 +399,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     return result.canceled ? [] : result.filePaths;
   });
 
-  ipcMain.handle("backend:init", async () => {
+  ipcMain.handle("backend:init", async (_e, opts?: { prebootBoard?: PlatformId }) => {
     const { driver: d, kind } = await createDriver();
     driver = d;
     driverKind = kind;
@@ -419,15 +447,75 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
         );
       }
     }
+    // Warm-standby pre-boot (Task 5): now that provisioning is done, fire a
+    // background boot of the last-used board so the first Launch attaches near-
+    // instantly. Fire-and-forget — NOT awaited, so it can never gate this init
+    // response (the renderer awaits backend:init before enabling Launch); errors
+    // are swallowed inside kick() to a log line. windows-native only: it's the
+    // shipping self-contained stack with the fast killAll/reap paths this relies
+    // on. The renderer passes `prebootBoard` only when the Settings checkbox is on.
+    const prebootBoard = opts?.prebootBoard;
+    if (kind === "windows-native" && prebootBoard) {
+      try {
+        getPlatform(prebootBoard); // reject an unknown/injected id before it reaches a boot
+        warmStandby.kick(prebootBoard);
+        // Adopt the warm boot's token as the current one so an abort/stop during
+        // the pre-boot window cancels the right boot's wait loops.
+        const t = warmStandby.currentToken();
+        if (t) currentBootToken = t;
+        console.log(`[warm] pre-booting ${prebootBoard}`);
+      } catch (err) {
+        console.error(`[warm] kick skipped: ${String(err)}`);
+      }
+    }
     return { kind };
   });
   // App version (v1.0.0) — surfaced in the Help → What's New modal.
   ipcMain.handle("app:version", () => app.getVersion());
+  // Post-live work shared by the cold boot and the warm-standby fast path: runs
+  // exactly once per user-visible launch (the warm boot owns only boot-to-Live).
+  // battery.reassert / time.applyAll are idempotent re-asserts, so running them
+  // here after a claim — even if the emulator has been warm for a while — just
+  // re-applies the chosen state (same as after a Clear/weather reboot).
+  const runPostLive = async (id: PlatformId, token: BootToken): Promise<void> => {
+    await battery.reassert(); // re-assert the chosen battery level (before the time push, since emu-battery's connect re-syncs host time)
+    void time.applyAll(); // re-assert time settings (fire-and-forget)
+    // Arm the health monitor only if this boot wasn't superseded by a force-close
+    // mid-flight: emu:abort/emu:stop flip token.cancelled and call bridgeMonitor.stop(),
+    // and a boot that resolves in that same window would otherwise re-start a monitor
+    // polling an already-killed emulator (symmetric to the renderer's bootGen guard).
+    if (!token.cancelled) bridgeMonitor.start(id);
+    if (!token.cancelled) { emuLive = true; startAppLog(id); }
+  };
   ipcMain.handle("emu:start", async (e, id: PlatformId) => {
     assertMainSender(e);
     getPlatform(id); // reject an unknown/injected platform id before it reaches a bash -lc line
     currentPlatform = id; // remembered for clay:phonesimPort's state-file lookup
-    // Fresh token per boot, stored as current so abort/stop can cancel it.
+
+    // Warm-standby fast path: if a pre-boot for THIS board is in flight or ready,
+    // claim it (single boot, no double-start) and jump straight to post-live work.
+    const warm = warmStandby.claim(id);
+    if (warm) {
+      // Adopt the warm boot's token so a force-close mid-attach cancels the right
+      // boot and the post-live guards see it.
+      const adopted = warmStandby.currentToken() ?? { cancelled: false };
+      currentBootToken = adopted;
+      try {
+        const ep = await warm;
+        await runPostLive(id, adopted);
+        return ep;
+      } catch (err) {
+        // The pre-boot ultimately failed — fall through to a normal cold boot.
+        console.error(`[warm] claimed pre-boot failed, falling back to a cold boot: ${String(err)}`);
+      }
+    } else {
+      // Not our board (or already claimed): cancel any UNCLAIMED warm boot for a
+      // different board and fully kill its stack (single-instance VNC ports) before
+      // we boot. No-op when the warm standby is idle/claimed.
+      await warmStandby.cancel();
+    }
+
+    // Cold boot. Fresh token per boot, stored as current so abort/stop can cancel it.
     const token: BootToken = { cancelled: false };
     currentBootToken = token;
     // Forward each boot step to the renderer (diagnostic boot notes, Task J).
@@ -439,14 +527,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     // handled by the start() call below, same as before.)
     await driver?.ensureTimeShim().catch(() => false);
     const ep = await requireDriver().start(id, token, onStep);
-    await battery.reassert(); // re-assert the chosen battery level on the fresh emulator (before the time push, since emu-battery's connect re-syncs host time)
-    void time.applyAll(); // re-assert time settings on the fresh emulator (fire-and-forget)
-    // Arm the health monitor only if this boot wasn't superseded by a force-close
-    // mid-flight: emu:abort/emu:stop flip token.cancelled and call bridgeMonitor.stop(),
-    // and a boot that resolves in that same window would otherwise re-start a monitor
-    // polling an already-killed emulator (symmetric to the renderer's bootGen guard).
-    if (!token.cancelled) bridgeMonitor.start(id);
-    if (!token.cancelled) { emuLive = true; startAppLog(id); }
+    await runPostLive(id, token);
     return ep;
   });
   ipcMain.handle("emu:abort", async () => {
