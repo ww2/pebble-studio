@@ -45,13 +45,18 @@ describe("applyCircularMask", () => {
   });
 
   it("works for non-square images (rectangle) — inscribed circle uses min dimension", () => {
-    const width = 180;
-    const height = 180;
+    // A genuine rectangle: min dim = 100 → r = 50, circle centered at (100,50).
+    const width = 200;
+    const height = 100;
     const src = solidWhite(width, height);
     const out = applyCircularMask(src);
-    // Corners should be transparent
+    // Corners are outside the circle.
     expect(alpha(out, 0, 0)).toBe(0);
-    // Center should be opaque
+    // Mid-left and mid-right lie on the wide axis, far outside the inscribed
+    // circle (|dx| ≈ 99.5 > r=50) — the min-dimension behavior under test.
+    expect(alpha(out, 0, height / 2)).toBe(0);
+    expect(alpha(out, width - 1, height / 2)).toBe(0);
+    // Center is opaque.
     expect(alpha(out, width / 2, height / 2)).toBe(255);
   });
 

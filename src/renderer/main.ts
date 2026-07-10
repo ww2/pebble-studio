@@ -11,14 +11,13 @@ import { getPlatform, PLATFORMS } from "../main/backend/emulatorRegistry.js";
 import { detectHostTimezone, type TimeConfig } from "../main/backend/timeController.js";
 
 interface StudioApi {
-  initBackend(): Promise<{ kind: string }>;
+  initBackend(opts?: { prebootBoard?: string }): Promise<{ kind: string }>;
   start(id: string): Promise<{ host: string; port: number; wsPath: string }>;
   stop(): Promise<unknown>;
   abort(): Promise<void>;
   install(pbwPath: string): Promise<unknown>;
   button(id: string, action?: string): Promise<unknown>;
   accelTap(): Promise<unknown>;
-  screenshot(out: string): Promise<unknown>;
   // Backlight-free framebuffer screenshot. Resolves with the saved absolute path,
   // or null on ANY failure (renderer falls back to the canvas + backlight grab).
   screenshotFramebuffer(name: string): Promise<string | null>;
@@ -69,11 +68,14 @@ interface StudioApi {
   // sdkInstall opens a picker then installs ("Replace & persist", null = cancel);
   // sdkReset returns to the bundled SDK.
   sdkInfo(): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }>;
-  sdkInstall(): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean } | null>;
+  sdkInstall(mode?: "file" | "folder"): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean } | null>;
   sdkReset(): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }>;
   // v1.0.0: app version + application-menu action subscription.
   appVersion(): Promise<string>;
   onMenu(cb: (action: string) => void): () => void;
+  // Task 11: language packs (native-Windows). Typed against the panel's seam so
+  // the renderer interface and the LanguagePanel never drift.
+  lang: import("./components/LanguagePanel.js").LangApiLike;
 }
 
 declare global {
@@ -150,6 +152,10 @@ window.addEventListener("pebble-studio:time-changed", (e) => {
 // morphs to the new chrome; in auto mode it boots.
 function selectPlatform(id: PlatformId): void {
   switcher.value = id; // no-op set when the combo originated the change
+  // Board-specific panes (Language) reload for the new board on this signal. The
+  // top combo doesn't otherwise notify Settings (its sections are board-agnostic
+  // except Language), so broadcast it here.
+  window.dispatchEvent(new Event("pebble-studio:board-changed"));
   void view.show(id, { boot: bootMode === "auto" });
 }
 
@@ -203,6 +209,8 @@ const settings = new SettingsPane(themeMode, initialPlatform, (id: PlatformId) =
   // tears it down, so relaunch it here to pick up the new SDK automatically.
   isEmuLive: () => view.isLive(),
   onSdkRelaunch: () => view.relaunch(),
+  // Task 11: the Language section scopes pack calls to the live board.
+  getBoard: () => switcher.value,
 });
 
 // Command bar: version switcher (Fluent combobox) controls the persistent
@@ -285,7 +293,14 @@ async function init(): Promise<void> {
   }
 
   try {
-    const { kind } = await window.studio.initBackend();
+    // Warm-standby pre-boot (Task 5): when enabled (default OFF, opt-in via
+    // Settings), ask main to boot the startup watch in the background right after
+    // provisioning so the first Launch attaches near-instantly. `switcher.value`
+    // is the resolved startup watch here. Passing no board leaves main cold.
+    const prebootEnabled = localStorage.getItem("pebble-studio:preboot-startup") === "true";
+    const { kind } = await window.studio.initBackend(
+      prebootEnabled ? { prebootBoard: switcher.value } : {},
+    );
     kindEl.textContent = kind;
     await library.refresh();
     // Manual (default): load the chrome idle with a Launch button — do NOT boot.

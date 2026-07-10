@@ -46,6 +46,11 @@ export class AppLibrary {
   /** True while a Clay config round-trip is running — all gears disabled
    * (prevents a second Setup overwriting pypkjs' pending config_callback). */
   private clayInFlight = false;
+  /** Monotonic token for refresh(): concurrent refreshes (the apps-changed event
+   * fires on boot/relaunch/force-close/clear, plus direct drop/pick calls) race,
+   * and whichever IPC pair resolves last would paint — letting pre-clear "loaded"
+   * pills reappear after a clear. Only the newest refresh paints. */
+  private refreshSeq = 0;
 
   constructor(
     getPlatformId: () => string,
@@ -170,6 +175,9 @@ export class AppLibrary {
    */
   private async installPath(filePath: string): Promise<void> {
     const name = basename(filePath);
+    // Reset the benign "info" styling up front so a rejection (or install error)
+    // never renders in the leftover info color from a prior "Added X…" message.
+    this.errorMsg.classList.remove("lib-error--info");
     if (!filePath.endsWith(".pbw")) {
       this.errorMsg.textContent = `Not a .pbw file: ${name}`;
       return;
@@ -268,10 +276,14 @@ export class AppLibrary {
   }
 
   async refresh(): Promise<void> {
+    const seq = ++this.refreshSeq;
     const [entries, loadedPaths] = await Promise.all([
       window.studio.libList(),
       window.studio.loadedList(),
     ]);
+    // A newer refresh started while our IPC was in flight — let it own the paint
+    // so a stale (pre-clear) snapshot can't clobber the current one.
+    if (seq !== this.refreshSeq) return;
     const loadedSet = new Set(loadedPaths);
 
     // Update header. Count ONLY apps that are both in the library AND loaded, so

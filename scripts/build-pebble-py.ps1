@@ -13,10 +13,36 @@
 param(
   [string]$OutDir = "vendor\pebble-py",
   [string]$PbsTag = "20260610",
-  [string]$PyVer  = "3.12.13"
+  [string]$PyVer  = "3.12.13",
+  # Download the CPython asset, print its SHA-256, and exit — use this to
+  # (re)generate $ExpectedSha256 below when bumping $PbsTag/$PyVer.
+  [switch]$PrintHash
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
+
+# Validate $OutDir is a RELATIVE path that stays under the repo before any code
+# derives a delete target from it (the script later does a recursive Delete on
+# $dest). A rooted or `..`-containing OutDir could point the delete anywhere.
+if ([System.IO.Path]::IsPathRooted($OutDir) -or $OutDir -match '\.\.') {
+  throw "OutDir must be a relative path under the repo (got '$OutDir')."
+}
+$repoFull = [System.IO.Path]::GetFullPath($repo)
+$destFull = [System.IO.Path]::GetFullPath((Join-Path $repo $OutDir))
+if (-not $destFull.StartsWith($repoFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+  throw "OutDir escapes the repo root: '$destFull'."
+}
+
+# EXPECTED SHA-256 of the python-build-standalone CPython asset for the pinned
+# $PbsTag / $PyVer. This interpreter is the supply-chain ROOT of the entire
+# bundle (it ships to every user as PebbleStudioEmu.exe), so it MUST be verified
+# against a known-good hash. Each release publishes ONE `SHA256SUMS` manifest
+# listing every asset (there are no per-asset `.sha256` sidecars):
+#   https://github.com/astral-sh/python-build-standalone/releases/download/$PbsTag/SHA256SUMS
+# When bumping $PbsTag/$PyVer, take the line for $asset from that manifest — or
+# run this script with -PrintHash and cross-check it against the manifest.
+$ExpectedSha256 = 'f5e4d9f856567493776f3d1e832c939fbaba5dcbcc5e0492a82ecfceea83b316'
+
 $work = Join-Path $env:TEMP "pebble-py-build"
 New-Item -ItemType Directory -Force $work | Out-Null
 
@@ -27,6 +53,21 @@ $tgz   = Join-Path $work "pbs.tar.gz"
 Write-Host "Downloading $asset ..." -ForegroundColor Cyan
 Invoke-WebRequest -Uri $url -OutFile $tgz
 
+# Integrity gate — never build on an unverified interpreter.
+$actualSha = (Get-FileHash -Algorithm SHA256 $tgz).Hash.ToLower()
+if ($PrintHash) {
+  Write-Host "SHA256($asset) = $actualSha" -ForegroundColor Yellow
+  Write-Host "Paste that into `$ExpectedSha256 in scripts\build-pebble-py.ps1." -ForegroundColor Yellow
+  exit 0
+}
+if ($ExpectedSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+  throw "SECURITY: `$ExpectedSha256 is a placeholder — fill in the real hash (run -PrintHash) before building. Refusing to bundle an unverified interpreter."
+}
+if ($actualSha -ne $ExpectedSha256.ToLower()) {
+  throw "SECURITY: CPython asset SHA-256 mismatch! expected $($ExpectedSha256.ToLower()) got $actualSha — aborting."
+}
+Write-Host "CPython asset SHA-256 verified." -ForegroundColor Green
+
 $py = Join-Path $work "python"
 if (Test-Path $py) { [System.IO.Directory]::Delete($py, $true) }
 Write-Host "Extracting ..." -ForegroundColor Cyan
@@ -34,7 +75,7 @@ tar -xzf $tgz -C $work          # creates $work\python
 
 $pyexe = Join-Path $py "python.exe"
 Write-Host "Installing pebble-tool + pyreadline3 ..." -ForegroundColor Cyan
-& $pyexe -m pip install --no-warn-script-location pebble-tool==5.0.37 pyreadline3
+& $pyexe -m pip install --no-warn-script-location pebble-tool==5.0.37 pyreadline3==3.4.1
 if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 
 Write-Host "Applying native-Windows patches ..." -ForegroundColor Cyan

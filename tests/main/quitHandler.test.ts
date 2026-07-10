@@ -31,6 +31,34 @@ describe("createQuitHandler", () => {
     expect(shutdown).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps deferring (preventDefault) a second quit attempt mid-teardown", () => {
+    const shutdown = vi.fn(() => new Promise<void>(() => {})); // never resolves
+    const exit = vi.fn();
+    const handler = createQuitHandler(shutdown, exit);
+    const e1 = { preventDefault: vi.fn() };
+    const e2 = { preventDefault: vi.fn() };
+    handler(e1);
+    handler(e2);
+    expect(e1.preventDefault).toHaveBeenCalledTimes(1);
+    expect(e2.preventDefault).toHaveBeenCalledTimes(1); // still deferred, not orphaning children
+    expect(exit).not.toHaveBeenCalled();
+  });
+
+  it("does not block a quit once the deliberate exit is underway", async () => {
+    let resolveShutdown!: () => void;
+    const shutdown = vi.fn(() => new Promise<void>((r) => { resolveShutdown = r; }));
+    const exit = vi.fn();
+    const handler = createQuitHandler(shutdown, exit);
+    handler({ preventDefault: vi.fn() });
+    resolveShutdown();
+    await Promise.resolve(); await Promise.resolve();
+    expect(exit).toHaveBeenCalledTimes(1);
+    const e = { preventDefault: vi.fn() };
+    handler(e);
+    expect(e.preventDefault).not.toHaveBeenCalled(); // exiting → let the quit proceed
+    expect(exit).toHaveBeenCalledTimes(1);            // and no re-exit
+  });
+
   describe("with fake timers", () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());

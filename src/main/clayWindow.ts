@@ -108,7 +108,15 @@ export function rewriteClayConfigUrl(url: string): string {
   const rawFragment = url.slice(hash + 1);
   if (rawFragment === "") return url;
 
-  let data = decodeURIComponent(rawFragment);
+  // A third-party watchface can hand us a malformed percent-escape here, which
+  // makes decodeURIComponent throw URIError; fall back to loading the URL as-is
+  // (matching the base64 branch below) rather than rejecting the IPC.
+  let data: string;
+  try {
+    data = decodeURIComponent(rawFragment);
+  } catch {
+    return url;
+  }
   // The bootstrap treats a fragment NOT starting with '<' as base64 HTML.
   if (data.charAt(0) !== "<") {
     try {
@@ -181,11 +189,43 @@ export function openClayWindow(
     return true;
   };
 
+  // The page we host is untrusted third-party content; the only navigations we
+  // trust are the pebblejs://close capture (handled above), staying on the
+  // exact page we loaded, or a same-origin move within it. Everything else — an
+  // outbound redirect to a tracker or a phishing origin — is blocked. A data:
+  // page has an opaque ("null") origin, so only the exact loadUrl is allowed.
+  const loadUrl = rewriteClayConfigUrl(url);
+  let loadOrigin: string | null = null;
+  try {
+    loadOrigin = new URL(loadUrl).origin;
+  } catch {
+    /* data:/malformed URL — leave null so only the exact loadUrl passes */
+  }
+  const isAllowedNavigation = (target: string): boolean => {
+    if (target === loadUrl) return true;
+    if (loadOrigin && loadOrigin !== "null") {
+      try {
+        return new URL(target).origin === loadOrigin;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  };
+
   win.webContents.on("will-navigate", (event, target) => {
-    if (handleClose(target)) event.preventDefault();
+    if (handleClose(target)) {
+      event.preventDefault();
+      return;
+    }
+    if (!isAllowedNavigation(target)) event.preventDefault();
   });
   win.webContents.on("will-redirect", (event, target) => {
-    if (handleClose(target)) event.preventDefault();
+    if (handleClose(target)) {
+      event.preventDefault();
+      return;
+    }
+    if (!isAllowedNavigation(target)) event.preventDefault();
   });
   // Some pages use window.open / target=_blank for the close URL; also deny
   // every other popup — a sandboxed config page has no business opening windows.
@@ -194,9 +234,14 @@ export function openClayWindow(
     return { action: "deny" };
   });
 
-  // Window closed without a captured fragment = user cancelled.
+  // Window closed without a captured fragment = user cancelled. A load failure
+  // (unreachable config page) is treated the same way — cancel rather than hang
+  // on a blank window — by closing, which fires this once-guarded cancel.
   win.on("closed", () => fire(""));
+  win.webContents.on("did-fail-load", (_e, errorCode, _desc, _url, isMainFrame) => {
+    if (isMainFrame && errorCode !== -3 && !fired) win.close();
+  });
 
-  void win.loadURL(rewriteClayConfigUrl(url));
+  void win.loadURL(loadUrl);
   return win;
 }

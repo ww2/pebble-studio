@@ -5,6 +5,24 @@ export function tasklistArgs(imageName: string): string[] {
   return ["/FI", `IMAGENAME eq ${imageName}`, "/FO", "CSV", "/NH"];
 }
 
+/** `tasklist` argv to query ONE pid in headerless CSV — used to resolve a
+ * state-file pid's image name so we can VERIFY it is one of ours before killing
+ * it (Windows recycles pids, so a stale state file can name an unrelated process). */
+export function tasklistPidArgs(pid: number): string[] {
+  return ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"];
+}
+
+/**
+ * Image name from the FIRST data row of `tasklist /FO CSV /NH` output (a row like
+ * `"image.exe","1234",...`), or "" when there is no row (e.g. the "No tasks…"
+ * banner for a pid that no longer exists). Pure + unit-testable.
+ */
+export function parseTasklistImage(stdout: string): string {
+  if (!stdout) return "";
+  const m = /^"([^"]+\.exe)","\d+"/m.exec(stdout);
+  return m ? m[1] : "";
+}
+
 /**
  * True iff `tasklist` output contains at least one real process row. When nothing
  * matches, tasklist prints an "INFO: No tasks…" banner (to stdout) instead of CSV
@@ -20,14 +38,21 @@ export function parseTasklistAlive(stdout: string): boolean {
   return /^"[^"]+\.exe","\d+"/m.test(stdout);
 }
 
-/** `taskkill` argv: force-kill an image and its child tree. */
-export function taskkillByImageArgs(imageName: string): string[] {
-  return ["/IM", imageName, "/T", "/F"];
-}
-
-/** `taskkill` argv: force-kill a pid and its child tree. */
-export function taskkillByPidArgs(pid: number): string[] {
-  return ["/PID", String(pid), "/T", "/F"];
+/**
+ * Extract EVERY pid from `tasklist /FO CSV /NH` output (headerless CSV rows like
+ * `"image.exe","1234",...`). Used to enumerate OUR emulator images for a DIRECT
+ * TerminateProcess kill, sidestepping `taskkill /T` — whose child-tree walk times
+ * out (and then silently fails) when the box is under load (e.g. a CPU-pegged
+ * qemu), leaving the stack orphaned. Pure + unit-testable; tolerates the
+ * "No tasks…" banner and empty output (→ []).
+ */
+export function parseTasklistPids(stdout: string): number[] {
+  if (!stdout) return [];
+  const pids: number[] = [];
+  const re = /^"[^"]+\.exe","(\d+)"/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stdout)) !== null) pids.push(Number(m[1]));
+  return pids;
 }
 
 /**

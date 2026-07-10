@@ -20,6 +20,8 @@ const CSP = [
   "font-src 'self' data:",
   "object-src 'none'",
   "base-uri 'self'",
+  "form-action 'none'",
+  "frame-src 'none'",
 ].join("; ");
 
 function cspMeta(): Plugin {

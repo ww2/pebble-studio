@@ -166,21 +166,27 @@ export function compileShimCmd(): string {
 /**
  * Build a PebbleCommand that writes the faketime control file.
  * Format: `<target_unix|-> <rate>`
- *   - `targetUnix` null  → `-`  (rate-only mode; shim uses current real time
- *     as base and applies only the rate multiplier)
+ *   - `targetUnix` null  → `-`  (keep the current fake anchor; apply only the rate)
  *   - `rate` 0            → freeze (shim ignores elapsed real time)
  *   - `rate` 1            → real-time passthrough
  *   - `rate` N>1          → fast-forward at N×
  *
- * Uses integer arithmetic (Math.trunc) so the value is numeric-only → quote-free.
- * Both interpolated tokens are coerced to plain integers: TS types are erased at
- * runtime, so this guarantees the string crossing `wsl.exe -- bash -lc` can never
- * carry shell metacharacters even if a caller passes a non-numeric value.
+ * Shell-safety: the string crosses `wsl.exe -- bash -lc "…"`, so it must carry NO
+ * shell metacharacters. The target is integer-truncated; the rate is emitted with
+ * fixed decimals via toFixed (non-finite → "0"). Both tokens therefore contain only
+ * digits, `.`, and `-` — none of which are shell-special — so the command is safe
+ * even if a caller passes a non-numeric value.
+ *
+ * NOTE the rate must NOT be integer-truncated: timeController substitutes a tiny
+ * QEMU_FROZEN_RATE (1e-3) for a frozen clock to avoid the firmware minute-tick loop,
+ * and Math.trunc(1e-3) === 0 would silently write back the exact rate-0 that fix
+ * exists to avoid. The shim parses the rate with fscanf("%lf") (a double), so a
+ * fixed-decimal string like "0.001000" is read correctly.
  */
 export function setFakeTimeCmd(targetUnix: number | null, rate: number): PebbleCommand {
   const t = targetUnix === null ? "-" : String(Math.trunc(targetUnix));
-  const r = String(Number.isFinite(rate) ? Math.trunc(rate) : 0);
-  // echo <t> <r> — all numerics / "-", zero quotes. > not < so no escaping.
+  const r = Number.isFinite(rate) ? rate.toFixed(6) : "0";
+  // echo <t> <r> — digits / "." / "-" only, zero quotes. > not < so no escaping.
   return { cmd: "bash", args: ["-lc", `echo ${t} ${r} > ${CTL_PATH}`] };
 }
 

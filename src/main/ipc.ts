@@ -1,10 +1,12 @@
-import { ipcMain, app, dialog, BrowserWindow } from "electron";
+import { ipcMain, app, dialog, BrowserWindow, type IpcMainInvokeEvent } from "electron";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { AppLogStream } from "./backend/appLogStream.js";
 import { createDriver } from "./backend/createDriver.js";
 import type { BackendDriver } from "./backend/BackendDriver.js";
 import { makeNativeShell, makeWslShell, type BootToken } from "./backend/bootEmulator.js";
+import { WarmStandby } from "./backend/warmStandby.js";
+import type { VncEndpoint } from "./backend/BackendDriver.js";
 import type { DriverKind } from "./backend/driverFactory.js";
 import { EMU_INFO_PATH } from "./backend/hostPaths.js";
 import { openClayWindow, parsePhonesimPort } from "./clayWindow.js";
@@ -17,14 +19,20 @@ import { buildHealthCommand, interpretHealth } from "./backend/bridgeHealth.js";
 import { makeNativeHealthCheck } from "./backend/winBridgeHealth.js";
 import { winHostPaths } from "./backend/hostPaths.js";
 import { readPypkjsPort } from "./backend/winInputChannel.js";
-import { defaultCtx } from "./backend/winRuntime.js";
+import { defaultCtx, pebblePyExe } from "./backend/winRuntime.js";
+import { deployWinHelpers } from "./backend/winHelpers.js";
+import { makeLanguageController, type LanguageController, type PackRef, type Selection } from "./backend/languageController.js";
+import { makeLangHandlers, kickLangReassert } from "./langIpc.js";
 import { ensureWinSdkProvisioned } from "./backend/winSdkProvision.js";
 import { currentSdkInfo, installCustomSdk, resetToBundledSdk } from "./backend/sdkController.js";
 import { readSimEnv, writeSimEnv } from "./backend/simEnv.js";
 import { clearWeatherCacheArgv, refreshWeatherAfterSimChange } from "./backend/weatherCacheRefresh.js";
 import { spawnRunner } from "./backend/spawnRunner.js";
+import { getPlatform } from "./backend/emulatorRegistry.js";
+import { applyCircularMaskToPngFile } from "./backend/circularMaskPng.js";
 import type { PlatformId, ButtonId, ButtonAction } from "../shared/types.js";
 import type { SimEnvConfig } from "../shared/simEnv.js";
+import { isButtonId, isButtonAction, normalizeSimEnv } from "../shared/validate.js";
 import { LibraryStore } from "./library.js";
 
 let driver: BackendDriver | null = null;
@@ -51,6 +59,32 @@ let currentPlatform: PlatformId | null = null;
 let currentBootToken: BootToken | null = null;
 
 /**
+ * The in-flight boot's promise (cold `emu:start` or warm-standby pre-boot).
+ * teardownEmulator awaits it (post-kill, token already cancelled → it unwinds
+ * promptly via BootAborted) so a boot past its last token checkpoint can't spawn
+ * a fresh stack AFTER the teardown sweep and leak it. Cleared when it settles.
+ */
+let currentBootPromise: Promise<unknown> | null = null;
+
+/**
+ * Latched by the app-quit teardown. `emu:start` refuses to boot once set: a quit
+ * that lands while a warm pre-boot is being claimed used to reject the claim and
+ * FALL THROUGH to a fresh cold boot with a brand-new (uncancelled) token —
+ * spawning a whole emulator stack after the quit sweep, orphaned when the app
+ * exited moments later.
+ */
+let quitting = false;
+
+/**
+ * Pending fire-and-forget QEMU snapshot-creation timer (Tasks 6+7). Armed ~8s
+ * after a cold boot reaches Live so post-live injections settle first; cleared on
+ * teardown so a stop cancels a not-yet-fired creation. Only ever holds ONE timer.
+ */
+let snapshotTimer: ReturnType<typeof setTimeout> | null = null;
+/** Delay after Live before creating a snapshot, so pypkjs/time/lang injections settle. */
+const SNAPSHOT_CREATE_DELAY_MS = 8000;
+
+/**
  * The directory captures are written to. Defaults to the user's Downloads; the
  * renderer can repoint it via `settings:setCaptureDir`.
  */
@@ -66,6 +100,15 @@ let captureDir: string | null = null;
  */
 const loaded = new Set<string>();
 
+/** Hard cap on the windows-native startup reap so backend:init can never hang on
+ * it (the renderer awaits backend:init before enabling Launch). */
+const STARTUP_REAP_TIMEOUT_MS = 8000;
+
+/** Ceiling on a `capture:save` payload (64 MiB). A screenshot/GIF is far smaller;
+ * this just stops a hostile/buggy renderer from asking main to buffer an
+ * unbounded blob to disk. */
+const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
+
 /**
  * Resolve + validate a capture filename against a configured directory.
  *
@@ -78,9 +121,21 @@ export function resolveCapturePath(dir: string, name: string): string {
   if (!/^[\w.\- ]+\.(png|gif)$/i.test(safeName)) {
     throw new Error(`invalid capture filename: ${name}`);
   }
+  // Reject Windows reserved device names (CON, NUL, COM1…, LPT1…) and any base
+  // ending in a space or dot: Windows can't create such files (they map to a
+  // device or get silently trimmed), so a write there would fail or misfire.
+  const stem = safeName.slice(0, safeName.lastIndexOf("."));
+  if (/[ .]$/.test(stem) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem)) {
+    throw new Error(`invalid capture filename: ${name}`);
+  }
   const base = path.resolve(dir);
   const out = path.resolve(base, safeName);
-  if (out !== path.join(base, safeName) || !out.startsWith(base + path.sep)) {
+  // Confirm the result stays inside the configured dir. path.resolve strips a
+  // trailing separator EXCEPT at a filesystem/drive root ("D:\\", "/"), so
+  // derive the prefix separator-normalized rather than always appending sep —
+  // otherwise a drive-root capture dir yields "D:\\\\" and every save fails.
+  const prefix = base.endsWith(path.sep) ? base : base + path.sep;
+  if (out !== path.join(base, safeName) || !out.startsWith(prefix)) {
     throw new Error("capture path escapes capture directory");
   }
   return out;
@@ -113,6 +168,30 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // Default capture target is the user's Downloads; settings:setCaptureDir can
   // repoint it. Resolved here (not at module load) so app paths are ready.
   captureDir = path.resolve(app.getPath("downloads"));
+
+  /**
+   * Reject an IPC invoke from any frame that isn't the MAIN window's top frame
+   * (defense-in-depth). Applied to the write/spawn-capable handlers. The Clay
+   * config child window carries NO preload (see clayWindow.ts), so it never
+   * invokes IPC at all; the clay:* channels are driven by the MAIN window and
+   * are deliberately left un-gated here. Before the main window exists (or if the
+   * frame was disposed) the strict !== check rejects, which is correct: no
+   * legitimate handler here runs before the window is up.
+   */
+  const assertMainSender = (e: IpcMainInvokeEvent): void => {
+    const main = getMainWindow();
+    if (!main || e.senderFrame !== main.webContents.mainFrame) {
+      throw new Error("ipc: rejected sender (not the main window)");
+    }
+  };
+
+  /** Return the active driver or throw a clean, typed error — instead of the raw
+   * TypeError a `driver!` deref produces — when a write/spawn handler is invoked
+   * before `backend:init`. Mirrors emu:activateHealth's null-guard. */
+  const requireDriver = (): BackendDriver => {
+    if (!driver) throw new Error("emulator backend not initialized");
+    return driver;
+  };
 
   // Backlight keepalive (Task K). The "back" wake reads the qemu HMP monitor port
   // from the emulator state file. windows-native MUST read %TEMP% via Node fs: a
@@ -211,20 +290,42 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
    * Shared by `emu:stop` and the app-quit handler (index.ts before-quit). Safe to
    * call when nothing is running: the timers no-op and `driver?.stop()` skips.
    * Never throws — a teardown error must not block app exit.
+   *
+   * `quit`: the app is exiting under before-quit's bounded deadline, so latch the
+   * boot refusal and use the driver's stopFast (direct kill sweep, no liveness
+   * probe / graceful `pebble kill` first — under load those steps could eat the
+   * whole deadline and the force-kill would never dispatch, orphaning the stack).
    */
-  const teardownEmulator = async (): Promise<void> => {
+  const teardownEmulator = async (opts?: { quit?: boolean }): Promise<void> => {
+    if (opts?.quit) quitting = true;
     emuLive = false;
     stopAppLog();
     backlight.stop();
     time.stop();
     bridgeMonitor.stop();
+    // Cancel a pending snapshot creation: the emulator is going away, so a delayed
+    // stop→migrate→cont must not fire against a dead/next monitor port.
+    if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
     if (currentBootToken) currentBootToken.cancelled = true;
+    // Clear any warm-standby state: teardown stops the driver itself, so a later
+    // claim must not attach to a pre-boot that this teardown just killed. reset()
+    // flips the warm token and drops to idle WITHOUT a second stack kill.
+    warmStandby.reset();
     // Reset the "loaded" status: a stopped/force-closed emulator is running
     // nothing, so the App Library's "● loaded" pills must clear. The set is
     // repopulated by the renderer's libInstallAll on the next boot. (Apps stay
     // on disk; this tracks what's loaded on a LIVE watch, which is now none.)
     loaded.clear();
-    try { await driver?.stop(); } catch { /* may already be stopped */ }
+    try {
+      if (opts?.quit && driver?.stopFast) await driver.stopFast();
+      else await driver?.stop();
+    } catch { /* may already be stopped */ }
+    // Wait for an in-flight boot to fully unwind (mirrors warmStandby.cancel()):
+    // the token is cancelled and the stack just got swept, so this resolves
+    // promptly via BootAborted — but a boot past its last token checkpoint could
+    // otherwise spawn AFTER the sweep and leak. Its compensating killAll runs
+    // inside this await. (On the quit path the before-quit timer still bounds us.)
+    if (currentBootPromise) await currentBootPromise.catch(() => { /* BootAborted et al. */ });
   };
 
   /** Seconds ahead of the watch clock to place the demo pin (inside the peek window). */
@@ -265,6 +366,86 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     },
   });
 
+  // Warm-standby pre-boot (Task 5). Right after `backend:init` finishes
+  // provisioning we kick a background boot of the last-used board so the first
+  // Launch attaches near-instantly. `emu:start` claims it (single boot, no
+  // double-start) when the launched board matches; otherwise it cancels the warm
+  // boot (freeing the single-instance VNC ports) before its own cold boot. Owns
+  // ONLY the boot-to-Live step — post-live work (battery/time/bridge/appLog) still
+  // runs once in `emu:start` after the claim. `enabled: () => true`: the renderer
+  // gates on the Settings checkbox by only passing a `prebootBoard` when it's on.
+  const warmStandby = new WarmStandby<VncEndpoint>({
+    // Always-true by design: the production gate lives upstream — the renderer
+    // only passes `prebootBoard` to backend:init when the Settings checkbox is on
+    // (the setting is renderer-side localStorage), and backend:init only kicks on
+    // the windows-native driver. Kept a dep so tests exercise the disabled path.
+    enabled: () => true,
+    boot: async (id, token) => {
+      // Same pre-boot prep as emu:start's cold path: deploy the time shim before
+      // the emulator comes up (bootControl consults the shim-ready cache).
+      await driver?.ensureTimeShim().catch(() => false);
+      // Tracked like emu:start's cold boot so teardownEmulator can await a warm
+      // pre-boot's unwind too (same late-spawn leak guard). An emu:start that
+      // claims this boot overwrites the tracker with its own promise, which
+      // awaits this one — the unwind is still covered transitively.
+      const p = requireDriver().start(id, token, (msg) => {
+        getMainWindow()?.webContents.send("emu:boot-progress", msg);
+      });
+      currentBootPromise = p;
+      void p.catch(() => {}).finally(() => { if (currentBootPromise === p) currentBootPromise = null; });
+      return p;
+    },
+    kill: async () => { try { await driver?.stop(); } catch { /* may already be stopped */ } },
+    onError: (err) => console.error(`[warm] pre-boot failed: ${String(err)}`),
+  });
+
+  // ── Language packs (Task 10, native-Windows only) ────────────────────────
+  // The controller is built ONCE, lazily, on first use — and only on the
+  // windows-native backend (the self-contained stack that bundles the pypkjs
+  // language helper + interpreter). On WSL / native-Linux getLang resolves null
+  // so the handlers surface a clear "not supported" payload instead of crashing.
+  let langController: LanguageController | null = null;
+  const getLang = async (): Promise<LanguageController | null> => {
+    if (driverKind !== "windows-native") return null;
+    if (!langController) {
+      const ctx = await defaultCtx();
+      const { langHelperPath } = deployWinHelpers(path.join(app.getPath("userData"), "helpers"));
+      langController = makeLanguageController({
+        userDataDir: app.getPath("userData"),
+        langHelperPath,
+        pythonExe: pebblePyExe(ctx),
+        // The active pypkjs websocket port, or null when the emulator isn't up.
+        readPort: () => readPypkjsPort(winHostPaths().emuInfo),
+      });
+    }
+    return langController;
+  };
+  // Catalog is keyed on the active SDK/firmware version pebble-tool resolves.
+  const getLangFwVersion = async (): Promise<string> => {
+    try {
+      return (await currentSdkInfo(await defaultCtx())).version;
+    } catch {
+      return "unknown";
+    }
+  };
+  // `.pbl` file picker for sideloading a pack (mirrors dialog:pickPbw / sdk:install).
+  const pickPblFile = async (): Promise<string | null> => {
+    const result = await dialog.showOpenDialog({
+      title: "Select a Pebble language pack",
+      properties: ["openFile"],
+      filters: [
+        { name: "Pebble language pack", extensions: ["pbl"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0];
+  };
+  const langHandlers = makeLangHandlers({
+    getController: getLang,
+    getFwVersion: getLangFwVersion,
+    pickPblFile,
+  });
+
   ipcMain.handle("lib:add", async (_e, pbwPath: string) => { library.add(pbwPath); return library.list(); });
   ipcMain.handle("lib:list", async () => library.list());
   ipcMain.handle("lib:remove", async (_e, p: string) => {
@@ -293,6 +474,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
 
   ipcMain.handle("loaded:list", async () => Array.from(loaded));
   ipcMain.handle("loaded:clear", async (_e, platformId: PlatformId) => {
+    getPlatform(platformId); // reject an unknown/injected platform id before it reaches a bash -lc line
     // Stop the bridge-health monitor before teardown so it doesn't poll a dead
     // emulator during the wipe window (mirrors emu:stop). It is re-started after
     // the clean reboot below via bridgeMonitor.start(platformId).
@@ -322,20 +504,28 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     return result.canceled ? [] : result.filePaths;
   });
 
-  ipcMain.handle("backend:init", async () => {
+  ipcMain.handle("backend:init", async (_e, opts?: { prebootBoard?: PlatformId }) => {
     const { driver: d, kind } = await createDriver();
     driver = d;
     driverKind = kind;
     console.log(`[backend] initialized kind=${kind}`);
-    // NOTE: no startup reap here. Orphans from a prior session killed via Task
-    // Manager "End process" (TerminateProcess — can't run before-quit) are reaped
-    // by the boot path instead: bootEmulator runs killAll ("Killing stale
-    // emulator…") before EVERY boot, freeing ports 5901/6080 + the stale state
-    // file. Reaping here too would block the renderer's first watch morph behind a
-    // `pebble kill` interpreter spawn (a visible startup slowdown), and a
-    // fire-and-forget reap could race a quick Launch and kill the fresh emulator.
-    // before-quit covers graceful closes (incl. "End task"); boot-time killAll
-    // covers the hard-kill aftermath when it matters (the next boot).
+    // STARTUP REAP (windows-native): clear orphaned emulator processes left by a
+    // prior session — a crash, Task Manager "End process" (TerminateProcess can't
+    // run before-quit), or a teardown that failed (e.g. the historic `taskkill /T`
+    // tree-walk timeout). driver.reap() force-kills our stack DIRECTLY (no graceful
+    // `pebble kill` interpreter spawn, so no startup slowdown). AWAITED here — and
+    // the renderer awaits backend:init before enabling Launch — so it finishes
+    // before any boot, which means it can NEVER race a fresh emulator (the old race
+    // concern that argued against reaping here). before-quit still covers graceful
+    // closes; boot-time killAll remains a backstop.
+    if (kind === "windows-native" && driver.reap) {
+      // Bounded: reap force-kills directly and enumerates via a bounded tasklist,
+      // but we still race it against a hard cap so a startup reap can NEVER wedge
+      // backend:init (which the renderer awaits before enabling Launch). On
+      // timeout we proceed — boot-time killAll is the backstop.
+      const reapDone = driver.reap().catch((e) => console.error(`[backend] startup reap failed: ${String(e)}`));
+      await Promise.race([reapDone, new Promise<void>((r) => setTimeout(r, STARTUP_REAP_TIMEOUT_MS))]);
+    }
     // First-run SDK provisioning for the native-Windows stack: the bundled SDK is
     // read-only, so we materialise a writable copy under the app-data persist dir
     // (the XDG_DATA_HOME the invocation contract points at) BEFORE any boot. Runs
@@ -362,13 +552,109 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
         );
       }
     }
+    // Warm-standby pre-boot (Task 5): now that provisioning is done, fire a
+    // background boot of the last-used board so the first Launch attaches near-
+    // instantly. Fire-and-forget — NOT awaited, so it can never gate this init
+    // response (the renderer awaits backend:init before enabling Launch); errors
+    // are swallowed inside kick() to a log line. windows-native only: it's the
+    // shipping self-contained stack with the fast killAll/reap paths this relies
+    // on. The renderer passes `prebootBoard` only when the Settings checkbox is on.
+    const prebootBoard = opts?.prebootBoard;
+    if (kind === "windows-native" && prebootBoard) {
+      try {
+        getPlatform(prebootBoard); // reject an unknown/injected id before it reaches a boot
+        warmStandby.kick(prebootBoard);
+        // Adopt the warm boot's token as the current one so an abort/stop during
+        // the pre-boot window cancels the right boot's wait loops.
+        const t = warmStandby.currentToken();
+        if (t) currentBootToken = t;
+        console.log(`[warm] pre-booting ${prebootBoard}`);
+      } catch (err) {
+        console.error(`[warm] kick skipped: ${String(err)}`);
+      }
+    }
     return { kind };
   });
   // App version (v1.0.0) — surfaced in the Help → What's New modal.
   ipcMain.handle("app:version", () => app.getVersion());
-  ipcMain.handle("emu:start", async (e, id: PlatformId) => {
+  // Post-live work shared by the cold boot and the warm-standby fast path: runs
+  // exactly once per user-visible launch (the warm boot owns only boot-to-Live).
+  // battery.reassert / time.applyAll are idempotent re-asserts, so running them
+  // here after a claim — even if the emulator has been warm for a while — just
+  // re-applies the chosen state (same as after a Clear/weather reboot).
+  // Arm a fire-and-forget QEMU snapshot creation for this boot, so the NEXT launch
+  // of this board restores instantly. Delayed so post-live injections settle, and
+  // guarded so it only fires while THIS exact boot is still the live one (a stop or
+  // a newer boot cancels it; the driver hook is a no-op off windows-native and
+  // ineligible boards, and skips when a current bundle already exists). Never on
+  // the boot critical path; never throws.
+  const scheduleSnapshotCreate = (id: PlatformId, token: BootToken): void => {
+    if (!driver?.createSnapshotAfterLive) return; // snapshots unsupported on this driver
+    if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
+    const stillLive = (): boolean => !token.cancelled && currentBootToken === token && emuLive;
+    snapshotTimer = setTimeout(() => {
+      snapshotTimer = null;
+      if (!stillLive()) return;
+      void driver?.createSnapshotAfterLive?.(id, () => !stillLive());
+    }, SNAPSHOT_CREATE_DELAY_MS);
+  };
+  const runPostLive = async (id: PlatformId, token: BootToken): Promise<void> => {
+    await battery.reassert(); // re-assert the chosen battery level (before the time push, since emu-battery's connect re-syncs host time)
+    void time.applyAll(); // re-assert time settings (fire-and-forget)
+    // Re-install the per-board language pack (Task 10): packs live in RAM and are
+    // wiped on reboot, so re-assert the persisted selection after every boot.
+    // Fire-and-forget like health — NEVER on the boot critical path, never awaited
+    // (the controller caps its own retries and never throws). No-op on non-native
+    // backends and when no language is selected. runPostLive runs exactly once per
+    // launch (cold boot + warm-standby claim), so this reassert does too.
+    kickLangReassert(getLang, id, (m) => console.error(m));
+    // Arm the health monitor only if this boot wasn't superseded by a force-close
+    // mid-flight: emu:abort/emu:stop flip token.cancelled and call bridgeMonitor.stop(),
+    // and a boot that resolves in that same window would otherwise re-start a monitor
+    // polling an already-killed emulator (symmetric to the renderer's bootGen guard).
+    if (!token.cancelled) bridgeMonitor.start(id);
+    if (!token.cancelled) { emuLive = true; startAppLog(id); }
+    // Kick the delayed snapshot creation for this launch (cold boot / warm claim).
+    // The driver hook self-skips when a current bundle already exists, so this is a
+    // one-time-per-identity capture and never re-snapshots after a restore boot.
+    if (!token.cancelled) scheduleSnapshotCreate(id, token);
+  };
+  const startEmu = async (e: IpcMainInvokeEvent, id: PlatformId): Promise<VncEndpoint> => {
+    assertMainSender(e);
+    if (quitting) throw new Error("Pebble Studio is shutting down.");
+    getPlatform(id); // reject an unknown/injected platform id before it reaches a bash -lc line
     currentPlatform = id; // remembered for clay:phonesimPort's state-file lookup
-    // Fresh token per boot, stored as current so abort/stop can cancel it.
+
+    // Warm-standby fast path: if a pre-boot for THIS board is in flight or ready,
+    // claim it (single boot, no double-start) and jump straight to post-live work.
+    const warm = warmStandby.claim(id);
+    if (warm) {
+      // Adopt the warm boot's token so a force-close mid-attach cancels the right
+      // boot and the post-live guards see it.
+      const adopted = warmStandby.currentToken() ?? { cancelled: false };
+      currentBootToken = adopted;
+      try {
+        const ep = await warm;
+        await runPostLive(id, adopted);
+        return ep;
+      } catch (err) {
+        // A CANCELLED claim (quit/force-close raced the attach) must NOT fall
+        // through: the fallback cold boot would spawn a fresh stack with a brand-
+        // new token right after teardown's sweep — orphaned on quit, or booting
+        // the watch straight back up after a Force close.
+        if (quitting || adopted.cancelled) throw err;
+        // The pre-boot genuinely failed — fall through to a normal cold boot.
+        console.error(`[warm] claimed pre-boot failed, falling back to a cold boot: ${String(err)}`);
+      }
+    } else {
+      // Not our board (or already claimed): cancel any UNCLAIMED warm boot for a
+      // different board and fully kill its stack (single-instance VNC ports) before
+      // we boot. No-op when the warm standby is idle/claimed.
+      await warmStandby.cancel();
+    }
+
+    // Cold boot. Fresh token per boot, stored as current so abort/stop can cancel it.
+    if (quitting) throw new Error("Pebble Studio is shutting down.");
     const token: BootToken = { cancelled: false };
     currentBootToken = token;
     // Forward each boot step to the renderer (diagnostic boot notes, Task J).
@@ -379,16 +665,18 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     // falls back to the legacy offset path. (Optional chaining: a null driver is
     // handled by the start() call below, same as before.)
     await driver?.ensureTimeShim().catch(() => false);
-    const ep = await driver!.start(id, token, onStep);
-    await battery.reassert(); // re-assert the chosen battery level on the fresh emulator (before the time push, since emu-battery's connect re-syncs host time)
-    void time.applyAll(); // re-assert time settings on the fresh emulator (fire-and-forget)
-    // Arm the health monitor only if this boot wasn't superseded by a force-close
-    // mid-flight: emu:abort/emu:stop flip token.cancelled and call bridgeMonitor.stop(),
-    // and a boot that resolves in that same window would otherwise re-start a monitor
-    // polling an already-killed emulator (symmetric to the renderer's bootGen guard).
-    if (!token.cancelled) bridgeMonitor.start(id);
-    if (!token.cancelled) { emuLive = true; startAppLog(id); }
+    const ep = await requireDriver().start(id, token, onStep);
+    await runPostLive(id, token);
     return ep;
+  };
+  ipcMain.handle("emu:start", (e, id: PlatformId) => {
+    // Track the boot so teardownEmulator can await its full unwind (leak guard).
+    const p = startEmu(e, id);
+    currentBootPromise = p;
+    // Swallow here only for the tracker's sake; the returned `p` still carries
+    // the rejection to the renderer unchanged.
+    void p.catch(() => {}).finally(() => { if (currentBootPromise === p) currentBootPromise = null; });
+    return p;
   });
   ipcMain.handle("emu:abort", async () => {
     // Cancel any in-flight boot so its wait loops bail promptly. No-op (no throw)
@@ -408,7 +696,8 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
       stopAppLog();
     }
   });
-  ipcMain.handle("emu:stop", async () => {
+  ipcMain.handle("emu:stop", async (e) => {
+    assertMainSender(e);
     // Shared teardown (also used by the app-quit handler). Deliberately does NOT
     // clear `loaded`: a stop/kill reaps processes + the state file but leaves
     // installed apps on disk (removed only by `pebble wipe`).
@@ -435,7 +724,12 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // which the emulator picks up live (sitecustomize re-reads on mtime change).
   ipcMain.handle("sim:get", async (): Promise<SimEnvConfig> =>
     readSimEnv(app.getPath("userData")));
-  ipcMain.handle("sim:set", async (_e, cfg: SimEnvConfig): Promise<{ rebooted: boolean }> => {
+  ipcMain.handle("sim:set", async (e, rawCfg: SimEnvConfig): Promise<{ rebooted: boolean }> => {
+    assertMainSender(e);
+    // Normalize the untrusted renderer object (finite lat/lon in range, allowed
+    // condition/units, clamped tempC) before persisting — the bundled python
+    // reads sim-env.json and trusts it. Never throws: bad fields fall back/clamp.
+    const cfg = normalizeSimEnv(rawCfg);
     await writeSimEnv(app.getPath("userData"), cfg);
     // Make weather watchfaces reflect the new values NOW rather than waiting out
     // their internal fetch throttle (faces commonly cache their last fetch for
@@ -496,13 +790,20 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
       return { rebooted: false };
     }
   });
-  ipcMain.handle("emu:install", async (_e, pbwPath: string) => {
-    await withAppLogPaused(() => installWithBridgeRetry(() => driver!.install(pbwPath)));
+  ipcMain.handle("emu:install", async (e, pbwPath: string) => {
+    assertMainSender(e);
+    await withAppLogPaused(() => installWithBridgeRetry(() => requireDriver().install(pbwPath)));
     loaded.add(pbwPath);
     reassertTime();
   });
   ipcMain.handle("emu:button", async (_e, id: ButtonId, action?: ButtonAction) => {
-    await driver!.button(id, action ?? "press");
+    // ButtonId/ButtonAction are erased at runtime; validate against the real
+    // allowed sets so a crafted id can't inject into the input-helper stdin
+    // protocol (`click <id>` / `hold <id>`; see winInputChannel.writeCommand).
+    if (!isButtonId(id)) throw new Error(`invalid button id: ${String(id)}`);
+    const act = action ?? "press";
+    if (!isButtonAction(act)) throw new Error(`invalid button action: ${String(action)}`);
+    await requireDriver().button(id, act);
     reassertTime();
   });
   ipcMain.handle("emu:accelTap", async () => {
@@ -523,7 +824,6 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     console.log(`[health] activate: ok=${r.ok} status=${r.status} ${r.detail}`);
     return r;
   });
-  ipcMain.handle("emu:screenshot", async (_e, out: string) => driver!.screenshot(out));
   // Backlight-free framebuffer screenshot (over the watch protocol). The renderer
   // passes a capture filename; main resolves it under the configured capture dir
   // (same whitelist/traversal guard as capture:save), asks the driver to write the
@@ -531,7 +831,8 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // tells the renderer to fall back to the VNC-canvas + backlight grab. Never
   // throws (a thrown handler would surface as a renderer rejection, defeating the
   // graceful fallback). The framebuffer path is unverified-live; see winHelpers.ts.
-  ipcMain.handle("emu:screenshotFramebuffer", async (_e, name: string): Promise<string | null> => {
+  ipcMain.handle("emu:screenshotFramebuffer", async (e, name: string): Promise<string | null> => {
+    assertMainSender(e);
     if (!driver) return null;
     try {
       const dir = captureDir ?? path.resolve(app.getPath("downloads"));
@@ -541,6 +842,17 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
       // Confirm the file actually landed before claiming success.
       const stat = await fs.stat(out).catch(() => null);
       if (!stat || !stat.isFile() || stat.size === 0) return null;
+      // Round boards (chalk, gabbro): the framebuffer PNG is a plain rectangle
+      // with black corners. Mask them to transparent so the saved shot is a
+      // circle, matching the renderer's canvas path. Best-effort: a mask failure
+      // must not lose the (otherwise valid) screenshot.
+      if (currentPlatform && getPlatform(currentPlatform).round) {
+        try {
+          await applyCircularMaskToPngFile(out);
+        } catch (e) {
+          console.warn(`[capture] circular mask failed (keeping square PNG): ${String(e)}`);
+        }
+      }
       console.log(`[capture] saved (framebuffer) ${out}`);
       return out;
     } catch (e) {
@@ -613,7 +925,8 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0];
   });
 
-  ipcMain.handle("settings:setCaptureDir", async (_e, dir: string) => {
+  ipcMain.handle("settings:setCaptureDir", async (e, dir: string) => {
+    assertMainSender(e);
     // Validate: must be an absolute path that exists and is a directory.
     if (typeof dir !== "string" || !path.isAbsolute(dir)) {
       throw new Error(`capture dir must be an absolute path: ${dir}`);
@@ -636,24 +949,66 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   ipcMain.handle("sdk:info", async () => {
     return currentSdkInfo(await defaultCtx());
   });
-  ipcMain.handle("sdk:install", async () => {
-    const result = await dialog.showOpenDialog({
-      title: "Select a Pebble SDK (archive or folder)",
-      properties: ["openFile"],
-      filters: [
-        { name: "Pebble SDK archive", extensions: ["bz2", "tbz2", "gz", "tgz", "tar", "zip"] },
-        { name: "All files", extensions: ["*"] },
-      ],
-    });
+  ipcMain.handle("sdk:install", async (e, mode?: "file" | "folder") => {
+    assertMainSender(e);
+    // Windows' openFile dialog can't select a directory, so a folder SDK needs a
+    // separate openDirectory picker. installCustomSdk handles either path shape;
+    // the renderer chooses via `mode` (default "file", the archive picker).
+    const result = await dialog.showOpenDialog(
+      mode === "folder"
+        ? { title: "Select a Pebble SDK folder", properties: ["openDirectory"] }
+        : {
+            title: "Select a Pebble SDK archive",
+            properties: ["openFile"],
+            filters: [
+              { name: "Pebble SDK archive", extensions: ["bz2", "tbz2", "gz", "tgz", "tar", "zip"] },
+              { name: "All files", extensions: ["*"] },
+            ],
+          },
+    );
     if (result.canceled || result.filePaths.length === 0) return null;
-    // Installing a new SDK changes what the NEXT boot resolves; if an emulator is
-    // live, tear it down first so it isn't left on the old SDK mid-swap.
-    if (emuLive) await teardownEmulator();
+    // Installing a new SDK changes what the NEXT boot resolves. Cancel any
+    // in-flight boot first — the `emuLive` gate alone misses a boot still in
+    // progress (emuLive flips true only once it completes), which the swap would
+    // otherwise race — then tear down so nothing is left straddling the old SDK.
+    if (currentBootToken) currentBootToken.cancelled = true;
+    await teardownEmulator();
     return installCustomSdk(await defaultCtx(), result.filePaths[0], { run: spawnRunner, onProgress: sdkProgress });
   });
   ipcMain.handle("sdk:reset", async () => {
     if (emuLive) await teardownEmulator();
     return resetToBundledSdk(await defaultCtx(), { onProgress: sdkProgress });
+  });
+
+  // ── Language packs (native-Windows) ──────────────────────────────────────
+  // The handlers delegate to the language controller (Task 9); the langIpc layer
+  // owns native-only gating + error→string mapping + the file picker. install /
+  // sideload return a `{ language }` / `{ pack }` on success or a surfaced
+  // `{ error }` string; on a non-native backend every handler resolves the clear
+  // "not supported" payload rather than crashing.
+  ipcMain.handle("lang:catalog", async (e, board: string) => {
+    assertMainSender(e);
+    return langHandlers.catalog(board);
+  });
+  ipcMain.handle("lang:install", async (e, board: string, ref: PackRef) => {
+    assertMainSender(e);
+    return langHandlers.install(board, ref);
+  });
+  ipcMain.handle("lang:sideload", async (e) => {
+    assertMainSender(e);
+    return langHandlers.sideload();
+  });
+  ipcMain.handle("lang:active", async (e, board: string) => {
+    assertMainSender(e);
+    return langHandlers.active(board);
+  });
+  ipcMain.handle("lang:selection", async (e, board: string) => {
+    assertMainSender(e);
+    return langHandlers.getSelection(board);
+  });
+  ipcMain.handle("lang:setSelection", async (e, board: string, sel: Selection | null) => {
+    assertMainSender(e);
+    return langHandlers.setSelection(board, sel);
   });
 
   ipcMain.handle("capture:nextName", async (_e, base: string, ext: "png" | "gif") => {
@@ -667,7 +1022,13 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     return `${safeBase}-${max + 1}.${safeExt}`;
   });
 
-  ipcMain.handle("capture:save", async (_e, name: string, bytes: Uint8Array) => {
+  ipcMain.handle("capture:save", async (e, name: string, bytes: Uint8Array) => {
+    assertMainSender(e);
+    // Cap the payload so a hostile/buggy renderer can't make main buffer an
+    // unbounded blob to disk (a real screenshot/GIF is far under this).
+    if (!ArrayBuffer.isView(bytes) || bytes.byteLength > MAX_CAPTURE_BYTES) {
+      throw new Error("capture payload too large or not binary");
+    }
     // Resolve + sanitize against the configured capture dir (filename whitelist +
     // path stays inside the dir). Falls back to Downloads if unset.
     const dir = captureDir ?? path.resolve(app.getPath("downloads"));
@@ -677,5 +1038,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     return out;
   });
 
-  return { shutdown: teardownEmulator };
+  // The app-quit path latches the boot refusal and takes the driver's fast stop
+  // (direct kill sweep, no graceful nicety) — see teardownEmulator.
+  return { shutdown: () => teardownEmulator({ quit: true }) };
 }

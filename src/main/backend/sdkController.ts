@@ -18,12 +18,13 @@
  */
 
 import { win32 as winPath } from "node:path";
-import { mkdir, readdir, readFile, rm, cp, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, cp, stat, writeFile, statfs } from "node:fs/promises";
 import type { WinRuntimeCtx } from "./winRuntime.js";
 import { pebbleDataDir, pebblePyExe, sdkBundleRoot } from "./winRuntime.js";
 import type { RunResult } from "./BackendDriver.js";
 import {
   ACTIVE_SDK_MARKER,
+  SDK_COMPLETE_MARKER,
   FW_REFRESH_BOARDS,
   FW_REFRESH_BLOBS,
   isSdkCoreManifestValid,
@@ -163,23 +164,48 @@ export function looksLikeArchive(p: string): boolean {
 }
 
 /**
- * Python one-liner that extracts an archive to a dir. `tarfile.open` auto-detects
- * bzip2/gzip; `.zip` goes through zipfile. The `filter='data'` arg (Python ≥3.12)
- * is the safe extraction mode; older interpreters that lack it fall back to the
- * legacy behaviour. SDK tarballs are plain files, so either path is fine.
+ * True when `child` is the same path as, or nested under, `parent` (win32,
+ * case-insensitive). Used to keep the install's destructive `rm`+`cp` from
+ * ever pointing source and target at the same tree. PURE.
+ */
+export function isPathInside(parent: string, child: string): boolean {
+  const rel = winPath.relative(winPath.resolve(parent), winPath.resolve(child));
+  return rel === "" || (!rel.startsWith("..") && !winPath.isAbsolute(rel));
+}
+
+/** Unique success token the extractor prints on completion. Distinctive so a
+ * stray "ok" in interpreter noise can't be mistaken for success. */
+export const EXTRACT_OK_TOKEN = "PB_EXTRACT_OK";
+
+/** Reject an archive whose declared uncompressed size exceeds this (zip-bomb
+ * guard). A real Pebble SDK is a few hundred MB; this leaves generous headroom. */
+export const MAX_EXTRACT_BYTES = 4 * 1024 * 1024 * 1024;
+
+/**
+ * Python snippet that safely extracts an archive to a dir. `tarfile.open`
+ * auto-detects bzip2/gzip; `.zip` goes through zipfile. Extraction is hardened
+ * against path traversal (zip-slip): tar uses the `filter='data'` mode (Python
+ * ≥3.12) and REFUSES to run — rather than silently falling back to an unfiltered
+ * extractall — on an interpreter too old to have it; zip sums declared sizes
+ * against a ceiling before extracting. Both archive handles are closed via
+ * `with`. Prints EXTRACT_OK_TOKEN on success.
  */
 export const EXTRACT_PY = [
   "import sys,tarfile,zipfile,os",
   "src,dst=sys.argv[1],sys.argv[2]",
+  `MAX=${MAX_EXTRACT_BYTES}`,
   "os.makedirs(dst,exist_ok=True)",
   "if zipfile.is_zipfile(src):",
-  "    zipfile.ZipFile(src).extractall(dst)",
+  "    with zipfile.ZipFile(src) as z:",
+  "        if sum(i.file_size for i in z.infolist()) > MAX:",
+  "            sys.exit('archive too large to extract safely (possible zip bomb)')",
+  "        z.extractall(dst)",
   "else:",
-  "    t=tarfile.open(src)",
-  "    try: t.extractall(dst, filter='data')",
-  "    except TypeError: t.extractall(dst)",
-  "    t.close()",
-  "print('ok')",
+  "    if not hasattr(tarfile,'data_filter'):",
+  "        sys.exit('Python too old to extract this archive safely (need >=3.12 tarfile data filter)')",
+  "    with tarfile.open(src) as t:",
+  "        t.extractall(dst, filter='data')",
+  `print('${EXTRACT_OK_TOKEN}')`,
 ].join("\n");
 
 // ---------------------------------------------------------------------------
@@ -200,6 +226,47 @@ async function exists(p: string): Promise<boolean> {
   return stat(p).then(() => true).catch(() => false);
 }
 
+/** Free bytes an SDK install/extract should keep clear on the persist volume. A
+ * Pebble SDK is a few hundred MB and `cp` briefly doubles it. */
+const SDK_INSTALL_MIN_FREE_BYTES = 512 * 1024 * 1024;
+
+/**
+ * Best-effort free-space guard: throws a clear, user-facing error when the volume
+ * holding `dir` has less than `minBytes` free, so a disk-full mid-copy can't leave
+ * a torn SDK tree. Silently skips when statfs is unsupported or `dir` is missing —
+ * it never blocks an install on an unknowable value.
+ */
+async function ensureFreeSpace(dir: string, minBytes: number, action: string): Promise<void> {
+  let free: number;
+  try {
+    const s = await statfs(dir);
+    free = s.bsize * s.bavail;
+  } catch {
+    return;
+  }
+  if (free < minBytes) {
+    throw new Error(
+      `Not enough free disk space to ${action} — ${Math.round(free / 1e6)}MB free, need ~${Math.round(minBytes / 1e6)}MB.`,
+    );
+  }
+}
+
+/**
+ * Remove a persisted custom SDK version tree `SDKs\<version>`, asserting it is
+ * confined to `<persistSdkRoot>\SDKs` before the recursive delete. A no-op for a
+ * non-version-shaped name or a path that escapes the SDK store. Used on reset so a
+ * same-version custom upload can't survive under the version dir bundled
+ * provisioning re-uses.
+ */
+async function removeCustomVersionTree(persistSdkRoot: string, version: string): Promise<void> {
+  if (!/^\d+(\.\d+)+$/.test(version)) return;
+  const sdksRoot = winPath.join(persistSdkRoot, "SDKs");
+  const tree = winPath.join(sdksRoot, version);
+  // Containment assertion: never delete outside the SDK store.
+  if (!isPathInside(sdksRoot, tree) || winPath.resolve(tree) === winPath.resolve(sdksRoot)) return;
+  await rm(tree, { recursive: true, force: true }).catch(() => {});
+}
+
 /**
  * Install an uploaded SDK from `pickedPath` (an archive file or an extracted
  * folder) as the active "Replace & persist" SDK. Returns the installed version.
@@ -215,10 +282,19 @@ export async function installCustomSdk(
   const persistSdkRoot = winPath.join(pebbleDataDir(ctx), "pebble-sdk");
   const tmpDir = winPath.join(persistSdkRoot, ".upload-tmp");
 
+  await ensureFreeSpace(pebbleDataDir(ctx), SDK_INSTALL_MIN_FREE_BYTES, "install the SDK");
+
   // 1. Resolve a search root: a folder is searched in place; an archive is
   //    extracted to a scratch dir first (cleaned before + after).
   let searchRoot = pickedPath;
   const isDir = await stat(pickedPath).then((s) => s.isDirectory()).catch(() => false);
+  // A folder pick that lives inside our own persist SDK root would make
+  // locateSdkCore resolve source === target, and the rm below would destroy the
+  // source before the cp. Reject it up front. (An archive extracts to our own
+  // scratch dir, which is expected to be inside the persist root.)
+  if (isDir && isPathInside(persistSdkRoot, pickedPath)) {
+    throw new Error("Pick an SDK from outside Pebble Studio's data folder (that folder is already the app's SDK store).");
+  }
   if (!isDir) {
     if (!looksLikeArchive(pickedPath)) {
       throw new Error("Unsupported file — pick a Pebble SDK archive (.tar.bz2 / .zip) or its folder.");
@@ -227,7 +303,7 @@ export async function installCustomSdk(
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     await mkdir(tmpDir, { recursive: true });
     const r = await deps.run(pebblePyExe(ctx), ["-c", EXTRACT_PY, pickedPath, tmpDir]);
-    if (r.code !== 0 || !/\bok\b/.test(r.stdout)) {
+    if (r.code !== 0 || !r.stdout.includes(EXTRACT_OK_TOKEN)) {
       await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
       throw new Error(`Couldn't extract the SDK archive: ${(r.stderr || r.stdout || "").split("\n")[0].trim()}`);
     }
@@ -245,6 +321,12 @@ export async function installCustomSdk(
     // 3. Copy it into the persist dir as SDKs\<version>\sdk-core (replace any prior).
     log(`Installing Pebble SDK ${version}…`);
     const target = winPath.join(persistSdkRoot, "SDKs", version, "sdk-core");
+    // Defensive: refuse when the located source and the destination overlap, so
+    // the rm below can never delete the very tree we're about to copy FROM.
+    if (isPathInside(sdkCoreDir, target) || isPathInside(target, sdkCoreDir)) {
+      throw new Error("The selected SDK is already installed here — nothing to copy.");
+    }
+    await ensureFreeSpace(persistSdkRoot, SDK_INSTALL_MIN_FREE_BYTES, "install the SDK");
     await rm(target, { recursive: true, force: true }).catch(() => {});
     await mkdir(winPath.dirname(target), { recursive: true });
     await cp(sdkCoreDir, target, { recursive: true });
@@ -252,6 +334,9 @@ export async function installCustomSdk(
     // 4. Validate the landed copy before committing the override.
     const ok = isSdkCoreManifestValid(await readFile(winPath.join(target, "manifest.json"), "utf8").catch(() => ""), version);
     if (!ok) throw new Error(`SDK copy failed validation (${version}).`);
+    // Stamp the completeness sentinel so provisioning treats this upload as a
+    // finished install and never re-copies the (non-existent) bundle over it.
+    await writeFile(winPath.join(target, SDK_COMPLETE_MARKER), version);
 
     // 5. Write the override marker so provisioning prefers this SDK from now on.
     await writeFile(winPath.join(persistSdkRoot, ACTIVE_SDK_MARKER), version);
@@ -277,12 +362,20 @@ export async function installCustomSdk(
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 
-  // 6. Re-provision (seeds keymaps, points `current` at the new version).
+  // 6. Re-provision (seeds keymaps, points `current` at the new version). The
+  //    override marker is written above because provisioning reads it to pick the
+  //    version; if provisioning throws, roll the marker back so a failed install
+  //    doesn't leave a live-but-broken override armed for the next launch.
   const reprovision = deps.reprovision ?? (async (c: WinRuntimeCtx) => {
     _resetProvisionState();
     await provisionWinSdk(c, { onProgress: log });
   });
-  await reprovision(ctx);
+  try {
+    await reprovision(ctx);
+  } catch (e) {
+    await rm(winPath.join(persistSdkRoot, ACTIVE_SDK_MARKER), { force: true }).catch(() => {});
+    throw e;
+  }
 
   return currentSdkInfo(ctx);
 }
@@ -303,8 +396,16 @@ export async function currentSdkInfo(ctx: WinRuntimeCtx): Promise<SdkInfo> {
 }
 
 /**
- * Drop the user override and return to the bundled SDK. Removes the marker and
- * re-provisions so `current` points back at the bundled version.
+ * Drop the user override and return to the bundled SDK. Removes the marker AND
+ * the custom version tree it named, then re-provisions so `current` points back
+ * at a FRESH bundled copy.
+ *
+ * Deleting the custom tree is essential, not just cleanup: an upload declaring
+ * the SAME version as the bundle overwrote `SDKs\<bundleVer>\sdk-core` — the very
+ * dir bundled provisioning re-uses. Left in place, provisioning would find a
+ * valid same-version manifest, SKIP the copy, and keep serving custom files while
+ * reporting `source: "bundled"`. Wiping it forces a clean re-provision from the
+ * bundle (and reclaims the hundreds of MB of a non-colliding custom version too).
  */
 export async function resetToBundledSdk(
   ctx: WinRuntimeCtx,
@@ -313,7 +414,10 @@ export async function resetToBundledSdk(
   const log = deps.onProgress ?? (() => {});
   const persistSdkRoot = winPath.join(pebbleDataDir(ctx), "pebble-sdk");
   const marker = winPath.join(persistSdkRoot, ACTIVE_SDK_MARKER);
+  // Read the named version BEFORE dropping the marker so we know which tree to wipe.
+  const customVersion = (await readFile(marker, "utf8").catch(() => "")).trim();
   if (await exists(marker)) await rm(marker, { force: true }).catch(() => {});
+  if (customVersion) await removeCustomVersionTree(persistSdkRoot, customVersion);
   const reprovision = deps.reprovision ?? (async (c: WinRuntimeCtx) => {
     _resetProvisionState();
     await provisionWinSdk(c, { onProgress: log });

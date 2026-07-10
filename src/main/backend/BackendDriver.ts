@@ -16,6 +16,15 @@ export interface BackendDriver {
    * a label before each major boot step (for diagnostic boot notes). */
   start(id: PlatformId, token?: BootToken, onStep?: OnStep): Promise<VncEndpoint>;
   stop(): Promise<void>;
+  /** Quit-path stop: skip the graceful `pebble kill` nicety and dispatch the
+   * direct force-kill sweep immediately, so the kills land inside before-quit's
+   * bounded window even when process enumeration is slow under load. Optional:
+   * callers fall back to stop(). */
+  stopFast?(): Promise<void>;
+  /** Reap orphaned emulator processes left by a prior session (crash / "End
+   * process" / a failed teardown). Called once at startup before the first boot.
+   * Optional: only the windows-native driver implements it. */
+  reap?(): Promise<void>;
   install(pbwPath: string): Promise<void>;
   button(id: ButtonId, action: ButtonAction): Promise<void>;
   accelTap(): Promise<void>;
@@ -60,4 +69,11 @@ export interface BackendDriver {
    * Optional: windows-native + native + WSL implement it; returns null when the
    * driver/stack can't stream (caller shows an empty panel). */
   streamLogs?(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null;
+  /**
+   * Create a QEMU snapshot bundle for `board` after a COLD boot reached Live, so
+   * the NEXT launch restores instantly. Fire-and-forget: reads the qemu monitor
+   * port, drives stop→migrate→cont, copies the SPI, and writes the bundle meta.
+   * NEVER throws. `isCancelled` aborts promptly if the emulator stops mid-create.
+   * Optional: only the windows-native driver implements it. */
+  createSnapshotAfterLive?(board: PlatformId, isCancelled?: () => boolean): Promise<void>;
 }

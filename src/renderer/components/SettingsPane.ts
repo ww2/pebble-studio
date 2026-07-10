@@ -6,6 +6,8 @@ import {
   DEFAULT_BINDINGS,
   loadBindings,
   saveBindings,
+  isBareModifierKey,
+  applyRebind,
   type KeyAction,
   type Bindings,
 } from "../keybindings.js";
@@ -22,6 +24,7 @@ import {
   type SimEnvConfig, type ConditionKey,
 } from "../../shared/simEnv.js";
 import { LIVE_SUNLIGHT_KEY, LIVE_SUNLIGHT_EVENT } from "../liveSunlight.js";
+import { LanguagePanel } from "./LanguagePanel.js";
 
 type ThemeChoice = "light" | "dark";
 type BootMode = "auto" | "manual";
@@ -56,6 +59,10 @@ interface SettingsOptions {
    * picked up). The backend tears the emulator down during the swap; this brings
    * it back on the newly-active SDK. */
   onSdkRelaunch?: () => void | Promise<void>;
+  /** The live board id (Task 11) — the Language section scopes every pack call to
+   * it. Provided by main.ts as `() => switcher.value`. When absent the Language
+   * section is omitted (no board context to act on). */
+  getBoard?: () => string;
 }
 
 const CAPTURE_DIR_KEY = "pebble-studio:capture-dir";
@@ -68,6 +75,9 @@ const DIAGNOSTICS_KEY = "pebble-studio:diagnostics";
 /** Auto-relaunch the emulator when the bridge crashes (EmulatorView reads this). Default OFF. */
 const AUTO_RELAUNCH_KEY = "pebble-studio:auto-relaunch";
 const EMU_LOGS_KEY = "pebble-studio:emu-logs";
+/** Warm-standby pre-boot on app start (Task 5). main.ts reads this to decide
+ * whether to pass a `prebootBoard` to initBackend. Default OFF (opt-in). */
+const PREBOOT_STARTUP_KEY = "pebble-studio:preboot-startup";
 
 const TIME_SOURCE_KEY = "pebble-studio:time-source";
 const TIME_RATE_KEY = "pebble-studio:time-rate";
@@ -181,6 +191,8 @@ const ACTION_LABELS: Record<KeyAction, string> = {
   tap: "Tap (accel)",
   shake: "Shake",
   light: "Backlight",
+  screenshot: "Screenshot",
+  record: "Record GIF",
 };
 
 /** Pretty-print a bound key for display (e.g. ArrowLeft → "←", " " → "Space"). */
@@ -235,6 +247,8 @@ export class SettingsPane {
   private readonly onSdkRelaunch?: () => void | Promise<void>;
   private readonly onWeatherRefreshBegin?: () => void;
   private readonly onWeatherRefreshEnd?: () => void;
+  /** Board-scoped Language section (Task 11); undefined when no board getter. */
+  private readonly languagePanel?: LanguagePanel;
 
   /** Current keybindings (Keyboard section); reloaded on reset/rebind. */
   private bindings: Bindings;
@@ -242,6 +256,9 @@ export class SettingsPane {
   private readonly keyRowsHost: HTMLElement;
   /** Active document keydown listener while in rebind-capture mode (else null). */
   private rebindListener: ((e: KeyboardEvent) => void) | null = null;
+  /** Removes ALL listeners armed for the active rebind capture (keydown + the
+   * blur / outside-click cancels), or null when no capture is armed. */
+  private rebindCleanup: (() => void) | null = null;
 
   // ── Time section controls (explicit edit-then-apply) ────────────────────
   private dateInput!: HTMLInputElement;
@@ -408,7 +425,18 @@ export class SettingsPane {
 
     bootRow.append(bootText, this.bootSwitchEl);
 
-    watch.append(watchHeader, this.defaultWatchSlot, bootRow);
+    // Pre-boot on app start (Task 5): warm-boot the startup watch in the
+    // background right after launch so the first Launch attaches near-instantly.
+    // main.ts reads PREBOOT_STARTUP_KEY at startup and passes the board to
+    // initBackend when this is on. Default OFF (opt-in).
+    const prebootRow = this.makeSwitchRow(
+      "Pre-boot emulator on app start",
+      "Start the last-used watch booting in the background as soon as the app opens, so your first Launch is near-instant. Off by default; turn on for instant first launches.",
+      localStorage.getItem(PREBOOT_STARTUP_KEY) === "true", // default OFF (opt-in)
+      (on) => localStorage.setItem(PREBOOT_STARTUP_KEY, on ? "true" : "false"),
+    );
+
+    watch.append(watchHeader, this.defaultWatchSlot, bootRow, prebootRow);
 
     // ── Time section ──────────────────────────────────────────────────────
     const time = document.createElement("section");
@@ -693,6 +721,12 @@ export class SettingsPane {
     );
 
     batBtn.addEventListener("click", () => {
+      // Pre-check liveness: setBattery against a stopped watch fails with a raw IPC
+      // error. Give a friendly nudge instead. (Absent injection = assume live.)
+      if (this.isEmuLive && !this.isEmuLive()) {
+        batStatus.textContent = "Watch isn't running — launch it first.";
+        return;
+      }
       const [pct, charging] = buildBatteryCall(pctSlider.value, localStorage.getItem(BAT_CHG_KEY));
       batStatus.textContent = "Setting…";
       void window.studio.setBattery(pct, charging)
@@ -797,8 +831,12 @@ export class SettingsPane {
       }
       syncCustomVisibility(); markSimDirty();
     });
-    latInput.addEventListener("input", () => { simState.lat = Number(latInput.value) || 0; markSimDirty(); });
-    lonInput.addEventListener("input", () => { simState.lon = Number(lonInput.value) || 0; markSimDirty(); });
+    // Clamp coordinates to valid geographic ranges (±90 lat / ±180 lon) so a typo
+    // can't feed an out-of-range fix to weather apps. (A sibling agent also
+    // validates in the main process; this is the UI-side guard.)
+    const clampNum = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v));
+    latInput.addEventListener("input", () => { simState.lat = clampNum(Number(latInput.value) || 0, -90, 90); markSimDirty(); });
+    lonInput.addEventListener("input", () => { simState.lon = clampNum(Number(lonInput.value) || 0, -180, 180); markSimDirty(); });
 
     // Condition dropdown.
     const condControl = document.createElement("label");
@@ -1175,25 +1213,47 @@ export class SettingsPane {
     const sdkUploadBtn = document.createElement("button");
     sdkUploadBtn.type = "button";
     sdkUploadBtn.className = "lib-pick-btn";
-    sdkUploadBtn.textContent = "Upload SDK…";
+    sdkUploadBtn.textContent = "Upload archive…";
+    // Windows' open dialog cannot pick a file and a directory in one picker, so
+    // an extracted SDK tree needs its own entry point into the same install path.
+    const sdkUploadDirBtn = document.createElement("button");
+    sdkUploadDirBtn.type = "button";
+    sdkUploadDirBtn.className = "lib-pick-btn";
+    sdkUploadDirBtn.textContent = "Upload folder…";
     const sdkResetBtn = document.createElement("button");
     sdkResetBtn.type = "button";
     sdkResetBtn.className = "lib-pick-btn";
     sdkResetBtn.textContent = "Reset to bundled";
     const sdkBtns = document.createElement("div");
     sdkBtns.className = "settings-row-actions";
-    sdkBtns.append(sdkUploadBtn, sdkResetBtn);
+    sdkBtns.append(sdkUploadBtn, sdkUploadDirBtn, sdkResetBtn);
 
     this.sdkStatus = document.createElement("span");
     this.sdkStatus.className = "settings-row-desc type-caption";
 
-    sdkUploadBtn.addEventListener("click", () => void this.uploadSdk(sdkUploadBtn, sdkResetBtn));
+    const sdkAllBtns = [sdkUploadBtn, sdkUploadDirBtn, sdkResetBtn];
+    sdkUploadBtn.addEventListener("click", () => void this.uploadSdk("file", sdkAllBtns));
+    sdkUploadDirBtn.addEventListener("click", () => void this.uploadSdk("folder", sdkAllBtns));
     sdkResetBtn.addEventListener("click", () => void this.resetSdk(sdkUploadBtn, sdkResetBtn));
 
     sdk.append(sdkHeader, sdkRow, sdkBtns, this.sdkStatus);
     void this.refreshSdkInfo();
 
-    this.el.append(appearance, watch, time, battery, sim, health, capture, sdk, keyboard, advanced);
+    // ── Language section (Task 11) ────────────────────────────────────────
+    // Board-specific (unlike the other sections), so it's its own component: it
+    // reloads for the live board on `pebble-studio:board-changed` and refreshes
+    // the active language on Live (`pebble-studio:apps-changed`). Omitted when no
+    // board getter was injected (no board context to act on).
+    this.languagePanel = options.getBoard
+      ? new LanguagePanel(options.getBoard)
+      : undefined;
+    const language = this.languagePanel?.el;
+
+    this.el.append(
+      appearance, watch, time, battery, sim,
+      ...(language ? [language] : []),
+      health, capture, sdk, keyboard, advanced,
+    );
 
     this.syncSwitch();
     this.syncBootSwitch();
@@ -1384,6 +1444,16 @@ export class SettingsPane {
 
   /** Apply the edited custom time (Run custom time button). */
   private applyCustom(): void {
+    // Refuse an empty/invalid date: customWallMs() would return 0 and silently
+    // drive the watch to 1970-01-01 (indistinguishable from the "random time" bug
+    // class). The time comes from selects (always valid), so only the date can be
+    // bad. Prompt in the status line instead of applying.
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(this.dateInput.value)) {
+      this.timeStatusEl.textContent = "Pick a valid date before running custom time.";
+      this.timeStatusEl.classList.add("settings-time-status--edited");
+      this.timeStatusEl.classList.remove("settings-time-status--running");
+      return;
+    }
     localStorage.setItem(TIME_CUSTOM_DATE_KEY, this.dateInput.value);
     localStorage.setItem(TIME_CUSTOM_TIME_KEY, this.customTime24);
     localStorage.setItem(TIME_RATE_KEY, this.rateSelect.value);
@@ -1542,29 +1612,55 @@ export class SettingsPane {
     btn.textContent = "Press a key…";
     btn.classList.add("lib-pick-btn--active");
 
+    // Tear down the capture and repaint the rows (restoring the "Rebind" label and
+    // reflecting any binding change). `rebound` gates the change notification.
+    const finish = (rebound: boolean): void => {
+      this.cancelRebind();
+      this.renderKeyRows();
+      if (rebound) window.dispatchEvent(new Event("pebble-studio:keybindings-changed"));
+    };
+
     const onKey = (e: KeyboardEvent): void => {
+      // The pane was detached (user navigated away — showPane replaces the DOM but
+      // not this document listener). Abandon WITHOUT hijacking the key, so it can't
+      // silently become the new binding.
+      if (!btn.isConnected) { finish(false); return; }
+      // Ignore a bare modifier press: a modifier-only key can never fire an action
+      // (handleKeyDown bails on any modifier chord), so it would be a dead binding.
+      // Stay armed for the actual key.
+      if (isBareModifierKey(e.key)) return;
       e.preventDefault();
       e.stopPropagation();
-      this.cancelRebind();
-      if (e.key === "Escape") {
-        this.renderKeyRows(); // cancelled — restore the button label
-        return;
-      }
-      this.bindings[action] = e.key;
+      if (e.key === "Escape") { finish(false); return; } // cancelled
+      // applyRebind clears the key from any other action first, so a key maps to
+      // exactly one action (resolveAction otherwise silently keeps the first).
+      this.bindings = applyRebind(this.bindings, action, e.key);
       saveBindings(this.bindings);
-      this.renderKeyRows();
-      window.dispatchEvent(new Event("pebble-studio:keybindings-changed"));
+      finish(true);
     };
+    // Cancel if the window loses focus or the user clicks anywhere but this button
+    // (e.g. the nav rail to switch panes) — so the capture can't stay armed and
+    // swallow the next keystroke anywhere in the app.
+    const onBlur = (): void => finish(false);
+    const onDown = (e: MouseEvent): void => {
+      if (e.target !== btn && !btn.contains(e.target as Node)) finish(false);
+    };
+
     this.rebindListener = onKey;
+    this.rebindCleanup = (): void => {
+      document.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("blur", onBlur);
+      document.removeEventListener("mousedown", onDown, true);
+    };
     document.addEventListener("keydown", onKey, true);
+    window.addEventListener("blur", onBlur);
+    document.addEventListener("mousedown", onDown, true);
   }
 
-  /** Tear down any active rebind-capture listener/state (idempotent). */
+  /** Tear down any active rebind-capture listeners/state (idempotent). */
   private cancelRebind(): void {
-    if (this.rebindListener) {
-      document.removeEventListener("keydown", this.rebindListener, true);
-      this.rebindListener = null;
-    }
+    if (this.rebindCleanup) { this.rebindCleanup(); this.rebindCleanup = null; }
+    this.rebindListener = null;
   }
 
   /** Reset bindings to defaults, persist, notify EmulatorView, refresh rows. */
@@ -1650,14 +1746,13 @@ export class SettingsPane {
   }
 
   /** Upload + install a user-chosen SDK (Replace & persist + full-launcher overlay). */
-  private async uploadSdk(uploadBtn: HTMLButtonElement, resetBtn: HTMLButtonElement): Promise<void> {
+  private async uploadSdk(mode: "file" | "folder", btns: HTMLButtonElement[]): Promise<void> {
     const wasLive = this.isEmuLive?.() ?? false;
-    uploadBtn.disabled = true;
-    resetBtn.disabled = true;
+    for (const b of btns) b.disabled = true;
     this.sdkStatus.textContent = "Installing…";
     let relaunch = false;
     try {
-      const info = await window.studio.sdkInstall();
+      const info = await window.studio.sdkInstall(mode);
       if (info == null) {
         this.sdkStatus.textContent = ""; // cancelled — emulator untouched
       } else {
@@ -1672,8 +1767,7 @@ export class SettingsPane {
       this.sdkStatus.textContent = `Upload failed: ${reason || "see console"}`;
       relaunch = wasLive; // the backend may have torn the emulator down before failing
     } finally {
-      uploadBtn.disabled = false;
-      resetBtn.disabled = false;
+      for (const b of btns) b.disabled = false;
     }
     await this.maybeRelaunchAfterSdk(relaunch);
   }

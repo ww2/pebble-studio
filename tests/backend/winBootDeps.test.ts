@@ -1,11 +1,27 @@
 import { describe, it, expect, vi } from "vitest";
-import { makeWinBootDeps } from "../../src/main/backend/winBootDeps.js";
+import { EventEmitter } from "node:events";
+import { makeWinBootDeps, tasklistPids, anythingAlive } from "../../src/main/backend/winBootDeps.js";
+
+/** Minimal stand-in for a spawned child process (stdout + close/error + kill). */
+function fakeChild() {
+  const child = new EventEmitter() as EventEmitter & { stdout: EventEmitter; kill: () => void };
+  child.stdout = new EventEmitter();
+  child.kill = () => {};
+  return child;
+}
 
 function deps(over = {}) {
   const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
   const readFile = vi.fn(async () => "");
   const detachSpawn = vi.fn(async () => {});
-  return { run, readFile, detachSpawn, ...over };
+  // Inject safe spies so tests NEVER call the real process.kill / tasklist.
+  const killPid = vi.fn(async (_pid: number) => {});
+  const pidsByImage = vi.fn(async (_image: string) => [] as number[]);
+  // Default: every state-file pid resolves to one of OUR images (verified), so the
+  // legacy tests that expect state pids to be killed keep passing. The identity
+  // regression tests below override this to return a NON-ours image.
+  const imageOfPid = vi.fn(async (_pid: number) => "qemu-pebble.exe");
+  return { run, readFile, detachSpawn, killPid, pidsByImage, imageOfPid, ...over };
 }
 
 describe("makeWinBootDeps", () => {
@@ -50,18 +66,19 @@ describe("makeWinBootDeps", () => {
     expect(wipeCall?.env).toEqual({ XDG_DATA_HOME: "C:\\data\\pebble-data" });
   });
 
-  it("diagnose reports qemuAlive from a live tasklist row", async () => {
+  it("diagnose reports qemuAlive from the bounded image enumeration (not the unbounded runner)", async () => {
     const d = deps({
-      run: vi.fn(async (_c: string, args: string[]) =>
-        args.includes("IMAGENAME eq qemu-pebble.exe")
-          ? { code: 0, stdout: `"qemu-pebble.exe","999","Console","1","10 K"\r\n`, stderr: "" }
-          : { code: 0, stdout: "", stderr: "" }),
+      // Liveness now comes from pidsByImage (bounded), NOT run("tasklist", …).
+      pidsByImage: vi.fn(async (img: string) => (img === "qemu-pebble.exe" ? [999] : [])),
       readFile: vi.fn(async () => JSON.stringify({ basalt: { "4.9": { qemu: { pid: 999 } } } })),
+      portOpen: vi.fn(async () => false),
     });
     const b = makeWinBootDeps(d);
     const probe = await b.diagnose();
     expect(probe.qemuAlive).toBe(true);
     expect(probe.stateFile).toBe(true);
+    // The unbounded runner is NOT used for the liveness probe (no tasklist spawn).
+    expect(d.run.mock.calls.some(([cmd]: [string]) => cmd === "tasklist")).toBe(false);
   });
 
   it("waitForEmuInfo resolves once the state file has a live pid for the platform", async () => {
@@ -70,16 +87,19 @@ describe("makeWinBootDeps", () => {
     await expect(b.waitForEmuInfo("basalt", 1000)).resolves.toBeUndefined();
   });
 
-  it("killAll force-kills qemu by image and removes the state file", async () => {
-    const calls: string[][] = [];
+  it("killAll kills image-enumerated pids DIRECTLY (no taskkill) and removes the state file", async () => {
     const d = deps({
-      run: vi.fn(async (_c: string, args: string[]) => { calls.push(args); return { code: 0, stdout: "", stderr: "" }; }),
+      pidsByImage: vi.fn(async (img: string) =>
+        img === "qemu-pebble.exe" ? [72480] : img === "PebbleStudioEmu.exe" ? [14952] : []),
       rm: vi.fn(async () => {}),
       portOpen: vi.fn(async () => false),
     });
     const b = makeWinBootDeps(d);
     await b.killAll();
-    expect(calls.some((a) => a.includes("qemu-pebble.exe") && a.includes("/F"))).toBe(true);
+    expect(d.killPid).toHaveBeenCalledWith(72480);
+    expect(d.killPid).toHaveBeenCalledWith(14952);
+    // The /T tree-walk that timed out under load is GONE: no taskkill is spawned.
+    expect(d.run.mock.calls.some(([cmd]: [string]) => cmd === "taskkill")).toBe(false);
     expect(d.rm).toHaveBeenCalled();
   });
 
@@ -124,37 +144,114 @@ describe("makeWinBootDeps killAll — process-leak fix", () => {
     },
   });
 
-  it("force-kills every state-file pid by PID and qemu by image, then removes the state file", async () => {
-    const calls: string[][] = [];
+  it("force-kills every state-file pid AND every image pid directly (process.kill), then removes the state file", async () => {
     const d = deps({
-      run: vi.fn(async (_c: string, args: string[]) => { calls.push(args); return { code: 0, stdout: "", stderr: "" }; }),
       readFile: vi.fn(async () => stateJson),
+      pidsByImage: vi.fn(async (img: string) =>
+        img === "qemu-pebble.exe" ? [1001] : img === "PebbleStudioEmu.exe" ? [2001] : []),
       rm: vi.fn(async () => {}),
       portOpen: vi.fn(async () => false),
     });
     const b = makeWinBootDeps(d);
     await b.killAll();
 
-    // Each pid (qemu/pypkjs/websockify) force-killed by PID with the child tree.
-    for (const pid of ["1001", "1002", "1003"]) {
-      expect(calls.some((a) => a.includes("/PID") && a.includes(pid) && a.includes("/T") && a.includes("/F"))).toBe(true);
+    // Every state-file pid (qemu/pypkjs/websockify) AND the image-enumerated
+    // supervisor pid are killed via the direct TerminateProcess primitive.
+    for (const pid of [1001, 1002, 1003, 2001]) {
+      expect(d.killPid).toHaveBeenCalledWith(pid);
     }
-    // Image backstop for qemu still runs; state file removed.
-    expect(calls.some((a) => a.includes("qemu-pebble.exe") && a.includes("/F"))).toBe(true);
-    expect(calls.some((a) => a.includes("PebbleStudioEmu.exe"))).toBe(true);
     expect(d.rm).toHaveBeenCalled();
   });
 
-  it("does not blanket-kill python.exe by image (would hit unrelated user Python)", async () => {
-    const calls: string[][] = [];
+  it("only enumerates OUR images (never python.exe, which would hit unrelated user Python)", async () => {
     const d = deps({
-      run: vi.fn(async (_c: string, args: string[]) => { calls.push(args); return { code: 0, stdout: "", stderr: "" }; }),
       readFile: vi.fn(async () => stateJson),
       rm: vi.fn(async () => {}),
       portOpen: vi.fn(async () => false),
     });
     await makeWinBootDeps(d).killAll();
-    expect(calls.some((a) => a.includes("python.exe"))).toBe(false);
+    const queried = d.pidsByImage.mock.calls.map(([img]: [string]) => img);
+    expect(queried).not.toContain("python.exe");
+    expect(queried).toEqual(expect.arrayContaining(["qemu-pebble.exe", "PebbleStudioEmu.exe"]));
+  });
+
+  it("re-sweeps while a port stays held, instead of silently giving up", async () => {
+    // Ports report busy for the first settle poll, then free — so killAll must
+    // run the kill sweep MORE THAN ONCE (the old code killed once and returned).
+    let poll = 0;
+    const d = deps({
+      readFile: vi.fn(async () => stateJson),
+      rm: vi.fn(async () => {}),
+      portOpen: vi.fn(async () => { poll++; return poll <= 2; }),
+    });
+    await makeWinBootDeps(d).killAll();
+    const killed1001 = d.killPid.mock.calls.filter(([p]: [number]) => p === 1001).length;
+    expect(killed1001).toBeGreaterThan(1);
+  });
+
+  it("does NOT kill a stale state-file pid whose image is NOT ours (post-reboot pid reuse)", async () => {
+    // The state file survives crashes AND reboots; Windows recycles pids, so 5555
+    // may now belong to an unrelated same-user process. It must NEVER be killed.
+    const staleState = JSON.stringify({ emery: { "4.9": { qemu: { pid: 5555 } } } });
+    const rm = vi.fn(async () => {});
+    const d = deps({
+      readFile: vi.fn(async () => staleState),
+      pidsByImage: vi.fn(async () => [] as number[]), // none of OUR images are running
+      imageOfPid: vi.fn(async (_pid: number) => "notepad.exe"), // 5555 is a stranger
+      rm,
+      portOpen: vi.fn(async () => false),
+    });
+    await makeWinBootDeps(d).killAll();
+    expect(d.killPid).not.toHaveBeenCalledWith(5555);
+    // ALL state pids failed verification → the stale file is dropped.
+    expect(rm).toHaveBeenCalled();
+  });
+
+  it("keeps the state file (and kills nothing) when verification is INDETERMINATE — wedged tasklist", async () => {
+    // imageOfPid → null means tasklist itself hung/errored: the pid may still be
+    // a live orphan of ours. The old code treated this like "definitively not
+    // ours" and dropped the state file — erasing the orphan's only record while
+    // killing nothing. Now: don't kill (unverified), but DON'T forget either.
+    const state = JSON.stringify({ emery: { "4.9": { pypkjs: { pid: 7001 } } } });
+    const rm = vi.fn(async () => {});
+    const d = deps({
+      readFile: vi.fn(async () => state),
+      pidsByImage: vi.fn(async () => [] as number[]), // enumeration also degraded
+      imageOfPid: vi.fn(async (_pid: number) => null), // ← indeterminate
+      rm,
+      portOpen: vi.fn(async () => false),
+    });
+    await makeWinBootDeps(d).killAll();
+    expect(d.killPid).not.toHaveBeenCalledWith(7001); // unverified — never kill
+    expect(rm).not.toHaveBeenCalled(); // the state file is the orphan's only record
+  });
+
+  it("startup reap also keeps the state file on an indeterminate sweep", async () => {
+    const state = JSON.stringify({ emery: { "4.9": { qemu: { pid: 7002 } } } });
+    const rm = vi.fn(async () => {});
+    const d = deps({
+      readFile: vi.fn(async () => state),
+      pidsByImage: vi.fn(async () => [] as number[]),
+      imageOfPid: vi.fn(async (_pid: number) => null),
+      rm,
+      portOpen: vi.fn(async () => false),
+    });
+    await makeWinBootDeps(d).reap();
+    expect(d.killPid).not.toHaveBeenCalledWith(7002);
+    expect(rm).not.toHaveBeenCalled();
+  });
+
+  it("DOES kill a state-file pid whose image IS ours (verified)", async () => {
+    const state = JSON.stringify({ emery: { "4.9": { pypkjs: { pid: 6001 } } } });
+    const d = deps({
+      readFile: vi.fn(async () => state),
+      pidsByImage: vi.fn(async () => [] as number[]),
+      imageOfPid: vi.fn(async (_pid: number) => "PebbleStudioEmu.exe"),
+      rm: vi.fn(async () => {}),
+      portOpen: vi.fn(async () => false),
+    });
+    await makeWinBootDeps(d).killAll();
+    expect(d.killPid).toHaveBeenCalledWith(6001);
   });
 
   it("calls pebble kill first (supervisor shutdown) through the bundled builder", async () => {
@@ -164,11 +261,123 @@ describe("makeWinBootDeps killAll — process-leak fix", () => {
       pebble,
       run: vi.fn(async (cmd: string, args: string[]) => { calls.push({ cmd, args }); return { code: 0, stdout: "", stderr: "" }; }),
       readFile: vi.fn(async () => ""),
+      // A live image makes the fast-path gate report "alive", so the graceful
+      // `pebble kill` still fires (this test asserts the graceful-first ordering).
+      pidsByImage: vi.fn(async (img: string) => (img === "qemu-pebble.exe" ? [4242] : [])),
       rm: vi.fn(async () => {}),
       portOpen: vi.fn(async () => false),
     });
     await makeWinBootDeps(d).killAll();
     expect(calls.some((c) => c.cmd === "C:\\py\\python.exe" && c.args.includes("kill"))).toBe(true);
+  });
+
+  it("FAST PATH: skips the graceful pebble kill spawn when nothing is alive", async () => {
+    // No state file, no images running, both ports free → nothing to gracefully
+    // kill, so we must NOT pay the bundled-interpreter spawn cost for `pebble kill`.
+    const d = deps({
+      readFile: vi.fn(async () => ""),
+      pidsByImage: vi.fn(async () => [] as number[]),
+      rm: vi.fn(async () => {}),
+      portOpen: vi.fn(async () => false),
+    });
+    await makeWinBootDeps(d).killAll();
+    // Graceful kill (any argv containing "kill" through the runner) never spawned.
+    expect(d.run.mock.calls.some(([, args]: [string, string[]]) => args?.includes("kill"))).toBe(false);
+    // The unconditional force-reap still ran (state file cleared).
+    expect(d.rm).toHaveBeenCalled();
+  });
+
+  it("still force-reaps (sweep + settle) when a port is occupied but no pids are found", async () => {
+    // A foreign owner (e.g. WSL emulator) holds the port with none of OUR pids.
+    // The gate reads "alive" (port busy), so graceful kill fires, AND the reap
+    // sweep + settle still run unconditionally.
+    const d = deps({
+      readFile: vi.fn(async () => ""),
+      pidsByImage: vi.fn(async () => [] as number[]),
+      rm: vi.fn(async () => {}),
+      portOpen: vi.fn(async () => true),
+    });
+    await makeWinBootDeps(d).killAll();
+    expect(d.run.mock.calls.some(([, args]: [string, string[]]) => args?.includes("kill"))).toBe(true);
+    expect(d.pidsByImage).toHaveBeenCalled(); // sweep enumerated our images
+    expect(d.rm).toHaveBeenCalled();
+  });
+});
+
+describe("anythingAlive — killAll fast-path gate", () => {
+  const base = {
+    readState: async () => "",
+    pidsByImage: async (_img: string) => [] as number[],
+    portOpen: async (_h: string, _p: number) => false,
+  };
+  it("false when there are no state pids, no image pids, and both ports are free", async () => {
+    expect(await anythingAlive({ ...base })).toBe(false);
+  });
+  it("true when the state file names a pid", async () => {
+    const readState = async () => JSON.stringify({ emery: { "4.9": { qemu: { pid: 1001 } } } });
+    expect(await anythingAlive({ ...base, readState })).toBe(true);
+  });
+  it("true when one of our images is running", async () => {
+    const pidsByImage = async (img: string) => (img === "qemu-pebble.exe" ? [123] : []);
+    expect(await anythingAlive({ ...base, pidsByImage })).toBe(true);
+  });
+  it("true when the ws port (6080) is occupied", async () => {
+    const portOpen = async (_h: string, p: number) => p === 6080;
+    expect(await anythingAlive({ ...base, portOpen })).toBe(true);
+  });
+  it("true when the RFB port (5901) is occupied", async () => {
+    const portOpen = async (_h: string, p: number) => p === 5901;
+    expect(await anythingAlive({ ...base, portOpen })).toBe(true);
+  });
+});
+
+describe("tasklistPids — bounded process enumeration (tasklist can hang)", () => {
+  it("resolves the parsed pids when the child closes with CSV output", async () => {
+    const child = fakeChild();
+    const p = tasklistPids("qemu-pebble.exe", { spawn: () => child, timeoutMs: 1000 });
+    child.stdout.emit("data", Buffer.from(`"qemu-pebble.exe","1234","Console","1","10 K"\r\n`));
+    child.emit("close", 0);
+    expect(await p).toEqual([1234]);
+  });
+
+  it("resolves [] AND kills the child when tasklist hangs past the timeout", async () => {
+    const child = fakeChild();
+    const kill = vi.fn();
+    child.kill = kill;
+    // never emit "close" → only the timeout can settle it
+    const p = tasklistPids("anything.exe", { spawn: () => child, timeoutMs: 10 });
+    expect(await p).toEqual([]);
+    expect(kill).toHaveBeenCalled();
+  });
+
+  it("resolves [] when the spawn errors (tasklist missing / failed)", async () => {
+    const child = fakeChild();
+    const p = tasklistPids("x.exe", { spawn: () => child, timeoutMs: 1000 });
+    child.emit("error", new Error("ENOENT"));
+    expect(await p).toEqual([]);
+  });
+});
+
+describe("makeWinBootDeps reap — startup orphan reaper", () => {
+  it("force-kills state + image pids directly and removes the state file", async () => {
+    const d = deps({
+      readFile: vi.fn(async () => JSON.stringify({ emery: { "4.9": { qemu: { pid: 1001 } } } })),
+      pidsByImage: vi.fn(async (img: string) => (img === "qemu-pebble.exe" ? [72480] : [])),
+      rm: vi.fn(async () => {}),
+      portOpen: vi.fn(async () => false),
+    });
+    const b = makeWinBootDeps(d);
+    await b.reap();
+    expect(d.killPid).toHaveBeenCalledWith(1001);
+    expect(d.killPid).toHaveBeenCalledWith(72480);
+    expect(d.rm).toHaveBeenCalled();
+  });
+
+  it("does NOT spawn the graceful 'pebble kill' (no bundled-interpreter startup cost)", async () => {
+    const pebble = vi.fn((args: string[]) => ({ cmd: "C:\\py\\PebbleStudioEmu.exe", args, env: {} }));
+    const d = deps({ pebble, readFile: vi.fn(async () => ""), rm: vi.fn(async () => {}), portOpen: vi.fn(async () => false) });
+    await makeWinBootDeps(d).reap();
+    expect(pebble).not.toHaveBeenCalled();
   });
 });
 

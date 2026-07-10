@@ -59,7 +59,7 @@ vi.mock("node:net", () => ({
 }));
 
 // Import AFTER the mock is registered (vi.mock is hoisted, so this is fine).
-const { bootEmulator, BootAborted, makeWslBootDeps, makeNativeBootDeps, waitUntilDead, makeDiagnose, fmtProbe, extractBootErrors } = await import(
+const { bootEmulator, BootAborted, makeWslBootDeps, makeNativeBootDeps, waitUntilDead, makeDiagnose, fmtProbe, extractBootErrors, pollUntil } = await import(
   "../../src/main/backend/bootEmulator.js"
 );
 // timeShim holds the module-level shim-readiness cache that bootControl consults;
@@ -255,7 +255,7 @@ describe("bootEmulator cancellation", () => {
     expect(elapsed).toBeLessThan(2000);
   });
 
-  it("does NOT retry when the first attempt aborts via BootAborted (cancel)", async () => {
+  it("does NOT retry when the first attempt aborts via BootAborted (cancel), but tears down the raced stack", async () => {
     const bootControl = vi.fn(async () => {});
     const killAll = vi.fn(async () => {});
     await expect(
@@ -270,8 +270,10 @@ describe("bootEmulator cancellation", () => {
         waitForPort: async () => {},
       }),
     ).rejects.toBeInstanceOf(BootAborted);
-    expect(bootControl).toHaveBeenCalledTimes(1);
-    expect(killAll).toHaveBeenCalledTimes(1); // only the initial teardown — no retry kill
+    expect(bootControl).toHaveBeenCalledTimes(1); // no retry launch
+    // Initial teardown + a best-effort cleanup of the stack this attempt spawned
+    // before the abort — so a cancelled boot never orphans qemu/pypkjs/websockify.
+    expect(killAll).toHaveBeenCalledTimes(2);
   });
 
   it("does NOT retry when the token is cancelled even if the failure is a plain Error", async () => {
@@ -307,6 +309,106 @@ describe("bootEmulator cancellation", () => {
     ).rejects.toBeInstanceOf(BootAborted);
     // Bails before doing any teardown work.
     expect(killAll).not.toHaveBeenCalled();
+  });
+});
+
+describe("pollUntil (adaptive readiness cadence)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("detects a condition true at t=150ms by ~200ms (hot 100ms cadence, not 300ms)", async () => {
+    vi.useFakeTimers();
+    const t0 = Date.now();
+    const checkedAt: number[] = [];
+    let ready = false;
+    const p = pollUntil(
+      () => { checkedAt.push(Date.now() - t0); return ready; },
+      { timeoutMs: 60_000 },
+    );
+    // Hot phase: checks fire at t=0 and t=100 (both false).
+    await vi.advanceTimersByTimeAsync(120);
+    expect(checkedAt).toEqual([0, 100]);
+    // Condition becomes true at ~t=150; the NEXT hot check (t=200) sees it — a
+    // fixed 300ms cadence would not check until t=300, so this is ~100ms sooner.
+    ready = true;
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(p).resolves.toBeUndefined();
+    expect(checkedAt).toEqual([0, 100, 200]);
+  });
+
+  it("drops from the 100ms hot cadence to 300ms after 1.5s", async () => {
+    vi.useFakeTimers();
+    const t0 = Date.now();
+    const checkedAt: number[] = [];
+    const p = pollUntil(
+      () => { checkedAt.push(Date.now() - t0); return false; },
+      { timeoutMs: 2_000 },
+    );
+    const assertion = expect(p).rejects.toThrow(/timeout/i);
+    await vi.advanceTimersByTimeAsync(2_150);
+    await assertion;
+    const diffs = checkedAt.slice(1).map((v, i) => v - checkedAt[i]);
+    // Every gap taken while elapsed < 1500ms is the 100ms hot interval…
+    for (let i = 0; i < checkedAt.length - 1; i++) {
+      expect(diffs[i]).toBe(checkedAt[i] < 1500 ? 100 : 300);
+    }
+    // …and the cadence really did reach the 300ms steady state.
+    expect(diffs.some((d) => d === 300)).toBe(true);
+  });
+
+  it("honors a custom timeoutMessage when the deadline elapses", async () => {
+    vi.useFakeTimers();
+    const p = pollUntil(() => false, { timeoutMs: 1_000, timeoutMessage: "no soup for you" });
+    const assertion = expect(p).rejects.toThrow("no soup for you");
+    await vi.advanceTimersByTimeAsync(1_200);
+    await assertion;
+  });
+
+  it("evaluates fn at least once even when timeoutMs is already 0-ish", async () => {
+    let calls = 0;
+    // Real timers here: with timeoutMs≈0 the very first fn call satisfies it.
+    await expect(pollUntil(() => { calls += 1; return true; }, { timeoutMs: 0 })).resolves.toBeUndefined();
+    expect(calls).toBe(1);
+  });
+
+  it("aborts within one interval with BootAborted when the token flips mid-wait", async () => {
+    vi.useFakeTimers();
+    const token = { cancelled: false };
+    const p = pollUntil(() => false, { timeoutMs: 60_000, token });
+    const assertion = expect(p).rejects.toBeInstanceOf(BootAborted);
+    await vi.advanceTimersByTimeAsync(250); // a couple of hot polls, still running
+    token.cancelled = true;
+    await vi.advanceTimersByTimeAsync(150); // next poll observes the cancel
+    await assertion;
+  });
+
+  it("throws BootAborted immediately if the token is already cancelled at entry", async () => {
+    let calls = 0;
+    await expect(
+      pollUntil(() => { calls += 1; return true; }, { timeoutMs: 60_000, token: { cancelled: true } }),
+    ).rejects.toBeInstanceOf(BootAborted);
+    expect(calls).toBe(0); // bailed before evaluating fn
+  });
+
+  it("BootAborted wins over the timeout when both land during an in-flight probe", async () => {
+    // Regression: the OLD gate loops checked the token BEFORE the deadline on
+    // every failed probe. A probe that is still in flight when BOTH cancellation
+    // and the deadline occur must therefore surface as BootAborted (a user stop),
+    // never the generic timeout Error (a boot failure the caller would retry).
+    vi.useFakeTimers();
+    const token = { cancelled: false };
+    const p = pollUntil(
+      // Async probe that resolves false at t=150ms — past the 100ms deadline —
+      // with the token having flipped while it was in flight.
+      () => new Promise<boolean>((resolve) => {
+        setTimeout(() => { token.cancelled = true; resolve(false); }, 150);
+      }),
+      { timeoutMs: 100, token },
+    );
+    const assertion = expect(p).rejects.toBeInstanceOf(BootAborted);
+    await vi.advanceTimersByTimeAsync(200);
+    await assertion;
   });
 });
 
@@ -404,6 +506,39 @@ describe("bootEmulator retry-once", () => {
     expect(steps[steps.length - 1]).toBe("Ready");
   });
 
+  it("restore hook: attempt 1 threads the incoming URI to bootControl; a failed restore retries cold", async () => {
+    // beforeAttempt returns a migration URI on attempt 1, null afterwards (the
+    // real manager also invalidates the bundle there). The restore attempt "fails"
+    // its readiness wait; the cold retry succeeds.
+    const seenIncoming: (string | null | undefined)[] = [];
+    const beforeAttempt = vi.fn(async (attempt: number, _board: string) =>
+      attempt === 1 ? "file:C:/snap/vm.migr" : null,
+    );
+    const bootControl = vi.fn(async (_id: string, incoming?: string | null) => { seenIncoming.push(incoming); });
+    let emuInfoCalls = 0;
+    const endpoint = await bootEmulator(
+      "basalt",
+      {
+        killAll: async () => {},
+        ensureKeymap: async () => {},
+        bootControl,
+        restore: { beforeAttempt },
+        diagnose: NOPROBE,
+        readBootLog: async () => "",
+        waitForEmuInfo: async () => {
+          emuInfoCalls += 1;
+          if (emuInfoCalls === 1) throw new Error("restore boot stalled"); // fail attempt 1
+        },
+        waitForPort: async () => {},
+      },
+      undefined,
+      () => {},
+    );
+    expect(endpoint).toEqual({ host: "localhost", port: 6080, wsPath: "/" });
+    expect(beforeAttempt.mock.calls.map((c) => c[0])).toEqual([1, 2]); // per-attempt
+    expect(seenIncoming).toEqual(["file:C:/snap/vm.migr", null]); // restore then cold
+  });
+
   it("after MAX_BOOT_ATTEMPTS stalls, wipes and retries once — recovering", async () => {
     const bootControl = vi.fn(async () => {});
     const killAll = vi.fn(async () => {});
@@ -471,6 +606,77 @@ describe("bootEmulator retry-once", () => {
   });
 });
 
+describe("bootEmulator pre-spawn probes run concurrently", () => {
+  /** Minimal external-resolvable deferred (no library) for overlap assertions. */
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+  const DEAD_PROBE = { qemuAlive: false, stateFile: false, rfbOpen: false, wsOpen: false };
+
+  it("starts diagnose AND preflight before either resolves (overlap, not sequential)", async () => {
+    let diagnoseStarted = false;
+    let preflightStarted = false;
+    const diagD = deferred<typeof DEAD_PROBE>();
+    const preD = deferred<void>();
+
+    const boot = bootEmulator("basalt", {
+      killAll: async () => {},
+      ensureKeymap: async () => {},
+      bootControl: async () => {},
+      waitForEmuInfo: async () => {},
+      waitForPort: async () => {},
+      diagnose: () => { diagnoseStarted = true; return diagD.promise; },
+      preflight: () => { preflightStarted = true; return preD.promise; },
+    });
+
+    // Let the boot reach the probe stage and start BOTH probes. Neither deferred
+    // has resolved yet, so a SEQUENTIAL impl (await diagnose, then preflight) would
+    // still be blocked inside diagnose and never have started preflight.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(diagnoseStarted).toBe(true);
+    expect(preflightStarted).toBe(true);
+
+    // Release both; the boot completes.
+    diagD.resolve(DEAD_PROBE);
+    preD.resolve();
+    await expect(boot).resolves.toEqual({ host: "localhost", port: 6080, wsPath: "/" });
+  });
+
+  it("probe wall-clock ≈ max(diagnose, preflight), not their sum", async () => {
+    const SLEEP = 120;
+    const start = Date.now();
+    await bootEmulator("basalt", {
+      killAll: async () => {},
+      ensureKeymap: async () => {},
+      bootControl: async () => {},
+      waitForEmuInfo: async () => {},
+      waitForPort: async () => {},
+      diagnose: async () => { await new Promise((r) => setTimeout(r, SLEEP)); return DEAD_PROBE; },
+      preflight: async () => { await new Promise((r) => setTimeout(r, SLEEP)); },
+    });
+    const elapsed = Date.now() - start;
+    // Parallel ⇒ ~one SLEEP; sequential ⇒ ~two. Ceiling well below the sum.
+    expect(elapsed).toBeLessThan(SLEEP * 1.8);
+  });
+
+  it("still surfaces a foreign-port preflight error (propagates, not swallowed)", async () => {
+    await expect(
+      bootEmulator("basalt", {
+        killAll: async () => {},
+        ensureKeymap: async () => {},
+        bootControl: async () => {},
+        waitForEmuInfo: async () => {},
+        waitForPort: async () => {},
+        diagnose: async () => DEAD_PROBE,
+        preflight: async () => { throw new Error("Emulator port 5901 is already in use by another process — likely a WSL Pebble emulator or a second Pebble Studio instance. Close it, then try again."); },
+      }),
+    ).rejects.toThrow(/already in use by another process/);
+  });
+});
+
 describe("bootControl wrapper routing (PEBBLE_QEMU_PATH)", () => {
   beforeEach(() => {
     calls.length = 0;
@@ -500,7 +706,7 @@ describe("bootControl wrapper routing (PEBBLE_QEMU_PATH)", () => {
     calls.length = 0;
     const deps = makeNativeBootDeps();
     await deps.bootControl("basalt");
-    const call = calls.find((c) => c.cmd === "bash");
+    const call = calls.find((c) => c.cmd === "bash" && String(c.args[1]).includes("emu-control"));
     expect(call).toBeDefined();
     const wrapped = String(call!.args[1]);
     expect(wrapped).toContain(
@@ -509,10 +715,41 @@ describe("bootControl wrapper routing (PEBBLE_QEMU_PATH)", () => {
     expect(WRAPPER).toBe("$HOME/.pebble-studio/qemu-pebble");
   });
 
+  it("resets the fake-clock control file to real time before launching qemu", async () => {
+    // The shim anchors to real time at process start, so a relative "-" target
+    // read at realize seeds the f2xx RTC correctly; without this reset a prior
+    // session's absolute System write would be re-read one boot stale.
+    const nowMs = 1_750_000_000_000;
+    const selfTestOut = String(Math.floor(nowMs / 1000) + 86400);
+    await ensureTimeShim(
+      async () => ({ code: 0, stdout: selfTestOut, stderr: "" }),
+      { resources: async () => ({ so: Buffer.from("so"), src: Buffer.from("src") }), now: () => nowMs },
+    );
+
+    calls.length = 0;
+    const deps = makeNativeBootDeps();
+    await deps.bootControl("basalt");
+
+    const resetIdx = calls.findIndex((c) => String(c.args[1]).startsWith("echo - 1"));
+    const bootIdx = calls.findIndex((c) => String(c.args[1]).includes("emu-control"));
+    expect(resetIdx).toBeGreaterThanOrEqual(0);
+    expect(bootIdx).toBeGreaterThanOrEqual(0);
+    expect(resetIdx).toBeLessThan(bootIdx);
+    // Never a bare "0" rate — that re-enters the firmware minute-tick loop.
+    expect(String(calls[resetIdx].args[1])).toContain("1.000000");
+  });
+
+  it("does not touch the control file when the shim is not ready", async () => {
+    calls.length = 0;
+    const deps = makeNativeBootDeps();
+    await deps.bootControl("basalt");
+    expect(calls.some((c) => String(c.args[1]).startsWith("echo - 1"))).toBe(false);
+  });
+
   it("uses no prefix when the shim is not ready", async () => {
     const deps = makeNativeBootDeps();
     await deps.bootControl("basalt");
-    const call = calls.find((c) => c.cmd === "bash");
+    const call = calls.find((c) => c.cmd === "bash" && String(c.args[1]).includes("emu-control"));
     expect(call).toBeDefined();
     const wrapped = String(call!.args[1]);
     expect(wrapped).toContain("pebble emu-control --emulator basalt --vnc");

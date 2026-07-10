@@ -272,19 +272,188 @@ def main():
 main()
 `;
 
+/**
+ * Language-pack helper (pb-lang-helper.py): a ONE-SHOT CLI (not a persistent
+ * channel) that installs a Pebble language pack (.pbl) onto the running emulator
+ * and/or reports the watch's active language, connecting to the SAME pypkjs
+ * websocket the input helper uses (port passed via `--port`).
+ *
+ * A .pbl is pushed RAW as a single `PutBytes(File, filename="lang")` object
+ * straight to the WATCH — it passes through the pypkjs bridge transparently (it
+ * is NOT an app-install bundle, which would route to pypkjs and fail). The active
+ * language is read from the WatchVersion handshake (WatchVersionResponse.language
+ * / .language_version). Contract (consumed by the Task 9 controller):
+ *
+ *   pb-lang-helper.py --port <p> install <path.pbl>
+ *   pb-lang-helper.py --port <p> query
+ *
+ * prints EXACTLY ONE JSON line to stdout —
+ *   {"ok": true, "language": "fr_FR", "languageVersion": 38}
+ *   {"ok": false, "error": "<message>", "kind": "<nack|connect|timeout|other>"}
+ * — exit 0 on ok else 1. Every socket op is bounded by a watchdog so the process
+ * never hangs (the caller enforces a 15s process timeout on top). Kept
+ * backslash-free so it embeds verbatim in this template literal.
+ */
+export const LANG_HELPER_PY = `"""pb-lang-helper.py -- install a Pebble language pack (.pbl) onto the running
+emulator and/or report the watch's active language.
+
+Usage:
+  pb-lang-helper.py --port <pypkjsPort> install <path.pbl>
+  pb-lang-helper.py --port <pypkjsPort> query
+
+A .pbl is pushed RAW as a single PutBytes File object (filename "lang") straight
+to the WATCH; it passes through the pypkjs websocket bridge transparently (it is
+NOT an app-install bundle). The active language is read from the WatchVersion
+handshake (WatchVersionResponse.language / .language_version).
+
+Prints EXACTLY ONE JSON line to stdout:
+  {"ok": true, "language": "fr_FR", "languageVersion": 38}
+  {"ok": false, "error": "<message>", "kind": "<nack|connect|timeout|other>"}
+Exit 0 on ok, else 1. All socket ops are bounded by a watchdog so the process
+never hangs (Task 9's controller enforces a 15s process timeout on top). Debug
+lines may go to stderr; stdout stays exactly one JSON line.
+"""
+import sys, os, json, argparse, threading
+
+# Overall watchdog: the process is guaranteed to finish within this many seconds
+# (well under the caller's 15s spawn timeout). Individual round trips are bounded
+# too so a wedged bridge produces a clean "timeout" rather than a hang. 12s is
+# deliberately BELOW libpebble2's default send_and_read timeout (15s): our
+# watchdog must fire (and emit the one JSON line) before any library timeout
+# surfaces or the caller's process kill hits.
+_OVERALL_TIMEOUT = 12.0
+_REQUERY_TIMEOUT = 4.0
+
+
+def _emit(obj):
+    # Exactly one JSON line on stdout, flushed so the parent reads it promptly.
+    print(json.dumps(obj), flush=True)
+
+
+def _classify(exc):
+    # Map an exception to one of the CLI's error kinds.
+    name = type(exc).__name__
+    low = str(exc).lower()
+    if name == "PutBytesError" or "nack" in low:
+        return "nack"
+    if "timeout" in name.lower() or "timed out" in low:
+        return "timeout"
+    if (name in ("ConnectionRefusedError", "ConnectionResetError", "ConnectionError",
+                 "WebSocketConnectionClosedException", "WebSocketBadStatusException",
+                 "WebSocketException", "WebSocketAddressException")
+            or "refused" in low or "reset" in low or "connection" in low
+            or "no pypkjs" in low):
+        return "connect"
+    return "other"
+
+
+def _read_language(pebble, timeout):
+    # One bounded WatchVersion round trip -> (language, language_version). Used to
+    # REFRESH after an install (the cached watch_info is pre-install).
+    from libpebble2.protocol.system import WatchVersion, WatchVersionRequest
+    resp = pebble.send_and_read(WatchVersion(data=WatchVersionRequest()),
+                                WatchVersion, timeout=timeout).data
+    lang = (resp.language or "").split(chr(0))[0]
+    return lang, int(resp.language_version)
+
+
+def _connect(port):
+    from libpebble2.communication import PebbleConnection
+    from libpebble2.communication.transports.websocket import WebsocketTransport
+    pebble = PebbleConnection(WebsocketTransport("ws://localhost:%d/" % port))
+    pebble.connect()
+    # run_async spawns the read loop AND performs the WatchVersion handshake
+    # (fetch_watch_info), so watch_info is populated when this returns.
+    pebble.run_async()
+    return pebble
+
+
+def _do(args, result):
+    try:
+        pebble = _connect(args.port)
+    except Exception as e:
+        result["obj"] = {"ok": False, "error": str(e), "kind": _classify(e)}
+        return
+    try:
+        if args.command == "install":
+            with open(args.pbl, "rb") as f:
+                data = f.read()
+            from libpebble2.services.putbytes import PutBytes, PutBytesType
+            PutBytes(pebble, PutBytesType.File, data, bank=0, filename="lang").send()
+            # Confirm the flip with a fresh handshake. Firmware may briefly go
+            # unresponsive / reboot after applying a pack, so a re-query failure
+            # is reported as language "unknown" (the install itself succeeded)
+            # rather than as an error.
+            try:
+                lang, ver = _read_language(pebble, _REQUERY_TIMEOUT)
+            except Exception:
+                lang, ver = "unknown", None
+            result["obj"] = {"ok": True, "language": lang, "languageVersion": ver}
+        else:  # query
+            info = pebble.watch_info  # cached from the run_async handshake
+            lang = (info.language or "").split(chr(0))[0]
+            result["obj"] = {"ok": True, "language": lang,
+                             "languageVersion": int(info.language_version)}
+    except Exception as e:
+        result["obj"] = {"ok": False, "error": str(e), "kind": _classify(e)}
+
+
+def main():
+    # add_help=False everywhere: argparse's -h/--help prints help to STDOUT,
+    # which would break the exactly-one-JSON-line contract. Usage lives in the
+    # module docstring; the only consumer is the TS controller.
+    p = argparse.ArgumentParser(prog="pb-lang-helper.py", add_help=False)
+    p.add_argument("--port", type=int, required=True)
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("query", add_help=False)
+    ip = sub.add_parser("install", add_help=False)
+    ip.add_argument("pbl")
+    try:
+        args = p.parse_args()
+    except SystemExit:
+        # argparse prints its usage/error to stderr then raises SystemExit
+        # (code 2) BEFORE any of our machinery runs. The contract is
+        # unconditional: exactly one JSON line on stdout, exit 0/1 — so
+        # translate every parse-time exit into a JSON error.
+        _emit({"ok": False, "error": "invalid arguments (see stderr)",
+               "kind": "other"})
+        sys.exit(1)
+
+    result = {}
+    t = threading.Thread(target=_do, args=(args, result))
+    t.daemon = True
+    t.start()
+    t.join(_OVERALL_TIMEOUT)
+    if t.is_alive():
+        # A wedged websocket keeps the daemon thread alive; os._exit so we still
+        # terminate immediately after emitting the one JSON line.
+        _emit({"ok": False, "error": "operation timed out", "kind": "timeout"})
+        os._exit(1)
+    obj = result.get("obj") or {"ok": False, "error": "no result", "kind": "other"}
+    _emit(obj)
+    sys.exit(0 if obj.get("ok") else 1)
+
+
+main()
+`;
+
 export interface DeployedHelpers {
   /** Absolute path to the deployed persistent input helper. */
   inputHelperPath: string;
+  /** Absolute path to the deployed one-shot language-pack helper. */
+  langHelperPath: string;
 }
 
 /**
- * Write the input helper script into `dir` (created if missing) and return its
- * absolute path. Idempotent — overwrites with the current source each launch so
- * an app update re-deploys a fresh helper.
+ * Write the helper scripts into `dir` (created if missing) and return their
+ * absolute paths. Idempotent — overwrites with the current source each launch so
+ * an app update re-deploys fresh helpers.
  */
 export function deployWinHelpers(dir: string): DeployedHelpers {
   mkdirSync(dir, { recursive: true });
   const inputHelperPath = join(dir, "pb-input-helper.py");
   writeFileSync(inputHelperPath, INPUT_HELPER_PY, "utf8");
-  return { inputHelperPath };
+  const langHelperPath = join(dir, "pb-lang-helper.py");
+  writeFileSync(langHelperPath, LANG_HELPER_PY, "utf8");
+  return { inputHelperPath, langHelperPath };
 }

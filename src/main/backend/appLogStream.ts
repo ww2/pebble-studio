@@ -43,5 +43,8 @@ export class AppLogStream {
 
   clear(): void {
     this.lines.length = 0;
+    // Drop any buffered partial line too, so the first line after a clear isn't
+    // prefixed with a stale fragment from before it.
+    this.partial = "";
   }
 }

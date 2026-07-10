@@ -29,4 +29,13 @@ describe("AppLogStream", () => {
     s.push("y\n");
     expect(s.history()).toEqual(["y"]);
   });
+  it("clear() also drops a buffered partial so the next line has no stale prefix", () => {
+    const seen: string[] = [];
+    const s = new AppLogStream({ onLine: (l) => seen.push(l) });
+    s.push("stale-frag"); // no newline → held as the partial
+    s.clear();
+    s.push("fresh\n");
+    expect(s.history()).toEqual(["fresh"]);   // NOT "stale-fragfresh"
+    expect(seen).toEqual(["fresh"]);
+  });
 });

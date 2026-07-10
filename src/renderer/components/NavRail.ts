@@ -39,11 +39,20 @@ export class NavRail {
       btn.dataset.nav = item.id;
       btn.setAttribute("role", "tab");
       btn.title = item.label;
-      btn.innerHTML = `
-        <span class="nav-rail-pill" aria-hidden="true"></span>
-        <span class="nav-rail-glyph" aria-hidden="true">${item.glyph}</span>
-        <span class="nav-rail-label">${item.label}</span>
-      `;
+      // Build the three spans via textContent (not innerHTML) so item labels /
+      // glyphs can never be interpreted as markup — this is the only innerHTML
+      // sink the renderer would otherwise have.
+      const pill = document.createElement("span");
+      pill.className = "nav-rail-pill";
+      pill.setAttribute("aria-hidden", "true");
+      const glyph = document.createElement("span");
+      glyph.className = "nav-rail-glyph";
+      glyph.setAttribute("aria-hidden", "true");
+      glyph.textContent = item.glyph;
+      const label = document.createElement("span");
+      label.className = "nav-rail-label";
+      label.textContent = item.label;
+      btn.append(pill, glyph, label);
       btn.addEventListener("click", () => this.select(item.id));
       this.buttons.set(item.id, btn);
       this.el.appendChild(btn);

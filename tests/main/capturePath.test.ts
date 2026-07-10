@@ -43,4 +43,26 @@ describe("resolveCapturePath", () => {
     const other = path.resolve("/var/captures");
     expect(resolveCapturePath(other, "ok.png")).toBe(path.join(other, "ok.png"));
   });
+
+  it("accepts a drive-root capture dir (trailing-separator prefix bug)", () => {
+    // path.resolve keeps the trailing sep at a root, so the old `base + sep`
+    // prefix became "D:\\\\" / "//" and startsWith failed on EVERY save. On win32
+    // a drive root is "D:\\"; on posix the analogous root is "/".
+    const root = process.platform === "win32" ? "D:\\" : "/";
+    const out = resolveCapturePath(root, "shot.png");
+    expect(out).toBe(path.join(path.resolve(root), "shot.png"));
+  });
+
+  it("rejects Windows reserved device names", () => {
+    expect(() => resolveCapturePath(dir, "CON.png")).toThrow(/invalid capture filename/);
+    expect(() => resolveCapturePath(dir, "nul.gif")).toThrow(/invalid capture filename/);
+    expect(() => resolveCapturePath(dir, "COM1.png")).toThrow(/invalid capture filename/);
+    // A name merely CONTAINING a reserved word is fine.
+    expect(resolveCapturePath(dir, "console.png")).toBe(path.join(dir, "console.png"));
+  });
+
+  it("rejects a base name ending in a space or dot", () => {
+    expect(() => resolveCapturePath(dir, "shot .png")).toThrow(/invalid capture filename/);
+    expect(() => resolveCapturePath(dir, "shot..png")).toThrow(/invalid capture filename/);
+  });
 });

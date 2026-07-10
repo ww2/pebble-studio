@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import type { PlatformId, ButtonId, ButtonAction } from "../../shared/types.js";
-import type { BackendDriver, HealthActivateResult, Runner, VncEndpoint } from "./BackendDriver.js";
+import type { BackendDriver, HealthActivateResult, RunResult, Runner, VncEndpoint } from "./BackendDriver.js";
 import { NativeDriver, type BootFn, type StopFn } from "./NativeDriver.js";
 import type { BootToken, OnStep } from "./bootEmulator.js";
 import type { PebbleCmdBuilder } from "./winBootDeps.js";
@@ -33,6 +33,10 @@ export interface WindowsNativeDriverDeps {
   boot?: BootFn;
   /** Windows teardown orchestration. */
   stop?: StopFn;
+  /** Startup orphan reaper: force-kill any leftover emulator stack from a prior
+   * session (no graceful `pebble kill`). Called once at backend:init before the
+   * first boot is enabled. Absent → reap() is a no-op. */
+  reap?: () => Promise<void>;
   /** Resolved python + helper paths for the legacy utc_offset time push. When
    * absent, setTzOffset degrades to a no-op (legacy time silently unavailable),
    * mirroring how the POSIX path degrades when the tool isn't found. */
@@ -45,13 +49,21 @@ export interface WindowsNativeDriverDeps {
   /** Custom-time control file. Custom time is built into the bundled qemu-pebble.exe
    * (the Pebble RTC reads this file directly), so ensureTimeShim is always ready and
    * setFakeTime just writes the %TEMP% control file. Absent → ensureTimeShim=false +
-   * setFakeTime=no-op (no custom time). */
-  timeShim?: { ctlPath: string };
+   * setFakeTime=no-op (no custom time). `ftLogPath` (qemu's PEBBLE_FAKETIME_LOG) is
+   * truncated once per boot so the diagnostic log can't grow unbounded. */
+  timeShim?: { ctlPath: string; ftLogPath?: string };
   /** Injectable delay (tests pass a no-op so health-activation retries don't wait).
    * Defaults to a real setTimeout-backed sleep. */
   sleep?: (ms: number) => Promise<void>;
   /** Streaming spawn for `streamLogs` (injectable for tests). */
   logSpawn?: typeof spawnLineStream;
+  /**
+   * QEMU snapshot creation hook (Tasks 6+7). Reads the qemu monitor port and
+   * drives the SnapshotManager to save a per-board bundle after a cold boot
+   * reaches Live. Fire-and-forget + never throws. Absent ⇒ snapshots disabled
+   * (no snapshot is ever created). Wired by createDriver from the SnapshotManager.
+   */
+  snapshotCreate?: (board: PlatformId, isCancelled?: () => boolean) => Promise<void>;
 }
 
 /**
@@ -78,6 +90,15 @@ export const HEALTH_ACTIVATE_READY_MS = 1200;
  */
 export const BATTERY_PUSH_MAX_ATTEMPTS = 5;
 export const BATTERY_PUSH_RETRY_MS = 600;
+
+/** Hard bound (ms) for the bare python tz-offset helper. Matches the POSIX path's
+ * `timeout -k 2 6` SIGKILL deadline and timeController's TZ_PUSH_TIMEOUT_MS so a
+ * wedged pypkjs connection can't hang the push or leave a zombie python. */
+export const TZ_PUSH_TIMEOUT_MS = 8000;
+
+/** spawnRunner accepts an optional 4th `timeoutMs` arg beyond the base Runner
+ * contract; this widens the injected runner at the one call site that needs it. */
+type TimedRunner = (cmd: string, args: string[], env?: Record<string, string>, timeoutMs?: number) => Promise<RunResult>;
 
 /** Pure retry decision for one activation attempt. Exported for testing. */
 export function healthRetryDecision(
@@ -125,6 +146,21 @@ export class WindowsNativeDriver implements BackendDriver {
   setPlatform(id: PlatformId): void { this.inner.setPlatform(id); }
 
   async start(id: PlatformId, token?: BootToken, onStep?: OnStep): Promise<VncEndpoint> {
+    const ts = this.deps.timeShim;
+    if (ts) {
+      // Reset the fake-clock control file to real time BEFORE qemu spawns/realizes.
+      // A fresh qemu process anchors the fake clock to real time, so "- 1" reads as
+      // real — this clears any stale custom/frozen target a prior session left in
+      // %TEMP% and keeps the f2xx RTC boot-seed correct while making the runtime
+      // absolute System write (timeController.apply) safe across restarts.
+      try { await writeWinFakeTime(ts.ctlPath, null, 1); } catch { /* best-effort */ }
+      // Truncate qemu's fake-time diagnostic log once per boot so a long session
+      // can't grow it without bound (an 11.7 MB pb-qemu-ft.log was seen in the
+      // field). Opening in write mode preserves diagnosis for the current boot.
+      if (ts.ftLogPath) {
+        try { await fs.writeFile(ts.ftLogPath, ""); } catch { /* best-effort */ }
+      }
+    }
     // qemu-pebble binds to 127.0.0.1 on the Windows host; enforce localhost so
     // callers don't depend on whatever makeWinBootDeps' boot fn returns (mirrors
     // WslDriver, where WSL2 also forwards to the Windows loopback).
@@ -143,6 +179,24 @@ export class WindowsNativeDriver implements BackendDriver {
     // linger holding a dead pypkjs connection (the next boot respawns it).
     this.deps.inputChannel?.stop();
     return this.inner.stop();
+  }
+
+  /** Quit-path stop. stop()'s killAll probes liveness and offers a graceful
+   * `pebble kill` BEFORE the force-kill — under load those bounded steps can add
+   * up past before-quit's exit deadline, so the first TerminateProcess would
+   * never dispatch and the stack would outlive the app (the historic orphan
+   * scenario). Skip the niceties and reap directly: kill sweep first, port
+   * settle after. Falls back to stop() when no reaper is wired. */
+  async stopFast(): Promise<void> {
+    this.deps.inputChannel?.stop();
+    if (this.deps.reap) await this.deps.reap();
+    else await this.inner.stop();
+  }
+
+  /** Reap orphaned emulator processes left by a prior session (startup self-heal).
+   * Delegates to the injected reaper; a no-op when none is wired. */
+  async reap(): Promise<void> {
+    await this.deps.reap?.();
   }
 
   async install(pbwPath: string): Promise<void> {
@@ -172,8 +226,16 @@ export class WindowsNativeDriver implements BackendDriver {
     const h = this.deps.timeHelper;
     if (!h) return; // legacy time unavailable until python/helper are provisioned
     const c = winSetTzOffsetArgv({ pythonExe: h.pythonExe, helperPath: h.helperPath, offsetMin, tzName });
-    const r = await this.deps.run(c.cmd, c.args, c.env);
-    if (r.code !== 0) console.warn(`[time] win setTzOffset(${offsetMin}) exit ${r.code}: ${r.stderr || r.stdout}`);
+    try {
+      // Bound the bare helper (no coreutils `timeout`, unlike POSIX): a dead pypkjs
+      // bridge would otherwise hang forever and strand the caller's in-flight latch.
+      const r = await (this.deps.run as TimedRunner)(c.cmd, c.args, c.env, TZ_PUSH_TIMEOUT_MS);
+      if (r.code !== 0) console.warn(`[time] win setTzOffset(${offsetMin}) exit ${r.code}: ${r.stderr || r.stdout}`);
+    } catch (e) {
+      // spawnRunner rejects on the child's `error` event (missing / AV-quarantined
+      // interpreter). Degrade silently — this method is documented never to throw.
+      console.warn(`[time] win setTzOffset(${offsetMin}) failed to spawn: ${String(e)}`);
+    }
   }
 
   // Custom time is built into the bundled qemu-pebble.exe: the Pebble RTC reads the
@@ -274,6 +336,13 @@ export class WindowsNativeDriver implements BackendDriver {
   async deleteSamplePin(): Promise<void> {
     // Best-effort: nothing to remove if the channel is gone (emulator stopped).
     await this.deps.inputChannel?.deletePin(SAMPLE_PIN_ID);
+  }
+
+  /** Create a QEMU snapshot bundle for the board after a cold boot reached Live.
+   * Fire-and-forget + never throws (the hook itself is failure-swallowing); a
+   * no-op when no snapshot hook is wired (snapshots disabled). */
+  async createSnapshotAfterLive(board: PlatformId, isCancelled?: () => boolean): Promise<void> {
+    await this.deps.snapshotCreate?.(board, isCancelled);
   }
 
   streamLogs(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null {

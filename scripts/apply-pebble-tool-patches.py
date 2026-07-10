@@ -150,6 +150,122 @@ def main(sp):
          "'6080',",
          "'127.0.0.1:6080',",
          "'127.0.0.1:6080'"),
+        # Patch 17 — QEMU snapshot restore. When PEBBLE_QEMU_INCOMING is set (the
+        # full "file:C:/..." migration URI), append `-incoming <uri>` to the qemu
+        # argv so the guest boots by loading a saved VM migration stream instead of
+        # cold-booting. Studio sets this env for a SINGLE restore spawn only; when
+        # it is absent the block is inert, so every other path (cold boot, wipe)
+        # is unchanged. Appended last (just before env prep) so it is the final
+        # argv addition regardless of board.
+        ("emulator.py qemu incoming restore",
+         '        # Prepare environment with bundled dylibs for macOS\n'
+         '        env = os.environ.copy()',
+         '        # Pebble Studio (win port) patch 17: restore from a QEMU snapshot when\n'
+         '        # PEBBLE_QEMU_INCOMING is set (the full "file:C:/..." migration URI). Studio\n'
+         '        # sets it for a single restore spawn only; absent => a normal cold boot, so\n'
+         '        # this is inert on every other path (wipe, non-restore launches). Appended\n'
+         '        # last so the guest starts paused and loads the migration stream on launch.\n'
+         '        _incoming = os.environ.get("PEBBLE_QEMU_INCOMING")\n'
+         '        if _incoming:\n'
+         '            command.extend(["-incoming", _incoming])\n'
+         '\n'
+         '        # Prepare environment with bundled dylibs for macOS\n'
+         '        env = os.environ.copy()',
+         "PEBBLE_QEMU_INCOMING"),
+        # Patch 17b — restore-aware boot wait. The normal _wait_for_qemu blocks on
+        # the firmware's ONE-SHOT serial boot marker, which a restored guest never
+        # re-emits; and a migration stream saved from a paused source (the manager
+        # does HMP `stop` before `migrate`) restores PAUSED — qemu preserves the
+        # source runstate in the stream's global_state section, so autostart does
+        # not apply. Without this patch a restore boot hangs in _wait_for_qemu, the
+        # state file is never written, and Studio times out + cold-boots on every
+        # launch (restore would NEVER work). When PEBBLE_QEMU_INCOMING is set, wait
+        # on the HMP monitor instead: poll `info status` until the incoming
+        # migration finishes (runstate leaves "inmigrate"), send `cont` to resume
+        # the paused guest, and verify "running". Any failure raises ToolError so
+        # the launch fails CLEANLY and Studio's boot retry invalidates the bundle
+        # and cold-boots. The cold path (env absent) is byte-identical.
+        ("emulator.py restore-aware _wait_for_qemu",
+         '    def _wait_for_qemu(self):\n'
+         '        logger.info("Waiting for the firmware to boot.")',
+         '    def _mon_cmd(self, sock, cmd, deadline):\n'
+         '        # Pebble Studio patch 17b: one HMP command -> output up to the prompt.\n'
+         '        sock.sendall(cmd + b"\\n")\n'
+         '        buf = b""\n'
+         '        while time.time() < deadline:\n'
+         '            try:\n'
+         '                data = sock.recv(4096)\n'
+         '            except socket.timeout:\n'
+         '                continue\n'
+         '            if not data:\n'
+         '                raise ToolError("Emulator restore failed (monitor closed).")\n'
+         '            buf += data\n'
+         '            if b"(qemu)" in buf:\n'
+         '                return buf\n'
+         '        raise ToolError("Emulator restore timed out (monitor unresponsive).")\n'
+         '\n'
+         '    def _wait_for_qemu_restore(self):\n'
+         '        # Pebble Studio patch 17b: snapshot-restore readiness. A restored\n'
+         '        # guest never re-emits the serial boot marker the normal wait blocks\n'
+         '        # on, and a paused-source stream restores PAUSED — so wait for the\n'
+         '        # incoming migration on the monitor, resume, verify "running".\n'
+         '        logger.info("Waiting for snapshot restore.")\n'
+         '        deadline = time.time() + 30\n'
+         '        sock = None\n'
+         '        while time.time() < deadline:\n'
+         '            try:\n'
+         '                sock = socket.create_connection((\'localhost\', self.qemu_monitor_port), timeout=1)\n'
+         '                break\n'
+         '            except socket.error:\n'
+         '                # Fail fast if qemu already died (a corrupt/stale stream is\n'
+         '                # rejected at load and the process exits).\n'
+         '                if not self._is_pid_running(self.qemu_pid):\n'
+         '                    post_event("qemu_launched", success=False, reason="restore_qemu_died")\n'
+         '                    raise ToolError("Emulator restore failed (qemu exited during load).")\n'
+         '                time.sleep(0.3)\n'
+         '        if sock is None:\n'
+         '            post_event("qemu_launched", success=False, reason="restore_no_monitor")\n'
+         '            raise ToolError("Emulator restore timed out (no monitor).")\n'
+         '        try:\n'
+         '            sock.settimeout(2)\n'
+         '            buf = b""\n'
+         '            while time.time() < deadline and b"(qemu)" not in buf:\n'
+         '                try:\n'
+         '                    data = sock.recv(4096)\n'
+         '                except socket.timeout:\n'
+         '                    continue\n'
+         '                if not data:\n'
+         '                    raise ToolError("Emulator restore failed (monitor closed).")\n'
+         '                buf += data\n'
+         '            # Wait out the incoming migration: runstate reads "paused\n'
+         '            # (inmigrate)" until the stream finishes loading.\n'
+         '            status = b""\n'
+         '            while time.time() < deadline:\n'
+         '                status = self._mon_cmd(sock, b"info status", deadline)\n'
+         '                if b"inmigrate" not in status:\n'
+         '                    break\n'
+         '                time.sleep(0.1)\n'
+         '            # Resume the paused guest (no-op when already running).\n'
+         '            if b"running" not in status:\n'
+         '                self._mon_cmd(sock, b"cont", deadline)\n'
+         '                status = self._mon_cmd(sock, b"info status", deadline)\n'
+         '            if b"running" not in status:\n'
+         '                post_event("qemu_launched", success=False, reason="restore_not_running")\n'
+         '                raise ToolError("Emulator restore did not resume the guest.")\n'
+         '        finally:\n'
+         '            try:\n'
+         '                sock.close()\n'
+         '            except socket.error:\n'
+         '                pass\n'
+         '        post_event("qemu_launched", success=True)\n'
+         '        logger.info("Firmware restored from snapshot.")\n'
+         '\n'
+         '    def _wait_for_qemu(self):\n'
+         '        if os.environ.get("PEBBLE_QEMU_INCOMING"):\n'
+         '            self._wait_for_qemu_restore()\n'
+         '            return\n'
+         '        logger.info("Waiting for the firmware to boot.")',
+         "_wait_for_qemu_restore"),
     ])
 
     print(f"manager.py:")

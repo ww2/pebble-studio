@@ -5,6 +5,8 @@ import {
   parseSdkCoreManifest,
   readActiveSdkOverride,
   ACTIVE_SDK_MARKER,
+  SDK_COMPLETE_MARKER,
+  stripExtendedPrefix,
   planWinSdkProvision,
   provisionWinSdk,
   refreshWinSdkFirmware,
@@ -136,6 +138,22 @@ describe("readActiveSdkOverride", () => {
   it("returns null for a non-version-shaped marker (defends against a junk file)", async () => {
     const fs = makeFakeFs({ files: { [`${PERSIST_SDK_ROOT}\\${ACTIVE_SDK_MARKER}`]: "garbage" } });
     expect(await readActiveSdkOverride(fs, PERSIST_SDK_ROOT)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stripExtendedPrefix (Windows \\?\ extended-length path normalisation)
+// ---------------------------------------------------------------------------
+
+describe("stripExtendedPrefix", () => {
+  it("strips a \\\\?\\ drive prefix so an extended junction target compares equal", () => {
+    expect(stripExtendedPrefix("\\\\?\\C:\\Users\\x\\SDKs\\4.9.169")).toBe("C:\\Users\\x\\SDKs\\4.9.169");
+  });
+  it("strips a \\\\?\\UNC\\ prefix back to a plain UNC path", () => {
+    expect(stripExtendedPrefix("\\\\?\\UNC\\server\\share\\x")).toBe("\\\\server\\share\\x");
+  });
+  it("leaves a normal path untouched", () => {
+    expect(stripExtendedPrefix("C:\\Users\\x\\SDKs\\4.9.169")).toBe("C:\\Users\\x\\SDKs\\4.9.169");
   });
 });
 
@@ -289,6 +307,99 @@ describe("provisionWinSdk — idempotent re-run", () => {
     });
     const res = await provisionWinSdk(packaged, { fs });
     expect(res.actions.copiedSdkCore).toBe(true);
+  });
+});
+
+describe("provisionWinSdk — completeness sentinel (.complete) self-heal", () => {
+  beforeEach(() => _resetProvisionState());
+
+  it("skips the copy when the manifest is valid AND the .complete sentinel is present", async () => {
+    const p = planWinSdkProvision(packaged, "4.9.169");
+    const fs = makeFakeFs({
+      dirs: { [BUNDLE_SDKS]: ["4.9.169", "current"], [KEYMAPS_SRC]: ["en-us"] },
+      files: {
+        [p.targetManifest]: JSON.stringify({ type: "sdk-core", version: "4.9.169" }),
+        [`${p.targetSdkCore}\\${SDK_COMPLETE_MARKER}`]: "4.9.169",
+        [`${p.targetKeymaps}\\en-us`]: "x",
+      },
+    });
+    const res = await provisionWinSdk(packaged, { fs });
+    expect(res.actions.copiedSdkCore).toBe(false);
+    expect(fs.calls.some((c) => c.startsWith("copyTree"))).toBe(false);
+    expect(fs.calls.some((c) => c === `remove ${p.targetSdkCore}`)).toBe(false);
+  });
+
+  it("re-copies (self-heals) a torn tree: valid manifest but MISSING sentinel + a bundle source exists", async () => {
+    const p = planWinSdkProvision(packaged, "4.9.169");
+    const fs = makeFakeFs({
+      dirs: {
+        [BUNDLE_SDKS]: ["4.9.169", "current"],
+        [KEYMAPS_SRC]: ["en-us"],
+        // A real bundle sdk-core to copy FROM (makes haveBundleSource true).
+        [p.bundleSdkCore]: [],
+      },
+      files: {
+        [p.targetManifest]: JSON.stringify({ type: "sdk-core", version: "4.9.169" }),
+        // NO .complete sentinel → treated as incomplete.
+        [`${p.targetKeymaps}\\en-us`]: "x",
+      },
+    });
+    const res = await provisionWinSdk(packaged, { fs });
+    expect(res.actions.copiedSdkCore).toBe(true);
+    // Wipes the partial tree BEFORE re-copying (self-heal), then stamps the sentinel.
+    expect(fs.calls).toContain(`remove ${p.targetSdkCore}`);
+    expect(fs.calls).toContain(`copyTree ${p.bundleSdkCore} -> ${p.targetSdkCore}`);
+    expect(fs.calls).toContain(`writeText ${p.targetComplete}`);
+    expect(fs.calls.indexOf(`remove ${p.targetSdkCore}`))
+      .toBeLessThan(fs.calls.indexOf(`copyTree ${p.bundleSdkCore} -> ${p.targetSdkCore}`));
+  });
+
+  it("heals a legacy install (valid manifest, NO sentinel, NO bundle source) by writing the sentinel — no destructive re-copy", async () => {
+    const ovr = planWinSdkProvision(packaged, "5.0.0");
+    const fs = makeFakeFs({
+      dirs: { [BUNDLE_SDKS]: ["4.9.169", "current"], [KEYMAPS_SRC]: ["en-us"] },
+      files: {
+        [`${ovr.persistSdkRoot}\\${ACTIVE_SDK_MARKER}`]: "5.0.0",
+        [ovr.targetManifest]: JSON.stringify({ type: "sdk-core", version: "5.0.0" }),
+        [`${ovr.targetKeymaps}\\en-us`]: "x",
+      },
+    });
+    const res = await provisionWinSdk(packaged, { fs });
+    expect(res.version).toBe("5.0.0");
+    expect(res.actions.copiedSdkCore).toBe(false);
+    // No wipe of the upload's own tree; just a sentinel written to heal it.
+    expect(fs.calls.some((c) => c === `remove ${ovr.targetSdkCore}`)).toBe(false);
+    expect(fs.calls.some((c) => c.startsWith("copyTree"))).toBe(false);
+    expect(fs.calls).toContain(`writeText ${ovr.targetComplete}`);
+  });
+});
+
+describe("provisionWinSdk — firmware refresh is skipped under an override", () => {
+  beforeEach(() => _resetProvisionState());
+
+  it("does NOT run the bundle-keyed firmware refresh when a valid override is active", async () => {
+    const ovr = planWinSdkProvision(packaged, "5.0.0");
+    const files: Record<string, string> = {
+      [`${ovr.persistSdkRoot}\\${ACTIVE_SDK_MARKER}`]: "5.0.0",
+      [ovr.targetManifest]: JSON.stringify({ type: "sdk-core", version: "5.0.0" }),
+      [`${ovr.targetSdkCore}\\${SDK_COMPLETE_MARKER}`]: "5.0.0",
+      [`${ovr.targetKeymaps}\\en-us`]: "x",
+      // A bundle fw-rev that DIFFERS from the (absent) target rev — would trigger a
+      // refresh if it weren't gated off for overrides.
+      [ovr.bundleFwRev]: "freeze-fix-9",
+    };
+    for (const board of FW_REFRESH_BOARDS) {
+      for (const blob of FW_REFRESH_BLOBS) files[`${ovr.bundleSdkCore}\\pebble\\${board}\\qemu\\${blob}`] = "fw";
+    }
+    const fs = makeFakeFs({
+      files,
+      dirs: { [BUNDLE_SDKS]: ["4.9.169", "current"], [KEYMAPS_SRC]: ["en-us"] },
+    });
+    const res = await provisionWinSdk(packaged, { fs });
+    expect(res.version).toBe("5.0.0");
+    expect(res.actions.refreshedFirmware).toBe(false);
+    // No firmware blobs copied under the override.
+    expect(fs.calls.some((c) => c.startsWith("copyFile") && c.includes("\\qemu\\"))).toBe(false);
   });
 });
 

@@ -139,15 +139,17 @@ describe("makeTimeController — shim-backed (primary path)", () => {
     tc.stop();
   });
 
-  it("system after custom: setFakeTime(null, 1) returns the fake clock to real time", async () => {
+  it("system after custom: setFakeTime(<now>, 1) — an ABSOLUTE target returns the fake clock to real time", async () => {
     const d = fakeDriver();
     const tc = makeTimeController(() => d, deps);
     await tc.setConfig(cfg({ source: "custom", rate: "frozen", customWallMs: t0 }));
     await tc.setConfig(cfg({ source: "system", timezone: HOST }));
-    // System writes a RELATIVE "-" anchor (null target), not an absolute "<now> 1":
-    // a relative anchor reads as real time whenever qemu reads it, so the f2xx RTC
-    // boot-seed is never one-boot stale (the ~1-min-behind bug). See timeController.apply.
-    expect(d.fake[d.fake.length - 1]).toEqual([null, 1]);
+    // A live switch to System writes an ABSOLUTE "<now> 1", NOT a relative "-":
+    // "-" means "keep the current fake anchor" (timeshim.c), so after a Custom
+    // session it would re-anchor at the CUSTOM time and never return to real time.
+    // The f2xx boot-seed is kept correct by a "- 1" reset at BOOT instead (see
+    // WindowsNativeDriver.start), not by writing "-" here.
+    expect(d.fake[d.fake.length - 1]).toEqual([Math.trunc(t0 / 1000), 1]);
     tc.stop();
   });
 
@@ -315,6 +317,36 @@ describe("custom frozen avoids the qemu rate-0 firmware minute-tick loop", () =>
     const target = fakeTargetUnix(wall, HOST, t0);
     nowMs = t0 + 600_000; // 10 real minutes later
     expect(tc.currentWatchUnix()).toBe(target); // unchanged — frozen for sample-pin timing
+    tc.stop();
+  });
+});
+
+describe("tz-offset push latch always releases (even a hung setTzOffset)", () => {
+  const t0 = WINTER.getTime();
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("a setTzOffset that hangs forever does not permanently drop later pushes", async () => {
+    vi.useFakeTimers();
+    let tzCalls = 0;
+    const d = {
+      // Hangs forever — models a dead/contended pypkjs bridge with no `timeout`
+      // bound (the windows-native path). Without the timeout race in
+      // pushTzOffsetGuarded this latches tzPushInFlight true for the session.
+      setTzOffset: () => { tzCalls++; return new Promise<void>(() => {}); },
+      setFakeTime: async () => {},
+      timeFormat: async () => {},
+      ensureTimeShim: async () => true,
+    };
+    const tc = makeTimeController(() => d, { now: () => t0, hostTz: () => HOST });
+
+    await tc.setConfig(cfg({ source: "custom", rate: "1x", customWallMs: t0 }));
+    expect(tzCalls).toBe(1);            // first push fired, now hung + latched
+    await tc.applyAll();
+    expect(tzCalls).toBe(1);            // still latched — the in-flight guard holds
+
+    await vi.advanceTimersByTimeAsync(8000); // the timeout race elapses → latch releases
+    await tc.applyAll();
+    expect(tzCalls).toBe(2);            // a later push goes through again
     tc.stop();
   });
 });

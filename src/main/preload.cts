@@ -3,16 +3,28 @@ import { contextBridge, ipcRenderer, webUtils } from "electron";
 // bundle never pulls timeController code in at runtime.
 import type { TimeConfig } from "./backend/timeController.js";
 import type { SimEnvConfig } from "../shared/simEnv.js";
+// Type-only — erased by esbuild, so the preload bundle never pulls the language
+// controller / shared validate code in at runtime (mirrors the TimeConfig import).
+import type { PackRef, Selection } from "./backend/languageController.js";
+import type {
+  LangCatalogResult,
+  LangInstallResult,
+  LangSideloadResult,
+  LangActiveResult,
+} from "./langIpc.js";
 
 const studio = {
-  initBackend: (): Promise<{ kind: string }> => ipcRenderer.invoke("backend:init"),
+  // Task 5: `prebootBoard` (when passed) asks main to warm-boot that board right
+  // after provisioning so the first Launch attaches near-instantly. The renderer
+  // passes it only when the "Pre-boot emulator on app start" setting is on.
+  initBackend: (opts?: { prebootBoard?: string }): Promise<{ kind: string }> =>
+    ipcRenderer.invoke("backend:init", opts),
   start: (id: string) => ipcRenderer.invoke("emu:start", id),
   stop: () => ipcRenderer.invoke("emu:stop"),
   abort: (): Promise<void> => ipcRenderer.invoke("emu:abort"),
   install: (pbwPath: string) => ipcRenderer.invoke("emu:install", pbwPath),
   button: (id: string, action?: string) => ipcRenderer.invoke("emu:button", id, action),
   accelTap: () => ipcRenderer.invoke("emu:accelTap"),
-  screenshot: (out: string) => ipcRenderer.invoke("emu:screenshot", out),
   // Backlight-free framebuffer screenshot. Pass a capture filename; resolves with
   // the saved absolute path, or null on ANY failure (renderer then falls back to
   // the VNC-canvas + backlight grab).
@@ -67,10 +79,28 @@ const studio = {
   // only when the user cancels the picker.
   sdkInfo: (): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }> =>
     ipcRenderer.invoke("sdk:info"),
-  sdkInstall: (): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean } | null> =>
-    ipcRenderer.invoke("sdk:install"),
+  sdkInstall: (mode?: "file" | "folder"): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean } | null> =>
+    ipcRenderer.invoke("sdk:install", mode),
   sdkReset: (): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }> =>
     ipcRenderer.invoke("sdk:reset"),
+  // Language packs (Task 10, native-Windows). catalog lists Rebble packs for the
+  // active firmware; install/sideload apply a pack (resolving { language }/{ pack }
+  // or a surfaced { error } string); active reports the watch's current language;
+  // getSelection/setSelection persist the per-board choice re-asserted on boot. On
+  // a non-native backend the handlers resolve a clear not-supported payload.
+  lang: {
+    catalog: (board: string): Promise<LangCatalogResult> =>
+      ipcRenderer.invoke("lang:catalog", board),
+    install: (board: string, ref: PackRef): Promise<LangInstallResult> =>
+      ipcRenderer.invoke("lang:install", board, ref),
+    sideload: (): Promise<LangSideloadResult> => ipcRenderer.invoke("lang:sideload"),
+    active: (board: string): Promise<LangActiveResult> =>
+      ipcRenderer.invoke("lang:active", board),
+    getSelection: (board: string): Promise<Selection | null> =>
+      ipcRenderer.invoke("lang:selection", board),
+    setSelection: (board: string, sel: Selection | null): Promise<void> =>
+      ipcRenderer.invoke("lang:setSelection", board, sel),
+  },
   // App version (v1.0.0) — for the Help → What's New modal header.
   appVersion: (): Promise<string> => ipcRenderer.invoke("app:version"),
   // Subscribe to application-menu actions (v1.0.0). Returns a disposer.

@@ -9,11 +9,16 @@
 // SettingsPane (Wave 2b) edits them, persists via saveBindings, and notifies
 // EmulatorView by dispatching a `pebble-studio:keybindings-changed` window event.
 
-/** The bindable emulator actions. */
-export type KeyAction = "back" | "up" | "select" | "down" | "tap" | "shake" | "light";
+/** The bindable emulator actions. `screenshot`/`record` drive the Capture bar
+ * (via window events) so they work without the Capture pane being open. */
+export type KeyAction =
+  | "back" | "up" | "select" | "down" | "tap" | "shake" | "light"
+  | "screenshot" | "record";
 
 /** Ordered list of actions (drives the Settings UI rows). */
-export const ACTIONS: readonly KeyAction[] = ["back", "up", "select", "down", "tap", "shake", "light"] as const;
+export const ACTIONS: readonly KeyAction[] = [
+  "back", "up", "select", "down", "tap", "shake", "light", "screenshot", "record",
+] as const;
 
 /** A binding maps each action to a KeyboardEvent.key value, or null if unbound. */
 export type Bindings = Record<KeyAction, string | null>;
@@ -32,6 +37,8 @@ export const DEFAULT_BINDINGS: Bindings = {
   tap: null,
   shake: null,
   light: null,
+  screenshot: null,
+  record: null,
 };
 
 /** True for a record that has exactly the action keys with string|null values. */
@@ -86,4 +93,31 @@ export function resolveAction(key: string, bindings: Bindings): KeyAction | null
     if (bindings[a] !== null && bindings[a] === key) return a;
   }
   return null;
+}
+
+/** KeyboardEvent.key values for a bare modifier press. Such a key can never fire
+ * an action (EmulatorView.handleKeyDown bails on any modifier chord), so it must
+ * be rejected as a binding rather than stored as a dead key. */
+const BARE_MODIFIER_KEYS: ReadonlySet<string> = new Set([
+  "Control", "Alt", "Meta", "Shift", "AltGraph",
+]);
+
+/** True when `key` is a lone modifier key (not a valid binding target). */
+export function isBareModifierKey(key: string): boolean {
+  return BARE_MODIFIER_KEYS.has(key);
+}
+
+/**
+ * Return a NEW bindings object with `key` assigned to `action`, first clearing
+ * that key from any OTHER action so a key maps to exactly one action. Without this
+ * a re-used key would silently do nothing — resolveAction keeps the first action
+ * in ACTIONS order. The input is not mutated.
+ */
+export function applyRebind(bindings: Bindings, action: KeyAction, key: string): Bindings {
+  const next: Bindings = { ...bindings };
+  for (const a of ACTIONS) {
+    if (a !== action && next[a] === key) next[a] = null;
+  }
+  next[action] = key;
+  return next;
 }

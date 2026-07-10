@@ -9,6 +9,12 @@ export function splitLines(buffered: string, chunk: string): { lines: string[]; 
   return { lines: parts, rest };
 }
 
+/** Cap for the partial-line buffer: if a child emits data with no newline, `buf`
+ * would otherwise grow without bound. 1 MiB is far beyond any real log line; past
+ * it we keep only the tail so memory stays bounded (a pathological no-newline
+ * stream degrades to its last MiB rather than an OOM). */
+const MAX_PARTIAL = 1024 * 1024;
+
 /** Handle to a running streamed child. */
 export interface LineStreamHandle {
   kill(): void;
@@ -30,7 +36,8 @@ export function spawnLineStream(
   let buf = "";
   const feed = (chunk: Buffer): void => {
     const { lines, rest } = splitLines(buf, chunk.toString());
-    buf = rest;
+    // Cap the carried-over partial so a newline-less stream can't grow it forever.
+    buf = rest.length > MAX_PARTIAL ? rest.slice(rest.length - MAX_PARTIAL) : rest;
     for (const l of lines) onLine(l);
   };
   child.stdout?.on("data", feed);

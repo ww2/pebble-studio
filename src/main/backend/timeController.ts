@@ -40,7 +40,10 @@ export const QEMU_FROZEN_RATE = 1e-3;
  *     pebble-tool's post_connect already re-pushes the host offset on every
  *     command connect, so our push is a best-effort backstop (covers a freshly
  *     booted watch with no app installed yet), not the mechanism:
- *       · System → fake clock = real time (control file `<now> 1`).
+ *       · System → fake clock = real time. A LIVE switch writes an absolute
+ *         `<now> 1` so both consumers re-anchor to real time at once; the control
+ *         file is also reset to `- 1` at BOOT (see WindowsNativeDriver.start), which
+ *         a fresh qemu reads as real, keeping the f2xx boot-seed correct.
  *       · Custom → fake clock = the entered wall-clock baked into the control-file
  *         target; utc_offset stays at the host offset, so post_connect's re-push
  *         is a no-op (clobber-immune by construction; no reassert, no timer).
@@ -69,9 +72,13 @@ export const DEFAULT_TIME_CONFIG: TimeConfig = {
 export function tzOffsetMinutes(tz: string, at: Date): number {
   try {
     const dtf = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz, hour12: false,
+      // hourCycle (not hour12) — h12/h24 can surface a "24" hour; h23 cannot.
+      timeZone: tz,
       year: "numeric", month: "2-digit", day: "2-digit",
       hour: "2-digit", minute: "2-digit", second: "2-digit",
+      // h23 forces the hour into 00–23, so the formatter never emits the "24"
+      // (midnight) that h24 can — the `hour === "24"` guard below is thus dead.
+      hourCycle: "h23",
     });
     const p: Record<string, string> = {};
     for (const part of dtf.formatToParts(at)) p[part.type] = part.value;
@@ -221,16 +228,28 @@ export function makeTimeController(
   // connection to the single-client pypkjs bridge; without this, a slow/contended
   // push fired on every boot/install/relaunch overlaps with the next one and they
   // stack up (confirmed live: 15+ hung pb-set-tz.py chains), starving the bridge.
-  // Combined with the helper's `timeout` bound, pushes can neither hang nor pile up.
+  // The POSIX helper is wrapped in coreutils `timeout`, but the windows-native form
+  // runs the python helper BARE and spawnRunner only settles on process close — a
+  // dead/contended bridge would hang setTzOffset FOREVER and latch tzPushInFlight
+  // true for the whole session, silently dropping every later push. So the latch is
+  // ALWAYS released within TZ_PUSH_TIMEOUT_MS via a race, regardless of driver kind
+  // (the windows-native runner also self-bounds and kills its child — see
+  // WindowsNativeDriver.setTzOffset — so no zombie python survives the timeout).
+  const TZ_PUSH_TIMEOUT_MS = 8000;
   let tzPushInFlight = false;
   async function pushTzOffsetGuarded(d: TimeDriver, off: number, tzName?: string): Promise<void> {
     if (tzPushInFlight) return; // a push is already running — skip (latest state re-pushes next time)
     tzPushInFlight = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await d.setTzOffset(off, tzName);
+      await Promise.race([
+        d.setTzOffset(off, tzName),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, TZ_PUSH_TIMEOUT_MS); }),
+      ]);
     } catch {
       /* bridge down — non-fatal */
     } finally {
+      if (timer) clearTimeout(timer);
       tzPushInFlight = false;
     }
   }
@@ -310,33 +329,51 @@ export function makeTimeController(
       legacyActive = true;
       anchorMs = now();
       lastPushed = null;
+      // Keep currentWatchUnix() consistent with the legacy virtual clock: it advances
+      // the entered wall-clock (as a UTC anchor) at the rate, exactly as
+      // legacyOffsetMinutesFor models the displayed time.
+      fakeTarget = fakeTargetUnix(cfg.customWallMs, hostTz(), now());
+      fakeRate = RATE_MULT[cfg.rate];
+      fakeAppliedAtMs = now();
       await legacyPush(true);
       syncLegacyTimer();
     } else if (shimReady) {
       // PRIMARY PATH: write the control file FIRST.
       //   · Custom → the entered wall-clock baked into an ABSOLUTE target at rate.
-      //   · System → a RELATIVE anchor ("- 1"), NOT an absolute "<now> 1". The f2xx
-      //     RTC (basalt/chalk/diorite/aplite) seeds its clock from the control file
-      //     at qemu *realize*, which happens BEFORE this apply() runs (apply fires
-      //     after the emulator reaches "live"). An absolute target written here is
-      //     read one boot STALE at the next realize, seeding that RTC tens-of-seconds
-      //     behind real — and the f2xx host→target offset is computed once and
-      //     sticks, so the watch runs permanently ~1 min behind. (The generic-RTC
-      //     M33 boards — emery/gabbro/flint — re-read the live clock every access,
-      //     so they were unaffected.) A relative "-" anchor reads as real time
-      //     WHENEVER qemu reads it, so the seed is correct regardless of ordering.
+      //   · System → an ABSOLUTE "<now> 1", so BOTH consumers (the qemu-native RTC
+      //     and the LD_PRELOAD shim) re-anchor to real time the instant this apply()
+      //     runs — a LIVE Custom→System switch returns the watch to real time at
+      //     once. A relative "-" here means "keep the current fake anchor" (see
+      //     timeshim.c), so after a Custom session it would re-anchor the fake clock
+      //     at the CUSTOM time and the watch would never return to real time.
+      //     The f2xx RTC (basalt/chalk/diorite/aplite) seeds from the control file at
+      //     qemu *realize* — BEFORE this apply(), which fires after "live" — so an
+      //     absolute value lingering here would be read one boot STALE and seed that
+      //     RTC ~1 min behind. That is neutralized by resetting the control file to
+      //     "- 1" at BOOT, before qemu realizes (WindowsNativeDriver.start): a fresh
+      //     qemu anchors "-" to real time, so the seed is always correct and this
+      //     runtime absolute write is safe across restarts. (Generic-RTC M33 boards —
+      //     emery/gabbro/flint — re-read the live clock every access, unaffected.)
       const isCustom = cfg.source === "custom";
-      const target = isCustom ? fakeTargetUnix(cfg.customWallMs, hostTz(), now()) : null;
+      const target = isCustom ? fakeTargetUnix(cfg.customWallMs, hostTz(), now()) : Math.trunc(now() / 1000);
       const rate = isCustom ? RATE_MULT[cfg.rate] : 1;
-      fakeTarget = target ?? Math.trunc(now() / 1000); // currentWatchUnix anchor: system tracks real now
-      fakeRate = rate; // LOGICAL rate (0 for frozen) — keeps currentWatchUnix truly frozen
+      fakeTarget = target; // currentWatchUnix anchor — matches the absolute target we write
+      fakeRate = rate;     // LOGICAL rate (0 for frozen) — keeps currentWatchUnix truly frozen
       fakeAppliedAtMs = now();
       // QEMU rate: substitute the tiny QEMU_FROZEN_RATE for an exactly-0 (frozen)
       // rate so the firmware's minute-tick alarm doesn't loop (see QEMU_FROZEN_RATE).
       const qemuRate = rate === 0 ? QEMU_FROZEN_RATE : rate;
-      try { await d.setFakeTime(target, qemuRate); } catch { /* ignore */ }
+      // This connection-free write IS the custom/freeze/rate mechanism — a swallowed
+      // failure means "time didn't change" with no trace, so surface it.
+      try { await d.setFakeTime(target, qemuRate); }
+      catch (e) { console.warn(`[time] setFakeTime failed — custom/system time may not have applied: ${String(e)}`); }
+    } else {
+      // System with no shim: no control file to write, but keep currentWatchUnix()
+      // reporting real time (a prior legacy-custom session left fake* on custom).
+      fakeTarget = Math.trunc(now() / 1000);
+      fakeRate = 1;
+      fakeAppliedAtMs = now();
     }
-    // System with no shim: nothing to write — skip.
 
     // Best-effort, FIRE-AND-FORGET pypkjs work — must NOT block the write above.
     void d.timeFormat(cfg.hour24).catch(() => { /* bridge down — non-fatal */ });

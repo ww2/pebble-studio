@@ -1,4 +1,5 @@
 import { access } from "node:fs/promises";
+import { closeSync, openSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { spawnRunner } from "./spawnRunner.js";
 import { selectDriverKind, type ProbeResult, type DriverKind } from "./driverFactory.js";
@@ -7,13 +8,18 @@ import { WslDriver } from "./WslDriver.js";
 import { WindowsNativeDriver } from "./WindowsNativeDriver.js";
 import { bootEmulator, stopEmulator, makeWslBootDeps } from "./bootEmulator.js";
 import { makeWinBootDeps } from "./winBootDeps.js";
-import { defaultCtx, pebbleCmd, bundledToolsPresent, pebblePyExe } from "./winRuntime.js";
+import { defaultCtx, pebbleCmd, bundledToolsPresent, pebblePyExe, qemuExe, pebbleDataDir } from "./winRuntime.js";
 import { winFakeTimeCtlPath, winQemuFakeTimeLogPath } from "./winTimeShim.js";
 import { simEnvPath } from "./simEnv.js";
 import { winHostPaths } from "./hostPaths.js";
 import { deployWinHelpers } from "./winHelpers.js";
 import { WinInputChannel, readPypkjsPort } from "./winInputChannel.js";
-import { join as pathJoin } from "node:path";
+import { ensureWinSdkProvisioned } from "./winSdkProvision.js";
+import { SnapshotManager, realSnapFs, realMonitorTransport, type SnapshotContext } from "./snapshotManager.js";
+import { parseMonitorPort } from "./backlight.js";
+import { stat as fsStat, readFile as fsReadFile } from "node:fs/promises";
+import { join as pathJoin, win32 as winPath } from "node:path";
+import type { PlatformId } from "../../shared/types.js";
 import type { BackendDriver } from "./BackendDriver.js";
 
 /**
@@ -112,8 +118,10 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
     // launcher.exe, no AV-blockable CreateRemoteThread.
     const ctlPath = winFakeTimeCtlPath();
     // The pebble invocation: pebbleCmd already points PEBBLE_QEMU_PATH at the
-    // bundled qemu; we just hand qemu the control-file path. System time writes
-    // "<now> 1" to it; an absent/empty file is treated as real time by qemu.
+    // bundled qemu; we just hand qemu the control-file path. A live switch to System
+    // writes an absolute "<now> 1"; the file is also reset to "- 1" at each boot
+    // (WindowsNativeDriver.start) so a fresh qemu reads "-" as real time. An
+    // absent/empty file is likewise treated as real time by qemu.
     const ftLogPath = winQemuFakeTimeLogPath();
     const simEnvFile = simEnvPath(ctx.userDataDir);
 
@@ -161,12 +169,59 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
     // on Windows a non-detached child also outlives the parent (no cascade
     // kill), and teardown is by PID via killAll. unref() keeps Node's event
     // loop from waiting on it. (Job Object assignment is a later increment.)
+    //
+    // The supervisor's output is redirected to EMU_LOG_PATH (truncated per boot,
+    // mirroring the POSIX path's `>` redirect) so a failed boot can be mined for
+    // the real qemu-launch error by readBootLog/extractBootErrors; with
+    // stdio:"ignore" nothing wrote that file and the diagnostic never fired.
     const detachSpawn = async (cmd: string, args: string[], env?: Record<string, string>): Promise<void> => {
-      const child = spawn(cmd, args, { windowsHide: true, stdio: "ignore", env: { ...process.env, ...env } });
+      let logFd: number | undefined;
+      try { logFd = openSync(winHostPaths().emuLog, "w"); } catch { /* diagnostics are best-effort */ }
+      const stdio = logFd === undefined
+        ? (["ignore", "ignore", "ignore"] as const)
+        : (["ignore", logFd, logFd] as const);
+      const child = spawn(cmd, args, { windowsHide: true, stdio: [...stdio], env: { ...process.env, ...env } });
+      if (logFd !== undefined) { try { closeSync(logFd); } catch { /* child owns it now */ } }
       child.unref();
       child.on("error", () => { /* readiness is checked via ports/state file */ });
     };
-    const winDeps = makeWinBootDeps({ run: spawnRunner, detachSpawn, pebble });
+    // QEMU snapshot restore (Tasks 6+7). One SnapshotManager keyed to the current
+    // firmware/SDK/exe identity: the boot path consults it to restore instantly,
+    // and ipc drives creation after a cold boot reaches Live. resolveContext is
+    // provision-aware (ensureWinSdkProvisioned is cached) and computes the exe
+    // stamp (size+mtime) so a new emulator build cleanly discards old streams.
+    const resolveSnapshotContext = async (): Promise<SnapshotContext> => {
+      const prov = await ensureWinSdkProvisioned(ctx);
+      const persistSdkRoot = winPath.join(pebbleDataDir(ctx), "pebble-sdk");
+      const fwRev = (await fsReadFile(winPath.join(prov.sdkCoreDir, ".fw-rev"), "utf8").catch(() => "")).trim();
+      const st = await fsStat(qemuExe(ctx));
+      return { persistSdkRoot, version: prov.version, fwRev, exeStamp: `${st.size}-${Math.round(st.mtimeMs)}` };
+    };
+    const snapshot = new SnapshotManager({
+      fs: realSnapFs(),
+      monitor: realMonitorTransport(),
+      resolveContext: resolveSnapshotContext,
+      log: (m) => console.warn(m),
+    });
+    // Read the qemu HMP monitor port from the native state file (Node fs; a Windows
+    // host must NOT read it through a WSL shell — see backlight.ts).
+    const readMonitorPort = async (): Promise<number | null> => {
+      const raw = await fsReadFile(winHostPaths().emuInfo, "utf8").catch(() => "");
+      return raw ? parseMonitorPort(raw) : null;
+    };
+    const winDeps = makeWinBootDeps({
+      run: spawnRunner,
+      detachSpawn,
+      pebble,
+      // attempt 1 restores (if a valid bundle exists); a retry/wipe invalidates it
+      // and cold-boots (an `-incoming` source is invalid after killAll/wipe).
+      restore: {
+        beforeAttempt: async (attempt: number, board: PlatformId): Promise<string | null> => {
+          if (attempt >= 2) { await snapshot.invalidate(board); return null; }
+          return snapshot.prepareRestore(board);
+        },
+      },
+    });
     // Deploy the persistent input helper and wire it to the bundled interpreter.
     // The input channel removes the per-press `pebble emu-button` spawn latency.
     const pyExe = pebblePyExe(ctx);
@@ -181,8 +236,18 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
       pebble,
       boot: (id, token, onStep) => bootEmulator(id, winDeps, token, onStep),
       stop: () => stopEmulator({ killAll: winDeps.killAll }),
+      // Startup orphan reaper (no graceful pebble kill) — backend:init calls this
+      // before enabling Launch to self-heal a prior session's leftover stack.
+      reap: () => winDeps.reap(),
       inputChannel,
-      timeShim: { ctlPath },
+      timeShim: { ctlPath, ftLogPath },
+      // Fire-and-forget snapshot creation after a cold boot reaches Live: read the
+      // qemu monitor port, then drive the SnapshotManager (never throws).
+      snapshotCreate: async (board, isCancelled) => {
+        const port = await readMonitorPort();
+        if (port == null) return;
+        await snapshot.createAfterLive(board, port, { isCancelled });
+      },
     });
   } else if (kind === "native") {
     driver = new NativeDriver({ run: spawnRunner }); // native default boot/stop

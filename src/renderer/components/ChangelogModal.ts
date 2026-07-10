@@ -20,6 +20,8 @@ export interface ChangelogSdkInfo {
 export class ChangelogModal {
   private overlay: HTMLElement | null = null;
   private onKey: ((e: KeyboardEvent) => void) | null = null;
+  /** The element focused before the dialog opened, restored on close. */
+  private prevFocus: HTMLElement | null = null;
 
   constructor(
     private readonly version: () => Promise<string>,
@@ -60,18 +62,31 @@ export class ChangelogModal {
       body.appendChild(sec);
     }
     const close = (): void => this.close();
-    overlay.querySelector(".cl-close")!.addEventListener("click", close);
+    const closeBtn = overlay.querySelector<HTMLButtonElement>(".cl-close")!;
+    closeBtn.addEventListener("click", close);
     overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
-    this.onKey = (e: KeyboardEvent): void => { if (e.key === "Escape") close(); };
+    this.onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") { close(); return; }
+      // Focus trap: the close button is the only focusable control in the dialog,
+      // so keep focus on it — Tab must not reach the UI behind the overlay.
+      if (e.key === "Tab") { e.preventDefault(); closeBtn.focus(); }
+    };
     document.addEventListener("keydown", this.onKey);
+    // Remember what had focus so it can be restored on close, then move focus into
+    // the dialog (accessible: the modal, not the page behind it, is now active).
+    this.prevFocus = document.activeElement as HTMLElement | null;
     document.body.appendChild(overlay);
     this.overlay = overlay;
+    closeBtn.focus();
   }
 
   close(): void {
     if (this.onKey) { document.removeEventListener("keydown", this.onKey); this.onKey = null; }
     this.overlay?.remove();
     this.overlay = null;
+    // Restore focus to whatever triggered the dialog (if it's still in the DOM).
+    if (this.prevFocus && this.prevFocus.isConnected) this.prevFocus.focus();
+    this.prevFocus = null;
   }
 }
 

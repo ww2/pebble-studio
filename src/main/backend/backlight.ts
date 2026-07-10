@@ -2,6 +2,7 @@ import { connect as netConnect } from "node:net";
 import { makeNativeShell, makeWslShell, type Shell } from "./bootEmulator.js";
 import type { DriverKind } from "./driverFactory.js";
 import { EMU_INFO_PATH } from "./hostPaths.js";
+import { getActivePlatform } from "./pebbleCli.js";
 
 /**
  * Backlight keepalive (Task K).
@@ -27,17 +28,24 @@ const TICK_MS = 1000;
  *
  * Pure (no fs / no shell) so it is unit-testable. The file shape is
  *   { "<platform>": { "<version>": { "qemu": { "monitor": <port>, ... } } } }
- * (e.g. `{ "basalt": { "4.9": { "qemu": { "monitor": 63215 } } } }`). We return
- * the first live `monitor` port found, or null if the json is missing/malformed
- * or has no monitor entry.
+ * (e.g. `{ "basalt": { "4.9": { "qemu": { "monitor": 63215 } } } }`).
+ *
+ * With `platform` given, only that platform's versions are searched — like
+ * parseBridgePids — so a stale entry for a DIFFERENT, dead platform can't hand back
+ * a monitor port for a qemu that is gone (a Back-press to a dead port). Without it
+ * (legacy callers) we return the first live `monitor` port across all platforms.
+ * Returns null if the json is missing/malformed or has no matching monitor entry.
  */
-export function parseMonitorPort(jsonText: string): number | null {
+export function parseMonitorPort(jsonText: string, platform?: string): number | null {
   try {
     const json = JSON.parse(jsonText) as Record<
       string,
       Record<string, { qemu?: { monitor?: number } }>
     >;
-    for (const versions of Object.values(json)) {
+    const entries = platform
+      ? (json?.[platform] ? [json[platform]] : [])
+      : Object.values(json);
+    for (const versions of entries) {
       if (!versions || typeof versions !== "object") continue;
       for (const v of Object.values(versions)) {
         const port = v?.qemu?.monitor;
@@ -58,7 +66,9 @@ export function parseMonitorPort(jsonText: string): number | null {
 async function readPortViaShell(shell: Shell): Promise<number | null> {
   const { code, stdout } = await shell.run(`cat ${EMU_INFO_PATH} 2>/dev/null`);
   if (code !== 0 || !stdout.trim()) return null;
-  return parseMonitorPort(stdout);
+  // Scope to the active platform so a stale entry for a different, dead platform
+  // can't return a monitor port for a qemu that's already gone.
+  return parseMonitorPort(stdout, getActivePlatform());
 }
 
 /** Open a TCP socket to the HMP monitor, send a Back press, then close. */

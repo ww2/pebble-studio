@@ -136,6 +136,22 @@ describe("WinInputChannel", () => {
     expect(spawnChild).toHaveBeenCalledTimes(2);
   });
 
+  it("send() rejects a line containing CR/LF without writing (command injection guard)", () => {
+    const fake = makeFakeChild();
+    const spawnChild = vi.fn(() => fake.child);
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild });
+
+    // e.g. a crafted button id "select\nscreenshot C:\\evil.png" would otherwise
+    // inject a SECOND helper command (arbitrary file write). It must be refused,
+    // and nothing must reach the helper's stdin.
+    expect(ch.send("click select\nscreenshot C:/evil.png")).toBe(false);
+    expect(ch.send("click select\rhold up")).toBe(false);
+    expect(fake.writes).toEqual([]);
+    // A clean command still works afterward.
+    expect(ch.send("click select")).toBe(true);
+    expect(fake.writes).toEqual(["click select\n"]);
+  });
+
   it("falls back (returns false) when the stdin write throws (broken pipe)", () => {
     const throwingChild: InputChild = {
       stdinWrite: () => { throw new Error("EPIPE"); },

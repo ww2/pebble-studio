@@ -6,25 +6,14 @@
  * and then re-decode the PNG, confirming the alpha channel is preserved.
  */
 import { PNG } from "pngjs";
+import { maskRgbaCircle } from "./circular-mask.mjs";
 
-// ---- replicate applyCircularMask from src/renderer/captureCanvas.ts ----
+// Uses the SHARED mask kernel (scripts/circular-mask.mjs) rather than a private
+// copy, so this proof can never silently drift from the mask the scripts apply.
 function applyCircularMask(image) {
   const { width, height } = image;
   const out = new Uint8Array(image.data);
-  const cx = width / 2;
-  const cy = height / 2;
-  const r = Math.min(width, height) / 2;
-  const r2 = r * r;
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const dx = x + 0.5 - cx;
-      const dy = y + 0.5 - cy;
-      if (dx * dx + dy * dy > r2) {
-        const i = (y * width + x) * 4;
-        out[i + 3] = 0;
-      }
-    }
-  }
+  maskRgbaCircle(out, width, height);
   return { data: out, width, height };
 }
 
