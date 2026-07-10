@@ -19,7 +19,10 @@ import { buildHealthCommand, interpretHealth } from "./backend/bridgeHealth.js";
 import { makeNativeHealthCheck } from "./backend/winBridgeHealth.js";
 import { winHostPaths } from "./backend/hostPaths.js";
 import { readPypkjsPort } from "./backend/winInputChannel.js";
-import { defaultCtx } from "./backend/winRuntime.js";
+import { defaultCtx, pebblePyExe } from "./backend/winRuntime.js";
+import { deployWinHelpers } from "./backend/winHelpers.js";
+import { makeLanguageController, type LanguageController, type PackRef, type Selection } from "./backend/languageController.js";
+import { makeLangHandlers, kickLangReassert } from "./langIpc.js";
 import { ensureWinSdkProvisioned } from "./backend/winSdkProvision.js";
 import { currentSdkInfo, installCustomSdk, resetToBundledSdk } from "./backend/sdkController.js";
 import { readSimEnv, writeSimEnv } from "./backend/simEnv.js";
@@ -345,6 +348,53 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     onError: (err) => console.error(`[warm] pre-boot failed: ${String(err)}`),
   });
 
+  // ── Language packs (Task 10, native-Windows only) ────────────────────────
+  // The controller is built ONCE, lazily, on first use — and only on the
+  // windows-native backend (the self-contained stack that bundles the pypkjs
+  // language helper + interpreter). On WSL / native-Linux getLang resolves null
+  // so the handlers surface a clear "not supported" payload instead of crashing.
+  let langController: LanguageController | null = null;
+  const getLang = async (): Promise<LanguageController | null> => {
+    if (driverKind !== "windows-native") return null;
+    if (!langController) {
+      const ctx = await defaultCtx();
+      const { langHelperPath } = deployWinHelpers(path.join(app.getPath("userData"), "helpers"));
+      langController = makeLanguageController({
+        userDataDir: app.getPath("userData"),
+        langHelperPath,
+        pythonExe: pebblePyExe(ctx),
+        // The active pypkjs websocket port, or null when the emulator isn't up.
+        readPort: () => readPypkjsPort(winHostPaths().emuInfo),
+      });
+    }
+    return langController;
+  };
+  // Catalog is keyed on the active SDK/firmware version pebble-tool resolves.
+  const getLangFwVersion = async (): Promise<string> => {
+    try {
+      return (await currentSdkInfo(await defaultCtx())).version;
+    } catch {
+      return "unknown";
+    }
+  };
+  // `.pbl` file picker for sideloading a pack (mirrors dialog:pickPbw / sdk:install).
+  const pickPblFile = async (): Promise<string | null> => {
+    const result = await dialog.showOpenDialog({
+      title: "Select a Pebble language pack",
+      properties: ["openFile"],
+      filters: [
+        { name: "Pebble language pack", extensions: ["pbl"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0];
+  };
+  const langHandlers = makeLangHandlers({
+    getController: getLang,
+    getFwVersion: getLangFwVersion,
+    pickPblFile,
+  });
+
   ipcMain.handle("lib:add", async (_e, pbwPath: string) => { library.add(pbwPath); return library.list(); });
   ipcMain.handle("lib:list", async () => library.list());
   ipcMain.handle("lib:remove", async (_e, p: string) => {
@@ -484,6 +534,13 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   const runPostLive = async (id: PlatformId, token: BootToken): Promise<void> => {
     await battery.reassert(); // re-assert the chosen battery level (before the time push, since emu-battery's connect re-syncs host time)
     void time.applyAll(); // re-assert time settings (fire-and-forget)
+    // Re-install the per-board language pack (Task 10): packs live in RAM and are
+    // wiped on reboot, so re-assert the persisted selection after every boot.
+    // Fire-and-forget like health — NEVER on the boot critical path, never awaited
+    // (the controller caps its own retries and never throws). No-op on non-native
+    // backends and when no language is selected. runPostLive runs exactly once per
+    // launch (cold boot + warm-standby claim), so this reassert does too.
+    kickLangReassert(getLang, id, (m) => console.error(m));
     // Arm the health monitor only if this boot wasn't superseded by a force-close
     // mid-flight: emu:abort/emu:stop flip token.cancelled and call bridgeMonitor.stop(),
     // and a boot that resolves in that same window would otherwise re-start a monitor
@@ -834,6 +891,37 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   ipcMain.handle("sdk:reset", async () => {
     if (emuLive) await teardownEmulator();
     return resetToBundledSdk(await defaultCtx(), { onProgress: sdkProgress });
+  });
+
+  // ── Language packs (native-Windows) ──────────────────────────────────────
+  // The handlers delegate to the language controller (Task 9); the langIpc layer
+  // owns native-only gating + error→string mapping + the file picker. install /
+  // sideload return a `{ language }` / `{ pack }` on success or a surfaced
+  // `{ error }` string; on a non-native backend every handler resolves the clear
+  // "not supported" payload rather than crashing.
+  ipcMain.handle("lang:catalog", async (e, board: string) => {
+    assertMainSender(e);
+    return langHandlers.catalog(board);
+  });
+  ipcMain.handle("lang:install", async (e, board: string, ref: PackRef) => {
+    assertMainSender(e);
+    return langHandlers.install(board, ref);
+  });
+  ipcMain.handle("lang:sideload", async (e) => {
+    assertMainSender(e);
+    return langHandlers.sideload();
+  });
+  ipcMain.handle("lang:active", async (e, board: string) => {
+    assertMainSender(e);
+    return langHandlers.active(board);
+  });
+  ipcMain.handle("lang:selection", async (e, board: string) => {
+    assertMainSender(e);
+    return langHandlers.getSelection(board);
+  });
+  ipcMain.handle("lang:setSelection", async (e, board: string, sel: Selection | null) => {
+    assertMainSender(e);
+    return langHandlers.setSelection(board, sel);
   });
 
   ipcMain.handle("capture:nextName", async (_e, base: string, ext: "png" | "gif") => {
