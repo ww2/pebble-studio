@@ -71,7 +71,7 @@ export class BootAborted extends Error {
 export interface PollUntilOpts {
   /** Overall deadline (ms). `fn` is always evaluated at least once, even at 0. */
   timeoutMs: number;
-  /** Duration of the fast "hot" window measured from the first poll (default 1500ms). */
+  /** Duration of the fast "hot" window, measured from pollUntil entry (default 1500ms). */
   hotMs?: number;
   /** Re-poll interval during the hot window (default 100ms). */
   hotIntervalMs?: number;
@@ -91,10 +91,13 @@ export interface PollUntilOpts {
  * hot window it settles to `intervalMs` (300ms) to keep steady-state polling cheap.
  *
  * Cancellation and the timeout are honored EXACTLY as the fixed-cadence loops this
- * replaces: the token is re-checked before each `fn` call AND after each sleep (so
- * a cancel aborts within one interval with BootAborted), and the deadline is
- * checked only after a failed `fn` (so `fn` is always evaluated at least once, even
- * at `timeoutMs: 0`). `fn` may be sync or async; a thrown error propagates.
+ * replaces: the token is re-checked around every await — before each `fn` call,
+ * right after a failed `fn` (BEFORE the deadline check, so a cancel that lands
+ * while a probe is in flight surfaces as BootAborted even when the deadline has
+ * also elapsed — a user stop must never masquerade as a retryable timeout), and
+ * after each sleep (so a cancel aborts within one interval). The deadline is
+ * checked only after a failed `fn`, so `fn` is always evaluated at least once,
+ * even at `timeoutMs: 0`. `fn` may be sync or async; a thrown error propagates.
  */
 export async function pollUntil(
   fn: () => boolean | Promise<boolean>,
@@ -113,8 +116,11 @@ export async function pollUntil(
   for (;;) {
     if (token?.cancelled) throw new BootAborted();
     if (await fn()) return;
+    // Token BEFORE deadline: if both landed while the probe was in flight,
+    // cancellation must win (BootAborted, not a retryable-looking timeout).
+    if (token?.cancelled) throw new BootAborted();
     if (Date.now() > deadline) throw new Error(timeoutMessage);
-    // Hot for the first hotMs (measured from the first poll), then steady 300ms.
+    // Hot for the first hotMs (measured from entry), then steady 300ms.
     const interval = Date.now() - start < hotMs ? hotIntervalMs : intervalMs;
     await new Promise((r) => setTimeout(r, interval));
     if (token?.cancelled) throw new BootAborted();

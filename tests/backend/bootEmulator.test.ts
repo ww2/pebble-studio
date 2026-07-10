@@ -390,6 +390,26 @@ describe("pollUntil (adaptive readiness cadence)", () => {
     ).rejects.toBeInstanceOf(BootAborted);
     expect(calls).toBe(0); // bailed before evaluating fn
   });
+
+  it("BootAborted wins over the timeout when both land during an in-flight probe", async () => {
+    // Regression: the OLD gate loops checked the token BEFORE the deadline on
+    // every failed probe. A probe that is still in flight when BOTH cancellation
+    // and the deadline occur must therefore surface as BootAborted (a user stop),
+    // never the generic timeout Error (a boot failure the caller would retry).
+    vi.useFakeTimers();
+    const token = { cancelled: false };
+    const p = pollUntil(
+      // Async probe that resolves false at t=150ms — past the 100ms deadline —
+      // with the token having flipped while it was in flight.
+      () => new Promise<boolean>((resolve) => {
+        setTimeout(() => { token.cancelled = true; resolve(false); }, 150);
+      }),
+      { timeoutMs: 100, token },
+    );
+    const assertion = expect(p).rejects.toBeInstanceOf(BootAborted);
+    await vi.advanceTimersByTimeAsync(200);
+    await assertion;
+  });
 });
 
 describe("makeDiagnose + fmtProbe (boot health probe)", () => {
