@@ -140,11 +140,24 @@ export class WarmStandby<T> {
    * the single-instance ports are free before the caller boots a different board).
    * No-op — and crucially NO kill — when idle or already claimed (a claimed boot is
    * the live watch the user is using; tearing it down here would be wrong).
+   *
+   * IMPORTANT ordering: the abandoned boot fn is awaited to FULL unwind BEFORE
+   * this resolves. bootEmulator's BootAborted catch runs its own terminal
+   * `killAll()` — a BLANKET sweep of every emulator-image PID — so if cancel()
+   * returned while that fn was still mid-flight, the caller's fresh cold boot
+   * could spawn and then be blanket-killed by the abandoned boot's late cleanup.
+   * Capturing the promise before reset() (which nulls it) and awaiting it here
+   * guarantees the stale killAll has already run when the cold boot proceeds.
    */
   async cancel(): Promise<void> {
     const active = this._state === "booting" || this._state === "ready";
-    this.reset();
+    const inflight = this._promise; // capture BEFORE reset() nulls it
+    this.reset(); // flips the token → the boot fn's next check throws BootAborted
     if (active) {
+      // Wait for the abandoned boot fn to fully unwind (including its own
+      // terminal killAll on BootAborted). Rejection is the EXPECTED outcome of a
+      // cancelled boot; a resolved ('ready') promise settles instantly.
+      if (inflight) await inflight.catch(() => {});
       try {
         await this.deps.kill();
       } catch {

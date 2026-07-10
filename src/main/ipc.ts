@@ -328,6 +328,10 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // runs once in `emu:start` after the claim. `enabled: () => true`: the renderer
   // gates on the Settings checkbox by only passing a `prebootBoard` when it's on.
   const warmStandby = new WarmStandby<VncEndpoint>({
+    // Always-true by design: the production gate lives upstream — the renderer
+    // only passes `prebootBoard` to backend:init when the Settings checkbox is on
+    // (the setting is renderer-side localStorage), and backend:init only kicks on
+    // the windows-native driver. Kept a dep so tests exercise the disabled path.
     enabled: () => true,
     boot: async (id, token) => {
       // Same pre-boot prep as emu:start's cold path: deploy the time shim before

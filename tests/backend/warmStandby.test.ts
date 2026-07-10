@@ -100,10 +100,62 @@ describe("WarmStandby", () => {
     ws.kick("emery");
     const token = fake.calls[0].token;
     expect(token.cancelled).toBe(false);
-    await ws.cancel();
-    expect(token.cancelled).toBe(true); // token flipped
+    const cancelP = ws.cancel();
+    expect(token.cancelled).toBe(true); // token flipped synchronously
+    fake.fail(new Error("BootAborted")); // the abandoned boot fn unwinds
+    await cancelP;
     expect(kill).toHaveBeenCalledTimes(1); // killAll awaited
     expect(order).toEqual(["kill"]);
+    expect(ws.state()).toBe("idle");
+  });
+
+  it("cancel() resolves only AFTER the abandoned boot fn fully unwound (its terminal killAll cannot land on the successor cold boot)", async () => {
+    // Regression (review of 9d34ec7): bootEmulator's BootAborted catch runs its
+    // own BLANKET killAll. If cancel() resolved while the abandoned warm boot was
+    // still mid-flight, emu:start's cold boot could spawn a fresh stack and then
+    // be blanket-killed by that late cleanup. cancel() must therefore await the
+    // in-flight promise's settlement (rejection = expected) BEFORE its own kill
+    // sweep and before returning.
+    const fake = makeFakeBoot();
+    const order: string[] = [];
+    const kill = vi.fn(async () => { order.push("cancel-kill"); });
+    const { ws } = makeStandby({ boot: fake.boot, kill, onError: () => {} });
+    ws.kick("emery");
+
+    let cancelResolved = false;
+    const cancelP = ws.cancel().then(() => { cancelResolved = true; });
+
+    // Give cancel() every chance to (wrongly) resolve early: the abandoned boot
+    // fn has NOT unwound yet, so cancel must still be pending and must not have
+    // run its kill sweep.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(cancelResolved).toBe(false);
+    expect(kill).not.toHaveBeenCalled();
+
+    // The abandoned boot fn now notices the flipped token: simulate its
+    // catch-side terminal killAll, then its rejection (full unwind).
+    order.push("abandoned-boot-terminal-killAll");
+    fake.fail(new Error("BootAborted"));
+
+    await cancelP;
+    expect(cancelResolved).toBe(true);
+    // The stale blanket kill happened strictly BEFORE cancel's own sweep — so a
+    // cold boot started after `await cancel()` can never be hit by it.
+    expect(order).toEqual(["abandoned-boot-terminal-killAll", "cancel-kill"]);
+    expect(ws.state()).toBe("idle");
+  });
+
+  it("cancel() of a 'ready' (already-resolved) warm boot settles without waiting", async () => {
+    const kill = vi.fn(async () => {});
+    const { ws } = makeStandby({
+      boot: async () => ({ host: "h", port: 1, wsPath: "/w" }),
+      kill,
+    });
+    ws.kick("emery");
+    await new Promise((r) => setTimeout(r, 0)); // reach 'ready'
+    expect(ws.state()).toBe("ready");
+    await ws.cancel(); // resolved promise → unwind-await is instant
+    expect(kill).toHaveBeenCalledTimes(1);
     expect(ws.state()).toBe("idle");
   });
 
