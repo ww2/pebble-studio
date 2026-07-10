@@ -150,6 +150,28 @@ def main(sp):
          "'6080',",
          "'127.0.0.1:6080',",
          "'127.0.0.1:6080'"),
+        # Patch 17 — QEMU snapshot restore. When PEBBLE_QEMU_INCOMING is set (the
+        # full "file:C:/..." migration URI), append `-incoming <uri>` to the qemu
+        # argv so the guest boots by loading a saved VM migration stream instead of
+        # cold-booting. Studio sets this env for a SINGLE restore spawn only; when
+        # it is absent the block is inert, so every other path (cold boot, wipe)
+        # is unchanged. Appended last (just before env prep) so it is the final
+        # argv addition regardless of board.
+        ("emulator.py qemu incoming restore",
+         '        # Prepare environment with bundled dylibs for macOS\n'
+         '        env = os.environ.copy()',
+         '        # Pebble Studio (win port) patch 17: restore from a QEMU snapshot when\n'
+         '        # PEBBLE_QEMU_INCOMING is set (the full "file:C:/..." migration URI). Studio\n'
+         '        # sets it for a single restore spawn only; absent => a normal cold boot, so\n'
+         '        # this is inert on every other path (wipe, non-restore launches). Appended\n'
+         '        # last so the guest starts paused and loads the migration stream on launch.\n'
+         '        _incoming = os.environ.get("PEBBLE_QEMU_INCOMING")\n'
+         '        if _incoming:\n'
+         '            command.extend(["-incoming", _incoming])\n'
+         '\n'
+         '        # Prepare environment with bundled dylibs for macOS\n'
+         '        env = os.environ.copy()',
+         "PEBBLE_QEMU_INCOMING"),
     ])
 
     print(f"manager.py:")
