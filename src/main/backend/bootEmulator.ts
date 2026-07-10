@@ -67,6 +67,60 @@ export class BootAborted extends Error {
   }
 }
 
+/** Options for {@link pollUntil}. */
+export interface PollUntilOpts {
+  /** Overall deadline (ms). `fn` is always evaluated at least once, even at 0. */
+  timeoutMs: number;
+  /** Duration of the fast "hot" window measured from the first poll (default 1500ms). */
+  hotMs?: number;
+  /** Re-poll interval during the hot window (default 100ms). */
+  hotIntervalMs?: number;
+  /** Re-poll interval once past the hot window (default 300ms). */
+  intervalMs?: number;
+  /** Cancellation token; a cancel aborts the loop within one interval with BootAborted. */
+  token?: BootToken;
+  /** Message for the timeout Error thrown when the deadline elapses (default "timeout"). */
+  timeoutMessage?: string;
+}
+
+/**
+ * Poll `fn` on an ADAPTIVE cadence until it returns true, the timeout elapses, or
+ * the boot token is cancelled. For the first `hotMs` (1.5s) it re-checks every
+ * `hotIntervalMs` (100ms) so a readiness condition that becomes true early in a
+ * boot is observed up to ~100ms sooner than the old fixed 300ms cadence; after the
+ * hot window it settles to `intervalMs` (300ms) to keep steady-state polling cheap.
+ *
+ * Cancellation and the timeout are honored EXACTLY as the fixed-cadence loops this
+ * replaces: the token is re-checked before each `fn` call AND after each sleep (so
+ * a cancel aborts within one interval with BootAborted), and the deadline is
+ * checked only after a failed `fn` (so `fn` is always evaluated at least once, even
+ * at `timeoutMs: 0`). `fn` may be sync or async; a thrown error propagates.
+ */
+export async function pollUntil(
+  fn: () => boolean | Promise<boolean>,
+  opts: PollUntilOpts,
+): Promise<void> {
+  const {
+    timeoutMs,
+    hotMs = 1500,
+    hotIntervalMs = 100,
+    intervalMs = 300,
+    token,
+    timeoutMessage = "timeout",
+  } = opts;
+  const start = Date.now();
+  const deadline = start + timeoutMs;
+  for (;;) {
+    if (token?.cancelled) throw new BootAborted();
+    if (await fn()) return;
+    if (Date.now() > deadline) throw new Error(timeoutMessage);
+    // Hot for the first hotMs (measured from the first poll), then steady 300ms.
+    const interval = Date.now() - start < hotMs ? hotIntervalMs : intervalMs;
+    await new Promise((r) => setTimeout(r, interval));
+    if (token?.cancelled) throw new BootAborted();
+  }
+}
+
 /**
  * A point-in-time health snapshot of the emulator stack, used to annotate boot
  * progress so a stuck boot shows EXACTLY which component hasn't come up:
@@ -192,30 +246,30 @@ function shQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+/**
+ * Probe whether host:port is ACCEPTING connections. Resolves true on connect,
+ * false on a refused/errored/slow (1s) connect. The 1s socket timeout bounds each
+ * probe independently of the poll cadence. (Distinct from `defaultPortFree`, whose
+ * timeout means "occupied/unknown" — the opposite readiness question.)
+ */
+function probePortOpen(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = netConnect({ host, port });
+    sock.setTimeout(1000);
+    const no = () => { sock.destroy(); resolve(false); };
+    sock.once("connect", () => { sock.destroy(); resolve(true); });
+    sock.once("error", no);
+    sock.once("timeout", no);
+  });
+}
+
 function defaultWaitForPort(host: string, port: number, timeoutMs: number, token?: BootToken): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  return new Promise((resolve, reject) => {
-    const attempt = () => {
-      // Bail before opening a fresh socket if the boot was cancelled.
-      if (token?.cancelled) { reject(new BootAborted()); return; }
-      const sock = netConnect({ host, port });
-      sock.setTimeout(1000);
-      const fail = () => {
-        sock.destroy();
-        if (token?.cancelled) reject(new BootAborted());
-        else if (Date.now() > deadline) reject(new Error(`timeout waiting for ${host}:${port}`));
-        // Re-check the token between retries so cancellation interrupts the loop
-        // within one poll interval (~300ms) rather than at the full timeout.
-        else setTimeout(() => {
-          if (token?.cancelled) reject(new BootAborted());
-          else attempt();
-        }, 300);
-      };
-      sock.once("connect", () => { sock.destroy(); resolve(); });
-      sock.once("error", fail);
-      sock.once("timeout", fail);
-    };
-    attempt();
+  // Adaptive cadence (100ms hot for 1.5s, then 300ms) so a port that binds early
+  // in a boot is seen ~100ms sooner. Cancellation/timeout are honored by pollUntil.
+  return pollUntil(() => probePortOpen(host, port), {
+    timeoutMs,
+    token,
+    timeoutMessage: `timeout waiting for ${host}:${port}`,
   });
 }
 
@@ -225,10 +279,10 @@ function defaultWaitForPort(host: string, port: number, timeoutMs: number, token
  * the WSL filesystem and Node (running on Windows) cannot read that POSIX path.
  */
 function makeWaitForEmuInfo(shell: Shell) {
-  return async function waitForEmuInfo(id: PlatformId, timeoutMs: number, token?: BootToken): Promise<void> {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      if (token?.cancelled) throw new BootAborted();
+  return function waitForEmuInfo(id: PlatformId, timeoutMs: number, token?: BootToken): Promise<void> {
+    // Adaptive cadence (100ms hot for 1.5s, then 300ms) via pollUntil, which also
+    // honors the token (abort within one interval) and the per-attempt timeout.
+    return pollUntil(async () => {
       const { code, stdout } = await shell.run(`cat ${EMU_INFO_PATH} 2>/dev/null`);
       if (code === 0 && stdout.trim()) {
         try {
@@ -236,19 +290,15 @@ function makeWaitForEmuInfo(shell: Shell) {
           const versions = json[id];
           if (versions) {
             for (const v of Object.values(versions)) {
-              if (v?.qemu?.pid) return;
+              if (v?.qemu?.pid) return true;
             }
           }
         } catch {
           /* partial write; retry */
         }
       }
-      if (Date.now() > deadline) throw new Error(`timeout waiting for emulator info for ${id}`);
-      // Re-check the token after the poll delay so an in-flight cancel aborts the
-      // loop within ~300ms rather than waiting out the full timeout.
-      await new Promise((r) => setTimeout(r, 300));
-      if (token?.cancelled) throw new BootAborted();
-    }
+      return false;
+    }, { timeoutMs, token, timeoutMessage: `timeout waiting for emulator info for ${id}` });
   };
 }
 

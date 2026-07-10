@@ -59,7 +59,7 @@ vi.mock("node:net", () => ({
 }));
 
 // Import AFTER the mock is registered (vi.mock is hoisted, so this is fine).
-const { bootEmulator, BootAborted, makeWslBootDeps, makeNativeBootDeps, waitUntilDead, makeDiagnose, fmtProbe, extractBootErrors } = await import(
+const { bootEmulator, BootAborted, makeWslBootDeps, makeNativeBootDeps, waitUntilDead, makeDiagnose, fmtProbe, extractBootErrors, pollUntil } = await import(
   "../../src/main/backend/bootEmulator.js"
 );
 // timeShim holds the module-level shim-readiness cache that bootControl consults;
@@ -309,6 +309,86 @@ describe("bootEmulator cancellation", () => {
     ).rejects.toBeInstanceOf(BootAborted);
     // Bails before doing any teardown work.
     expect(killAll).not.toHaveBeenCalled();
+  });
+});
+
+describe("pollUntil (adaptive readiness cadence)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("detects a condition true at t=150ms by ~200ms (hot 100ms cadence, not 300ms)", async () => {
+    vi.useFakeTimers();
+    const t0 = Date.now();
+    const checkedAt: number[] = [];
+    let ready = false;
+    const p = pollUntil(
+      () => { checkedAt.push(Date.now() - t0); return ready; },
+      { timeoutMs: 60_000 },
+    );
+    // Hot phase: checks fire at t=0 and t=100 (both false).
+    await vi.advanceTimersByTimeAsync(120);
+    expect(checkedAt).toEqual([0, 100]);
+    // Condition becomes true at ~t=150; the NEXT hot check (t=200) sees it — a
+    // fixed 300ms cadence would not check until t=300, so this is ~100ms sooner.
+    ready = true;
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(p).resolves.toBeUndefined();
+    expect(checkedAt).toEqual([0, 100, 200]);
+  });
+
+  it("drops from the 100ms hot cadence to 300ms after 1.5s", async () => {
+    vi.useFakeTimers();
+    const t0 = Date.now();
+    const checkedAt: number[] = [];
+    const p = pollUntil(
+      () => { checkedAt.push(Date.now() - t0); return false; },
+      { timeoutMs: 2_000 },
+    );
+    const assertion = expect(p).rejects.toThrow(/timeout/i);
+    await vi.advanceTimersByTimeAsync(2_150);
+    await assertion;
+    const diffs = checkedAt.slice(1).map((v, i) => v - checkedAt[i]);
+    // Every gap taken while elapsed < 1500ms is the 100ms hot interval…
+    for (let i = 0; i < checkedAt.length - 1; i++) {
+      expect(diffs[i]).toBe(checkedAt[i] < 1500 ? 100 : 300);
+    }
+    // …and the cadence really did reach the 300ms steady state.
+    expect(diffs.some((d) => d === 300)).toBe(true);
+  });
+
+  it("honors a custom timeoutMessage when the deadline elapses", async () => {
+    vi.useFakeTimers();
+    const p = pollUntil(() => false, { timeoutMs: 1_000, timeoutMessage: "no soup for you" });
+    const assertion = expect(p).rejects.toThrow("no soup for you");
+    await vi.advanceTimersByTimeAsync(1_200);
+    await assertion;
+  });
+
+  it("evaluates fn at least once even when timeoutMs is already 0-ish", async () => {
+    let calls = 0;
+    // Real timers here: with timeoutMs≈0 the very first fn call satisfies it.
+    await expect(pollUntil(() => { calls += 1; return true; }, { timeoutMs: 0 })).resolves.toBeUndefined();
+    expect(calls).toBe(1);
+  });
+
+  it("aborts within one interval with BootAborted when the token flips mid-wait", async () => {
+    vi.useFakeTimers();
+    const token = { cancelled: false };
+    const p = pollUntil(() => false, { timeoutMs: 60_000, token });
+    const assertion = expect(p).rejects.toBeInstanceOf(BootAborted);
+    await vi.advanceTimersByTimeAsync(250); // a couple of hot polls, still running
+    token.cancelled = true;
+    await vi.advanceTimersByTimeAsync(150); // next poll observes the cancel
+    await assertion;
+  });
+
+  it("throws BootAborted immediately if the token is already cancelled at entry", async () => {
+    let calls = 0;
+    await expect(
+      pollUntil(() => { calls += 1; return true; }, { timeoutMs: 60_000, token: { cancelled: true } }),
+    ).rejects.toBeInstanceOf(BootAborted);
+    expect(calls).toBe(0); // bailed before evaluating fn
   });
 });
 

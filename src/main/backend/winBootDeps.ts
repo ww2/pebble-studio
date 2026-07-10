@@ -1,6 +1,6 @@
 import type { PlatformId } from "../../shared/types.js";
 import type { BootToken, SpawnDeps, BootProbe } from "./bootEmulator.js";
-import { BootAborted } from "./bootEmulator.js";
+import { pollUntil } from "./bootEmulator.js";
 import { winHostPaths } from "./hostPaths.js";
 import { tasklistArgs, tasklistPidArgs, parseTasklistPids, parseTasklistImage, parseStatePids } from "./winProc.js";
 import { VNC_RFB_PORT, WS_PORT } from "./ports.js";
@@ -263,30 +263,21 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps & { reap: () =
     return { qemuAlive: qpids.length > 0, stateFile: stateRaw.trim().length > 0, rfbOpen, wsOpen };
   };
 
-  const waitForEmuInfo = async (id: PlatformId, timeoutMs: number, token?: BootToken): Promise<void> => {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      if (token?.cancelled) throw new BootAborted();
+  // Both readiness gates share the adaptive cadence (100ms hot for 1.5s, then
+  // 300ms) via pollUntil, which also honors the token (abort within one interval)
+  // and the per-attempt timeout — identical semantics to the old fixed-300ms loops.
+  const waitForEmuInfo = (id: PlatformId, timeoutMs: number, token?: BootToken): Promise<void> =>
+    pollUntil(async () => {
       const raw = await readFile(paths.emuInfo);
-      if (raw.trim() && stateHasLivePid(raw, id)) return;
-      if (Date.now() > deadline) throw new Error(`timeout waiting for emulator info for ${id}`);
-      await new Promise((r) => setTimeout(r, 300));
-      if (token?.cancelled) throw new BootAborted();
-    }
-  };
+      return raw.trim().length > 0 && stateHasLivePid(raw, id);
+    }, { timeoutMs, token, timeoutMessage: `timeout waiting for emulator info for ${id}` });
 
-  const waitForPort = (host: string, port: number, timeoutMs: number, token?: BootToken): Promise<void> => {
-    const deadline = Date.now() + timeoutMs;
-    return new Promise((resolve, reject) => {
-      const attempt = async () => {
-        if (token?.cancelled) return reject(new BootAborted());
-        if (await checkPortOpen(host, port)) return resolve();
-        if (Date.now() > deadline) return reject(new Error(`timeout waiting for ${host}:${port}`));
-        setTimeout(() => { void attempt().catch(reject); }, 300);
-      };
-      void attempt().catch(reject);
+  const waitForPort = (host: string, port: number, timeoutMs: number, token?: BootToken): Promise<void> =>
+    pollUntil(() => checkPortOpen(host, port), {
+      timeoutMs,
+      token,
+      timeoutMessage: `timeout waiting for ${host}:${port}`,
     });
-  };
 
   const isEmuImage = (image: string): boolean =>
     (EMU_IMAGES as readonly string[]).includes(image);
