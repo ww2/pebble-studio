@@ -73,6 +73,9 @@ interface StudioApi {
   // v1.0.0: app version + application-menu action subscription.
   appVersion(): Promise<string>;
   onMenu(cb: (action: string) => void): () => void;
+  // Task 11: language packs (native-Windows). Typed against the panel's seam so
+  // the renderer interface and the LanguagePanel never drift.
+  lang: import("./components/LanguagePanel.js").LangApiLike;
 }
 
 declare global {
@@ -149,6 +152,10 @@ window.addEventListener("pebble-studio:time-changed", (e) => {
 // morphs to the new chrome; in auto mode it boots.
 function selectPlatform(id: PlatformId): void {
   switcher.value = id; // no-op set when the combo originated the change
+  // Board-specific panes (Language) reload for the new board on this signal. The
+  // top combo doesn't otherwise notify Settings (its sections are board-agnostic
+  // except Language), so broadcast it here.
+  window.dispatchEvent(new Event("pebble-studio:board-changed"));
   void view.show(id, { boot: bootMode === "auto" });
 }
 
@@ -202,6 +209,8 @@ const settings = new SettingsPane(themeMode, initialPlatform, (id: PlatformId) =
   // tears it down, so relaunch it here to pick up the new SDK automatically.
   isEmuLive: () => view.isLive(),
   onSdkRelaunch: () => view.relaunch(),
+  // Task 11: the Language section scopes pack calls to the live board.
+  getBoard: () => switcher.value,
 });
 
 // Command bar: version switcher (Fluent combobox) controls the persistent

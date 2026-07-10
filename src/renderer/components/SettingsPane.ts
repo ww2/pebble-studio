@@ -24,6 +24,7 @@ import {
   type SimEnvConfig, type ConditionKey,
 } from "../../shared/simEnv.js";
 import { LIVE_SUNLIGHT_KEY, LIVE_SUNLIGHT_EVENT } from "../liveSunlight.js";
+import { LanguagePanel } from "./LanguagePanel.js";
 
 type ThemeChoice = "light" | "dark";
 type BootMode = "auto" | "manual";
@@ -58,6 +59,10 @@ interface SettingsOptions {
    * picked up). The backend tears the emulator down during the swap; this brings
    * it back on the newly-active SDK. */
   onSdkRelaunch?: () => void | Promise<void>;
+  /** The live board id (Task 11) — the Language section scopes every pack call to
+   * it. Provided by main.ts as `() => switcher.value`. When absent the Language
+   * section is omitted (no board context to act on). */
+  getBoard?: () => string;
 }
 
 const CAPTURE_DIR_KEY = "pebble-studio:capture-dir";
@@ -242,6 +247,8 @@ export class SettingsPane {
   private readonly onSdkRelaunch?: () => void | Promise<void>;
   private readonly onWeatherRefreshBegin?: () => void;
   private readonly onWeatherRefreshEnd?: () => void;
+  /** Board-scoped Language section (Task 11); undefined when no board getter. */
+  private readonly languagePanel?: LanguagePanel;
 
   /** Current keybindings (Keyboard section); reloaded on reset/rebind. */
   private bindings: Bindings;
@@ -1232,7 +1239,21 @@ export class SettingsPane {
     sdk.append(sdkHeader, sdkRow, sdkBtns, this.sdkStatus);
     void this.refreshSdkInfo();
 
-    this.el.append(appearance, watch, time, battery, sim, health, capture, sdk, keyboard, advanced);
+    // ── Language section (Task 11) ────────────────────────────────────────
+    // Board-specific (unlike the other sections), so it's its own component: it
+    // reloads for the live board on `pebble-studio:board-changed` and refreshes
+    // the active language on Live (`pebble-studio:apps-changed`). Omitted when no
+    // board getter was injected (no board context to act on).
+    this.languagePanel = options.getBoard
+      ? new LanguagePanel(options.getBoard)
+      : undefined;
+    const language = this.languagePanel?.el;
+
+    this.el.append(
+      appearance, watch, time, battery, sim,
+      ...(language ? [language] : []),
+      health, capture, sdk, keyboard, advanced,
+    );
 
     this.syncSwitch();
     this.syncBootSwitch();
