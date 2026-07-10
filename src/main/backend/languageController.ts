@@ -27,6 +27,7 @@ import { win32 as winPath } from "node:path";
 import { readFile, writeFile, copyFile, mkdir, stat, rename } from "node:fs/promises";
 import type { RunResult } from "./BackendDriver.js";
 import { spawnRunner } from "./spawnRunner.js";
+import { isPathInside } from "./sdkController.js";
 
 /** Boards Rebble publishes language packs for → their catalog `hw` code. Boards
  * absent here (emery/gabbro/flint) are sideload-only: fetchCatalog returns empty
@@ -348,7 +349,16 @@ export function makeLanguageController(deps: LanguageControllerDeps): LanguageCo
    * by the size>0 skip — every later install would push garbage to the watch and
    * surface the misleading NACK firmware/flash hint, with no way to re-fetch. */
   async function resolveLocalPack(board: string, pack: PackRef): Promise<string> {
-    if (pack.source === "sideload") return pack.path;
+    if (pack.source === "sideload") {
+      // A sideload ref must point inside the app's own lang-packs store (where
+      // `sideload()` copied it). The ref crosses the IPC boundary, so a
+      // compromised renderer could otherwise name any file on disk and have it
+      // pushed to the emulator. Same boundary-validation posture as sim:set.
+      if (!isPathInside(langPacksDir, pack.path)) {
+        throw new Error("That language pack isn't in Pebble Studio's store — sideload it again.");
+      }
+      return pack.path;
+    }
     const { entry } = pack;
     const boardDir = winPath.join(langPacksDir, board);
     const dst = winPath.join(boardDir, baseName(entry.file));
@@ -359,8 +369,15 @@ export function makeLanguageController(deps: LanguageControllerDeps): LanguageCo
       const cached = await fs.readFile(dst).catch(() => null);
       if (cached && validatePbpackHeader(cached)) return dst;
     }
-    const url = /^https?:\/\//i.test(entry.file) ? entry.file : new URL(entry.file, REBBLE_ORIGIN).toString();
-    const res = await withTimeout((signal) => doFetch(url, { signal }), HTTP_TIMEOUT_MS);
+    // Catalog entries download ONLY from the Rebble catalog host over HTTPS.
+    // `entry.file` also crosses the IPC boundary, so pin the resolved URL rather
+    // than trusting the renderer (blocks SSRF to arbitrary hosts and plaintext
+    // downgrade; relative files resolve against REBBLE_ORIGIN and pass).
+    const url = new URL(entry.file, REBBLE_ORIGIN);
+    if (url.protocol !== "https:" || url.host !== new URL(REBBLE_ORIGIN).host) {
+      throw new Error("Language packs can only be downloaded from the official catalog.");
+    }
+    const res = await withTimeout((signal) => doFetch(url.toString(), { signal }), HTTP_TIMEOUT_MS);
     if (!res.ok) throw new Error(`Couldn't download the language pack (HTTP ${res.status}).`);
     const bytes = Buffer.from(await res.arrayBuffer());
     if (!validatePbpackHeader(bytes)) {

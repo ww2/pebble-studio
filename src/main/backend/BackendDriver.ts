@@ -16,6 +16,11 @@ export interface BackendDriver {
    * a label before each major boot step (for diagnostic boot notes). */
   start(id: PlatformId, token?: BootToken, onStep?: OnStep): Promise<VncEndpoint>;
   stop(): Promise<void>;
+  /** Quit-path stop: skip the graceful `pebble kill` nicety and dispatch the
+   * direct force-kill sweep immediately, so the kills land inside before-quit's
+   * bounded window even when process enumeration is slow under load. Optional:
+   * callers fall back to stop(). */
+  stopFast?(): Promise<void>;
   /** Reap orphaned emulator processes left by a prior session (crash / "End
    * process" / a failed teardown). Called once at startup before the first boot.
    * Optional: only the windows-native driver implements it. */

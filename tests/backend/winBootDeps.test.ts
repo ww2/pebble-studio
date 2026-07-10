@@ -207,6 +207,40 @@ describe("makeWinBootDeps killAll — process-leak fix", () => {
     expect(rm).toHaveBeenCalled();
   });
 
+  it("keeps the state file (and kills nothing) when verification is INDETERMINATE — wedged tasklist", async () => {
+    // imageOfPid → null means tasklist itself hung/errored: the pid may still be
+    // a live orphan of ours. The old code treated this like "definitively not
+    // ours" and dropped the state file — erasing the orphan's only record while
+    // killing nothing. Now: don't kill (unverified), but DON'T forget either.
+    const state = JSON.stringify({ emery: { "4.9": { pypkjs: { pid: 7001 } } } });
+    const rm = vi.fn(async () => {});
+    const d = deps({
+      readFile: vi.fn(async () => state),
+      pidsByImage: vi.fn(async () => [] as number[]), // enumeration also degraded
+      imageOfPid: vi.fn(async (_pid: number) => null), // ← indeterminate
+      rm,
+      portOpen: vi.fn(async () => false),
+    });
+    await makeWinBootDeps(d).killAll();
+    expect(d.killPid).not.toHaveBeenCalledWith(7001); // unverified — never kill
+    expect(rm).not.toHaveBeenCalled(); // the state file is the orphan's only record
+  });
+
+  it("startup reap also keeps the state file on an indeterminate sweep", async () => {
+    const state = JSON.stringify({ emery: { "4.9": { qemu: { pid: 7002 } } } });
+    const rm = vi.fn(async () => {});
+    const d = deps({
+      readFile: vi.fn(async () => state),
+      pidsByImage: vi.fn(async () => [] as number[]),
+      imageOfPid: vi.fn(async (_pid: number) => null),
+      rm,
+      portOpen: vi.fn(async () => false),
+    });
+    await makeWinBootDeps(d).reap();
+    expect(d.killPid).not.toHaveBeenCalledWith(7002);
+    expect(rm).not.toHaveBeenCalled();
+  });
+
   it("DOES kill a state-file pid whose image IS ours (verified)", async () => {
     const state = JSON.stringify({ emery: { "4.9": { pypkjs: { pid: 6001 } } } });
     const d = deps({

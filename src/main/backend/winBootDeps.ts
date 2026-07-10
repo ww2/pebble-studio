@@ -29,25 +29,28 @@ export interface TasklistDeps {
 
 /**
  * Run one `tasklist` query to completion and resolve its raw stdout, BOUNDED by a
- * timeout so a hung tasklist can never wedge the caller. On timeout the child is
- * killed best-effort and "" is returned. Pure-ish (spawn + timeout injectable).
+ * timeout so a hung tasklist can never wedge the caller. On timeout/spawn error
+ * the child is killed best-effort and NULL is returned — distinct from "" so
+ * callers can tell "tasklist wedged, answer unknown" apart from a real empty
+ * result (killSweep must not drop the state file on an unknown). Pure-ish
+ * (spawn + timeout injectable).
  */
-function tasklistStdout(args: string[], deps: TasklistDeps = {}): Promise<string> {
+function tasklistStdout(args: string[], deps: TasklistDeps = {}): Promise<string | null> {
   const doSpawn = deps.spawn ?? ((c, a) => spawn(c, a, { windowsHide: true }) as unknown as ChildLike);
   const timeoutMs = deps.timeoutMs ?? TASKLIST_TIMEOUT_MS;
-  return new Promise<string>((resolve) => {
+  return new Promise<string | null>((resolve) => {
     let out = "";
     let done = false;
     const child = doSpawn("tasklist", args);
-    const finish = (s: string): void => {
+    const finish = (s: string | null): void => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       resolve(s);
     };
-    const timer = setTimeout(() => { try { child.kill(); } catch { /* ignore */ } finish(""); }, timeoutMs);
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* ignore */ } finish(null); }, timeoutMs);
     child.stdout?.on("data", (d) => { out += d.toString(); });
-    child.on("error", () => finish(""));
+    child.on("error", () => finish(null));
     child.on("close", () => finish(out));
   });
 }
@@ -58,16 +61,20 @@ function tasklistStdout(args: string[], deps: TasklistDeps = {}): Promise<string
  * best-effort and [] is returned. Pure-ish (spawn + timeout injectable for tests).
  */
 export async function tasklistPids(image: string, deps: TasklistDeps = {}): Promise<number[]> {
-  return parseTasklistPids(await tasklistStdout(tasklistArgs(image), deps));
+  return parseTasklistPids((await tasklistStdout(tasklistArgs(image), deps)) ?? "");
 }
 
 /**
  * Resolve ONE pid's image name via `tasklist /FI "PID eq <pid>"`, BOUNDED like
- * tasklistPids. Returns "" if the pid no longer exists or tasklist hangs/errors.
- * Used to VERIFY a state-file pid is one of ours before force-killing it.
+ * tasklistPids. Returns "" when the pid no longer exists (a definitive answer:
+ * tasklist ran and printed its "No tasks…" banner), and NULL when tasklist
+ * hung/errored (indeterminate — the pid may still be alive). Used to VERIFY a
+ * state-file pid is one of ours before force-killing it; killSweep keeps the
+ * state file when a verification came back null.
  */
-export async function tasklistImage(pid: number, deps: TasklistDeps = {}): Promise<string> {
-  return parseTasklistImage(await tasklistStdout(tasklistPidArgs(pid), deps));
+export async function tasklistImage(pid: number, deps: TasklistDeps = {}): Promise<string | null> {
+  const out = await tasklistStdout(tasklistPidArgs(pid), deps);
+  return out === null ? null : parseTasklistImage(out);
 }
 /** Max wait for the graceful `pebble kill` (bundled-interpreter spawn) before we
  * stop awaiting it and move on to the direct force-kill. Keeps a hung interpreter
@@ -146,7 +153,7 @@ export interface WinBootDepsImpl {
    * aggressively, so a stale entry can name an unrelated same-user process — which
    * we must NOT TerminateProcess. Injected for tests. Default = bounded tasklist.
    */
-  imageOfPid?: (pid: number) => Promise<string>;
+  imageOfPid?: (pid: number) => Promise<string | null>;
   /**
    * Last-modified time (ms since epoch) of a file, or 0 if missing/unreadable.
    * Used to decide whether the emu-control boot log is stale (older than the
@@ -246,7 +253,8 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps & { reap: () =
   // teardown / the startup reap / backend:init — the v3.0.4-test1 regression).
   const pidsByImage = impl.pidsByImage ?? ((image: string): Promise<number[]> => tasklistPids(image));
   // Default pid→image resolution = BOUNDED tasklist by PID (same wedge guard).
-  const imageOfPid = impl.imageOfPid ?? ((pid: number): Promise<string> => tasklistImage(pid));
+  // Resolves null when tasklist itself wedged (indeterminate ≠ "pid gone").
+  const imageOfPid = impl.imageOfPid ?? ((pid: number): Promise<string | null> => tasklistImage(pid));
   // Default mtime probe = fs.stat; missing/unreadable → 0 so a nonexistent log
   // reads as "infinitely stale" and readBootLog returns "" (never mines it).
   const statMtimeMs = impl.statMtimeMs ?? (async (p: string): Promise<number> => fsStat(p).then((s) => s.mtimeMs).catch(() => 0));
@@ -299,10 +307,14 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps & { reap: () =
    * an unrelated same-user process. We therefore VERIFY each state pid's image is
    * one of ours before killing it (image-enumerated pids are already verified and
    * skip the second check), and never signal our own process. If EVERY state pid
-   * fails verification the file is stale — drop it. Returns the count killed so the
-   * caller can tell whether anything of ours was still there.
+   * DEFINITIVELY fails verification the file is stale — drop it; but when a
+   * verification is INDETERMINATE (tasklist itself wedged, imageOfPid → null) the
+   * pid may still be a live orphan of ours, so the file is KEPT for a later sweep
+   * — dropping it would erase the orphan's only record while killing nothing.
+   * Returns the count killed (so callers can tell whether anything of ours was
+   * still there) plus the indeterminate flag (so reap keeps the state file too).
    */
-  const killSweep = async (): Promise<number> => {
+  const killSweep = async (): Promise<{ killed: number; indeterminate: boolean }> => {
     const fromState = parseStatePids(await readFile(paths.emuInfo));
     // Enumerate images CONCURRENTLY, but keep EMU_IMAGES order (supervisor before
     // qemu) so the kill loop below still fires supervisor-first — a killed qemu
@@ -313,16 +325,21 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps & { reap: () =
 
     // Verify each state pid before trusting it.
     const stateVerified: number[] = [];
+    let indeterminate = false;
     for (const pid of fromState) {
       if (pid === process.pid) continue; // never TerminateProcess ourselves
-      if (imageSet.has(pid) || isEmuImage(await imageOfPid(pid))) stateVerified.push(pid);
+      if (imageSet.has(pid)) { stateVerified.push(pid); continue; }
+      const image = await imageOfPid(pid);
+      if (image === null) { indeterminate = true; continue; } // unknown — don't kill, don't forget
+      if (isEmuImage(image)) stateVerified.push(pid);
     }
     // Stale state file: it named pids but NONE are ours (post-reboot pid reuse).
-    if (fromState.length > 0 && stateVerified.length === 0) await rm(paths.emuInfo);
+    // Only when every verdict was definitive — an indeterminate pass keeps it.
+    if (fromState.length > 0 && stateVerified.length === 0 && !indeterminate) await rm(paths.emuInfo);
 
     const pids = [...new Set([...fromImage, ...stateVerified])].filter((p) => p !== process.pid);
     for (const pid of pids) await killPid(pid);
-    return pids.length;
+    return { killed: pids.length, indeterminate };
   };
 
   /**
@@ -343,7 +360,7 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps & { reap: () =
       // If a sweep found NOTHING of ours yet a port is still held, the owner is a
       // FOREIGN process (e.g. a WSL Pebble emulator that mirrors localhost) — we
       // can't free it, so don't burn the full settle budget polling next to it.
-      if ((await killSweep()) === 0) return;
+      if ((await killSweep()).killed === 0) return;
       await new Promise((r) => setTimeout(r, 200));
     }
   };
@@ -356,8 +373,10 @@ export function makeWinBootDeps(impl: WinBootDepsImpl): SpawnDeps & { reap: () =
    * legitimate emulator yet, so the image-wide kill can only hit orphans.
    */
   const reap = async (): Promise<void> => {
-    await killSweep();
-    await rm(paths.emuInfo);
+    const { indeterminate } = await killSweep();
+    // Keep the state file when the sweep couldn't verify its pids (wedged
+    // tasklist): they may be live orphans and the file is their only record.
+    if (!indeterminate) await rm(paths.emuInfo);
     await settleKilled();
   };
 

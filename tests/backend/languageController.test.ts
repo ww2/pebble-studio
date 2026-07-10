@@ -315,6 +315,61 @@ describe("installPack", () => {
 });
 
 // ---------------------------------------------------------------------------
+// installPack — IPC-boundary validation. A PackRef crosses from the renderer,
+// so a compromised renderer could name any URL / any local file; the controller
+// must pin catalog downloads to the official HTTPS origin and confine sideload
+// paths to its own store.
+// ---------------------------------------------------------------------------
+describe("installPack — untrusted PackRef validation", () => {
+  const okLine = JSON.stringify({ ok: true, language: "de_DE", languageVersion: 38 });
+  const okSpawn = () => vi.fn(async (): Promise<RunResult> => ({ code: 0, stdout: okLine, stderr: "" }));
+
+  it("rejects a catalog entry pointing at a foreign host — no fetch, no helper spawn", async () => {
+    const fetchFn = vi.fn<FetchFn>();
+    const spawn = okSpawn();
+    const { ctl } = make({ fetchFn, spawn: spawn as unknown as LanguageControllerDeps["spawn"] });
+    const evil = { source: "catalog" as const, entry: { isoLocal: "de_DE", name: "x", localName: "x", version: 1, file: "https://evil.example.com/de.pbl" } };
+    await expect(ctl.installPack("basalt", evil)).rejects.toThrow(/official catalog/);
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("rejects a plaintext http:// catalog URL (downgrade), even on the official host", async () => {
+    const fetchFn = vi.fn<FetchFn>();
+    const { ctl } = make({ fetchFn });
+    const http = { source: "catalog" as const, entry: { isoLocal: "de_DE", name: "x", localName: "x", version: 1, file: "http://lp.rebble.io/de.pbl" } };
+    await expect(ctl.installPack("basalt", http)).rejects.toThrow(/official catalog/);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("accepts a RELATIVE catalog file (resolved against the official origin)", async () => {
+    const fetchFn = vi.fn<FetchFn>(async () => bytesResponse(Buffer.from([0x13, 0, 0, 0, 9, 9, 9, 9])));
+    const spawn = okSpawn();
+    const { ctl } = make({ fetchFn, spawn: spawn as unknown as LanguageControllerDeps["spawn"] });
+    const rel = { source: "catalog" as const, entry: { isoLocal: "de_DE", name: "x", localName: "x", version: 1, file: "packs/de.pbl" } };
+    const r = await ctl.installPack("basalt", rel);
+    expect(r.language).toBe("de_DE");
+    expect(fetchFn).toHaveBeenCalledWith("https://lp.rebble.io/packs/de.pbl", expect.anything());
+  });
+
+  it("rejects a sideload ref outside the lang-packs store — no helper spawn", async () => {
+    const spawn = okSpawn();
+    const { ctl } = make({ spawn: spawn as unknown as LanguageControllerDeps["spawn"] });
+    const outside = { source: "sideload" as const, path: "C:\\Windows\\System32\\config\\SAM", fileName: "SAM" };
+    await expect(ctl.installPack("basalt", outside)).rejects.toThrow(/store/);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("accepts a sideload ref inside the store (the path sideload() itself returns)", async () => {
+    const spawn = okSpawn();
+    const { ctl } = make({ spawn: spawn as unknown as LanguageControllerDeps["spawn"] });
+    const inside = { source: "sideload" as const, path: winPath.join(USER, "lang-packs", "x.pbl"), fileName: "x.pbl" };
+    const r = await ctl.installPack("basalt", inside);
+    expect(r.language).toBe("de_DE");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // selection persistence
 // ---------------------------------------------------------------------------
 describe("selection / setSelection", () => {

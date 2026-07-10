@@ -59,6 +59,23 @@ let currentPlatform: PlatformId | null = null;
 let currentBootToken: BootToken | null = null;
 
 /**
+ * The in-flight boot's promise (cold `emu:start` or warm-standby pre-boot).
+ * teardownEmulator awaits it (post-kill, token already cancelled → it unwinds
+ * promptly via BootAborted) so a boot past its last token checkpoint can't spawn
+ * a fresh stack AFTER the teardown sweep and leak it. Cleared when it settles.
+ */
+let currentBootPromise: Promise<unknown> | null = null;
+
+/**
+ * Latched by the app-quit teardown. `emu:start` refuses to boot once set: a quit
+ * that lands while a warm pre-boot is being claimed used to reject the claim and
+ * FALL THROUGH to a fresh cold boot with a brand-new (uncancelled) token —
+ * spawning a whole emulator stack after the quit sweep, orphaned when the app
+ * exited moments later.
+ */
+let quitting = false;
+
+/**
  * Pending fire-and-forget QEMU snapshot-creation timer (Tasks 6+7). Armed ~8s
  * after a cold boot reaches Live so post-live injections settle first; cleared on
  * teardown so a stop cancels a not-yet-fired creation. Only ever holds ONE timer.
@@ -273,8 +290,14 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
    * Shared by `emu:stop` and the app-quit handler (index.ts before-quit). Safe to
    * call when nothing is running: the timers no-op and `driver?.stop()` skips.
    * Never throws — a teardown error must not block app exit.
+   *
+   * `quit`: the app is exiting under before-quit's bounded deadline, so latch the
+   * boot refusal and use the driver's stopFast (direct kill sweep, no liveness
+   * probe / graceful `pebble kill` first — under load those steps could eat the
+   * whole deadline and the force-kill would never dispatch, orphaning the stack).
    */
-  const teardownEmulator = async (): Promise<void> => {
+  const teardownEmulator = async (opts?: { quit?: boolean }): Promise<void> => {
+    if (opts?.quit) quitting = true;
     emuLive = false;
     stopAppLog();
     backlight.stop();
@@ -293,7 +316,16 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     // repopulated by the renderer's libInstallAll on the next boot. (Apps stay
     // on disk; this tracks what's loaded on a LIVE watch, which is now none.)
     loaded.clear();
-    try { await driver?.stop(); } catch { /* may already be stopped */ }
+    try {
+      if (opts?.quit && driver?.stopFast) await driver.stopFast();
+      else await driver?.stop();
+    } catch { /* may already be stopped */ }
+    // Wait for an in-flight boot to fully unwind (mirrors warmStandby.cancel()):
+    // the token is cancelled and the stack just got swept, so this resolves
+    // promptly via BootAborted — but a boot past its last token checkpoint could
+    // otherwise spawn AFTER the sweep and leak. Its compensating killAll runs
+    // inside this await. (On the quit path the before-quit timer still bounds us.)
+    if (currentBootPromise) await currentBootPromise.catch(() => { /* BootAborted et al. */ });
   };
 
   /** Seconds ahead of the watch clock to place the demo pin (inside the peek window). */
@@ -352,9 +384,16 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
       // Same pre-boot prep as emu:start's cold path: deploy the time shim before
       // the emulator comes up (bootControl consults the shim-ready cache).
       await driver?.ensureTimeShim().catch(() => false);
-      return requireDriver().start(id, token, (msg) => {
+      // Tracked like emu:start's cold boot so teardownEmulator can await a warm
+      // pre-boot's unwind too (same late-spawn leak guard). An emu:start that
+      // claims this boot overwrites the tracker with its own promise, which
+      // awaits this one — the unwind is still covered transitively.
+      const p = requireDriver().start(id, token, (msg) => {
         getMainWindow()?.webContents.send("emu:boot-progress", msg);
       });
+      currentBootPromise = p;
+      void p.catch(() => {}).finally(() => { if (currentBootPromise === p) currentBootPromise = null; });
+      return p;
     },
     kill: async () => { try { await driver?.stop(); } catch { /* may already be stopped */ } },
     onError: (err) => console.error(`[warm] pre-boot failed: ${String(err)}`),
@@ -580,8 +619,9 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     // one-time-per-identity capture and never re-snapshots after a restore boot.
     if (!token.cancelled) scheduleSnapshotCreate(id, token);
   };
-  ipcMain.handle("emu:start", async (e, id: PlatformId) => {
+  const startEmu = async (e: IpcMainInvokeEvent, id: PlatformId): Promise<VncEndpoint> => {
     assertMainSender(e);
+    if (quitting) throw new Error("Pebble Studio is shutting down.");
     getPlatform(id); // reject an unknown/injected platform id before it reaches a bash -lc line
     currentPlatform = id; // remembered for clay:phonesimPort's state-file lookup
 
@@ -598,7 +638,12 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
         await runPostLive(id, adopted);
         return ep;
       } catch (err) {
-        // The pre-boot ultimately failed — fall through to a normal cold boot.
+        // A CANCELLED claim (quit/force-close raced the attach) must NOT fall
+        // through: the fallback cold boot would spawn a fresh stack with a brand-
+        // new token right after teardown's sweep — orphaned on quit, or booting
+        // the watch straight back up after a Force close.
+        if (quitting || adopted.cancelled) throw err;
+        // The pre-boot genuinely failed — fall through to a normal cold boot.
         console.error(`[warm] claimed pre-boot failed, falling back to a cold boot: ${String(err)}`);
       }
     } else {
@@ -609,6 +654,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     }
 
     // Cold boot. Fresh token per boot, stored as current so abort/stop can cancel it.
+    if (quitting) throw new Error("Pebble Studio is shutting down.");
     const token: BootToken = { cancelled: false };
     currentBootToken = token;
     // Forward each boot step to the renderer (diagnostic boot notes, Task J).
@@ -622,6 +668,15 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     const ep = await requireDriver().start(id, token, onStep);
     await runPostLive(id, token);
     return ep;
+  };
+  ipcMain.handle("emu:start", (e, id: PlatformId) => {
+    // Track the boot so teardownEmulator can await its full unwind (leak guard).
+    const p = startEmu(e, id);
+    currentBootPromise = p;
+    // Swallow here only for the tracker's sake; the returned `p` still carries
+    // the rejection to the renderer unchanged.
+    void p.catch(() => {}).finally(() => { if (currentBootPromise === p) currentBootPromise = null; });
+    return p;
   });
   ipcMain.handle("emu:abort", async () => {
     // Cancel any in-flight boot so its wait loops bail promptly. No-op (no throw)
@@ -983,5 +1038,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     return out;
   });
 
-  return { shutdown: teardownEmulator };
+  // The app-quit path latches the boot refusal and takes the driver's fast stop
+  // (direct kill sweep, no graceful nicety) — see teardownEmulator.
+  return { shutdown: () => teardownEmulator({ quit: true }) };
 }

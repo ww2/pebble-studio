@@ -340,4 +340,28 @@ describe("WindowsNativeDriver", () => {
     const d = new WindowsNativeDriver({ run, boot: async () => ep, stop: async () => {} });
     await expect(d.reap()).resolves.toBeUndefined();
   });
+
+  it("stopFast() kills the input helper and reaps DIRECTLY — no graceful stop first (quit path)", async () => {
+    // Quit runs under before-quit's bounded deadline: the graceful stop's
+    // liveness probe + `pebble kill` could eat the whole window, so stopFast
+    // must dispatch the force-kill sweep immediately instead.
+    const reap = vi.fn(async () => {});
+    const stop = vi.fn(async () => {});
+    const stopChannel = vi.fn();
+    const channel = { stop: stopChannel } as unknown as import("../../src/main/backend/winInputChannel.js").WinInputChannel;
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const d = new WindowsNativeDriver({ run, boot: async () => ep, stop, reap, inputChannel: channel });
+    await d.stopFast();
+    expect(stopChannel).toHaveBeenCalledOnce(); // helper never outlives the app
+    expect(reap).toHaveBeenCalledOnce();        // direct sweep dispatched
+    expect(stop).not.toHaveBeenCalled();        // graceful path skipped
+  });
+
+  it("stopFast() falls back to the normal stop when no reaper is wired", async () => {
+    const stop = vi.fn(async () => {});
+    const run = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const d = new WindowsNativeDriver({ run, boot: async () => ep, stop });
+    await d.stopFast();
+    expect(stop).toHaveBeenCalledOnce();
+  });
 });

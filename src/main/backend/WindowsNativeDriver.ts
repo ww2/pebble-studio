@@ -181,6 +181,18 @@ export class WindowsNativeDriver implements BackendDriver {
     return this.inner.stop();
   }
 
+  /** Quit-path stop. stop()'s killAll probes liveness and offers a graceful
+   * `pebble kill` BEFORE the force-kill — under load those bounded steps can add
+   * up past before-quit's exit deadline, so the first TerminateProcess would
+   * never dispatch and the stack would outlive the app (the historic orphan
+   * scenario). Skip the niceties and reap directly: kill sweep first, port
+   * settle after. Falls back to stop() when no reaper is wired. */
+  async stopFast(): Promise<void> {
+    this.deps.inputChannel?.stop();
+    if (this.deps.reap) await this.deps.reap();
+    else await this.inner.stop();
+  }
+
   /** Reap orphaned emulator processes left by a prior session (startup self-heal).
    * Delegates to the injected reaper; a no-op when none is wired. */
   async reap(): Promise<void> {
