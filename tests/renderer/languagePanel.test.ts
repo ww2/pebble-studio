@@ -4,7 +4,7 @@
 // suite stays on the default node env) so we can mount the real component and
 // mock the injected `window.studio.lang` surface. Covers the pure formatting
 // helpers plus the mounted install / sideload / note / in-flight behaviours.
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   LanguagePanel,
   sortedCatalogEntries,
@@ -104,13 +104,27 @@ const $ = (root: HTMLElement, sel: string): HTMLElement =>
   root.querySelector(sel) as HTMLElement;
 
 describe("LanguagePanel (mounted)", () => {
+  // Every case shares ONE jsdom window, so panels are disposed after each test —
+  // otherwise their window listeners (board-changed / apps-changed) pile up and
+  // earlier panels react to later tests' dispatches.
+  const mounted: LanguagePanel[] = [];
+  const mount = (getBoard: () => string, api: LangApiLike): LanguagePanel => {
+    const panel = new LanguagePanel(getBoard, api);
+    mounted.push(panel);
+    return panel;
+  };
+
   beforeEach(() => {
     document.body.replaceChildren();
   });
 
+  afterEach(() => {
+    for (const p of mounted.splice(0)) p.dispose();
+  });
+
   it("renders catalog entries in the dropdown, sorted by name", async () => {
     const api = makeApi();
-    const panel = new LanguagePanel(() => "basalt", api);
+    const panel = mount(() => "basalt", api);
     await panel.refresh();
     const opts = [...panel.el.querySelectorAll<HTMLOptionElement>("select.lang-select option")];
     expect(opts.map((o) => o.textContent)).toEqual([
@@ -124,7 +138,7 @@ describe("LanguagePanel (mounted)", () => {
       .mockResolvedValueOnce(null) // initial refresh
       .mockResolvedValue({ language: "fr_FR", languageVersion: 1 }); // after install
     const api = makeApi({ active });
-    const panel = new LanguagePanel(() => "basalt", api);
+    const panel = mount(() => "basalt", api);
     await panel.refresh();
 
     const select = $(panel.el, "select.lang-select") as HTMLSelectElement;
@@ -139,7 +153,7 @@ describe("LanguagePanel (mounted)", () => {
 
   it("shows the {error} string verbatim on a failed install", async () => {
     const api = makeApi({ install: vi.fn().mockResolvedValue({ error: "The watch rejected this pack." }) });
-    const panel = new LanguagePanel(() => "basalt", api);
+    const panel = mount(() => "basalt", api);
     await panel.refresh();
     ($(panel.el, "button.lang-install") as HTMLButtonElement).click();
     await panel.whenIdle();
@@ -149,7 +163,7 @@ describe("LanguagePanel (mounted)", () => {
 
   it("shows the sideload-only note (no dropdown) for a sideload-only board", async () => {
     const api = makeApi({ catalog: vi.fn().mockResolvedValue({ entries: [] }) });
-    const panel = new LanguagePanel(() => "emery", api);
+    const panel = mount(() => "emery", api);
     await panel.refresh();
     expect(panel.el.querySelector("select.lang-select")).toBeNull();
     expect($(panel.el, ".lang-note").textContent).toBe(
@@ -159,7 +173,7 @@ describe("LanguagePanel (mounted)", () => {
 
   it("shows the catalog-unavailable note", async () => {
     const api = makeApi({ catalog: vi.fn().mockResolvedValue({ entries: [], catalogUnavailable: true }) });
-    const panel = new LanguagePanel(() => "basalt", api);
+    const panel = mount(() => "basalt", api);
     await panel.refresh();
     expect($(panel.el, ".lang-note").textContent).toBe("Catalog unavailable — sideload still works");
   });
@@ -170,7 +184,7 @@ describe("LanguagePanel (mounted)", () => {
       release = () => r({ language: "fr_FR" });
     });
     const api = makeApi({ install: vi.fn().mockReturnValue(gate) });
-    const panel = new LanguagePanel(() => "basalt", api);
+    const panel = mount(() => "basalt", api);
     await panel.refresh();
 
     const installBtn = $(panel.el, "button.lang-install") as HTMLButtonElement;
@@ -188,7 +202,7 @@ describe("LanguagePanel (mounted)", () => {
 
   it("Reset to English installs the en_US entry when the catalog has it", async () => {
     const api = makeApi();
-    const panel = new LanguagePanel(() => "basalt", api);
+    const panel = mount(() => "basalt", api);
     await panel.refresh();
     ($(panel.el, "button.lang-reset") as HTMLButtonElement).click();
     await panel.whenIdle();
@@ -197,11 +211,92 @@ describe("LanguagePanel (mounted)", () => {
 
   it("Reset to English clears the selection when no en_US entry exists", async () => {
     const api = makeApi({ catalog: vi.fn().mockResolvedValue({ entries: [] }) });
-    const panel = new LanguagePanel(() => "emery", api);
+    const panel = mount(() => "emery", api);
     await panel.refresh();
     ($(panel.el, "button.lang-reset") as HTMLButtonElement).click();
     await panel.whenIdle();
     expect(api.setSelection).toHaveBeenCalledWith("emery", null);
     expect(api.install).not.toHaveBeenCalled();
+  });
+
+  // ── reactivity wiring (window events) ─────────────────────────────────────
+
+  it("reloads for the new board on pebble-studio:board-changed", async () => {
+    let board = "basalt";
+    const catalog = vi.fn(async (b: string) =>
+      b === "basalt" ? { entries: ENTRIES } : { entries: [] });
+    const api = makeApi({ catalog });
+    const panel = mount(() => board, api);
+    await panel.refresh();
+    expect(panel.el.querySelector("select.lang-select")).not.toBeNull();
+
+    board = "emery";
+    window.dispatchEvent(new Event("pebble-studio:board-changed"));
+    await panel.whenIdle();
+
+    expect(catalog).toHaveBeenCalledWith("emery");
+    expect(panel.el.querySelector("select.lang-select")).toBeNull();
+    expect($(panel.el, ".lang-note").textContent).toBe(
+      "No official packs for this board — sideload a .pbl instead",
+    );
+  });
+
+  it("refreshes the active line on pebble-studio:apps-changed (Live)", async () => {
+    let current: { language: string; languageVersion: number } | null = null;
+    const api = makeApi({ active: vi.fn(async () => current) });
+    const panel = mount(() => "basalt", api);
+    await panel.refresh();
+    expect($(panel.el, ".lang-active").textContent).toBe("");
+
+    current = { language: "fr_FR", languageVersion: 1 }; // boot re-asserted the pack
+    window.dispatchEvent(new Event("pebble-studio:apps-changed"));
+    await panel.whenIdle();
+
+    expect($(panel.el, ".lang-active").textContent).toBe("Active: Français (fr_FR)");
+  });
+
+  it("drops a stale refresh that resolves after a newer one (board-switch race)", async () => {
+    let board = "basalt";
+    const resolvers: Record<string, (r: { entries: CatalogEntry[] }) => void> = {};
+    const catalog = vi.fn(
+      (b: string) => new Promise<{ entries: CatalogEntry[] }>((res) => { resolvers[b] = res; }),
+    );
+    const api = makeApi({ catalog });
+    const panel = mount(() => board, api);
+    const firstRefresh = panel.whenIdle(); // constructor refresh for basalt (held)
+
+    board = "emery";
+    window.dispatchEvent(new Event("pebble-studio:board-changed"));
+    const secondRefresh = panel.whenIdle();
+
+    // The NEWER board's catalog resolves first, the OLD board's afterwards:
+    // the stale basalt result must be dropped, not overwrite emery's note.
+    resolvers["emery"]({ entries: [] });
+    await secondRefresh;
+    resolvers["basalt"]({ entries: ENTRIES });
+    await firstRefresh;
+
+    expect(panel.el.querySelector("select.lang-select")).toBeNull();
+    expect($(panel.el, ".lang-note").textContent).toBe(
+      "No official packs for this board — sideload a .pbl instead",
+    );
+  });
+
+  it("does not install a stale entry when the board changed under the dropdown", async () => {
+    let board = "basalt";
+    const api = makeApi();
+    const panel = mount(() => board, api);
+    await panel.refresh(); // dropdown now holds basalt's entries
+
+    // Board switched but the board-changed reload hasn't landed yet: the click
+    // must NOT install basalt's pack onto emery.
+    board = "emery";
+    ($(panel.el, "button.lang-install") as HTMLButtonElement).click();
+    await panel.whenIdle();
+
+    expect(api.install).not.toHaveBeenCalled();
+    expect(api.setSelection).not.toHaveBeenCalled();
+    // The mismatch kicked a reload for the new board instead.
+    expect(api.catalog).toHaveBeenCalledWith("emery");
   });
 });

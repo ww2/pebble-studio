@@ -119,6 +119,16 @@ export class LanguagePanel {
   /** Catalog entries for the current board (sorted) — the source for install /
    * reset / active-code mapping. */
   private entries: CatalogEntry[] = [];
+  /** Which board `entries` were loaded FOR. Install / Reset re-validate against
+   * the live board before acting, so a click landing mid-board-switch (the stale
+   * dropdown still on screen while the new catalog is in flight) can never
+   * install the OLD board's pack onto the NEW board. */
+  private entriesBoard = "";
+  /** Monotonic refresh generation. Each refresh() bumps it and every await
+   * inside re-checks it, dropping stale results — so two rapid board switches
+   * whose catalog fetches resolve out of order can't leave the old board's
+   * dropdown / note / active line on screen. */
+  private gen = 0;
   /** The most recent in-flight operation (install/sideload/reset/refresh) — tests
    * await it via whenIdle(); production ignores it. Starts settled. */
   private pending: Promise<void> = Promise.resolve();
@@ -173,9 +183,10 @@ export class LanguagePanel {
     this.el.append(heading, this.catalogHost, actions, this.activeLine, this.statusLine, this.errorLine);
 
     // Board switches → full reload; Live (apps-changed) → refresh the active line
-    // (the backend re-asserts the selection on boot; we just re-read it).
-    const onBoardChanged = (): void => { void this.refresh(); };
-    const onAppsChanged = (): void => { void this.refreshActive(this.getBoard()); };
+    // (the backend re-asserts the selection on boot; we just re-read it). Both
+    // record into `pending` so tests can await them via whenIdle().
+    const onBoardChanged = (): void => { this.pending = this.refresh(); };
+    const onAppsChanged = (): void => { this.pending = this.refreshActive(this.getBoard()); };
     window.addEventListener("pebble-studio:board-changed", onBoardChanged);
     window.addEventListener("pebble-studio:apps-changed", onAppsChanged);
     this.disposers.push(
@@ -184,10 +195,13 @@ export class LanguagePanel {
     );
 
     // Initial load (best-effort; tests await refresh() explicitly).
-    void this.refresh();
+    this.pending = this.refresh();
   }
 
-  /** Remove the window listeners (renderer is a singleton, but keep it tidy). */
+  /** Remove the window listeners. In the app the panel lives for the renderer's
+   * lifetime (SettingsPane is a singleton), so this is called by tests — which
+   * mount many panels against ONE jsdom window — to keep the shared window free
+   * of dead listeners between cases. */
   dispose(): void {
     for (const d of this.disposers) d();
   }
@@ -223,19 +237,34 @@ export class LanguagePanel {
   }
 
   /** Reload the catalog + persisted selection + active language for the live
-   * board, swapping the dropdown ↔ note as appropriate. */
+   * board, swapping the dropdown ↔ note as appropriate.
+   *
+   * Race-safe: the buttons are disabled while the reload is in flight (a click
+   * against a stale dropdown mid-board-switch must not act), and every await
+   * re-checks the generation so a SLOWER, older refresh that resolves after a
+   * newer one silently drops its results instead of overwriting them. */
   async refresh(): Promise<void> {
+    const gen = ++this.gen;
     const board = this.getBoard();
-    let result: LangCatalogResult;
+    this.setBusy(true);
     try {
-      result = await this.api().catalog(board);
-    } catch (e) {
-      result = { entries: [], catalogUnavailable: true, error: e instanceof Error ? e.message : String(e) };
+      let result: LangCatalogResult;
+      try {
+        result = await this.api().catalog(board);
+      } catch (e) {
+        result = { entries: [], catalogUnavailable: true, error: e instanceof Error ? e.message : String(e) };
+      }
+      if (gen !== this.gen) return; // superseded by a newer refresh — drop
+      this.entries = sortedCatalogEntries(result.entries);
+      this.entriesBoard = board;
+      this.renderCatalog(result);
+      await this.reflectSelection(board, gen);
+      await this.refreshActive(board, gen);
+    } finally {
+      // Only the CURRENT generation owns the busy state: a stale refresh must
+      // not re-enable the buttons under a newer one that is still loading.
+      if (gen === this.gen) this.setBusy(false);
     }
-    this.entries = sortedCatalogEntries(result.entries);
-    this.renderCatalog(result);
-    await this.reflectSelection(board);
-    await this.refreshActive(board);
   }
 
   /** Build the dropdown (packs present) or the note (sideload-only / unavailable
@@ -272,24 +301,31 @@ export class LanguagePanel {
   }
 
   /** Preselect the dropdown to the persisted catalog selection (if it's still in
-   * the list). Sideload selections have no dropdown entry — left as-is. */
-  private async reflectSelection(board: string): Promise<void> {
+   * the list). KNOWN INCONSISTENCY: a persisted SIDELOAD selection has no
+   * dropdown entry, so the dropdown stays on its default (first) option while
+   * the sideloaded pack is what actually re-asserts on boot — acceptable because
+   * the "Active: …" line still reports the truth from the watch. */
+  private async reflectSelection(board: string, gen: number): Promise<void> {
     if (!this.select) return;
     let sel: Selection | null = null;
     try {
       sel = await this.api().getSelection(board);
     } catch { /* best-effort — leave the default selection */ }
+    if (gen !== this.gen) return; // superseded — the dropdown is no longer ours
     if (sel?.source === "catalog" && sel.isoLocal && this.entries.some((e) => e.isoLocal === sel!.isoLocal)) {
       this.select.value = sel.isoLocal;
     }
   }
 
-  /** Re-query and render the active-language line for `board`. */
-  async refreshActive(board: string): Promise<void> {
+  /** Re-query and render the active-language line for `board`. Defaults to the
+   * current generation (post-install / Live refreshes); refresh() passes its own
+   * so a stale reload can't repaint the line after a newer one. */
+  async refreshActive(board: string, gen = this.gen): Promise<void> {
     let active: LangActiveResult = null;
     try {
       active = await this.api().active(board);
     } catch { /* best-effort */ }
+    if (gen !== this.gen) return; // superseded — drop the stale answer
     this.activeLine.textContent = formatActive(active, this.entries) ?? "";
   }
 
@@ -310,10 +346,26 @@ export class LanguagePanel {
     await this.refreshActive(board);
   }
 
+  /** The live board, but only when the on-screen catalog was loaded FOR it.
+   * Returns null mid-board-switch (dropdown still shows the old board's packs):
+   * acting then would install the old board's pack onto the new board, so the
+   * caller bails and a reload is kicked instead. Belt-and-braces with the
+   * refresh() busy-disable (which already blocks clicks during the reload). */
+  private boardForEntries(): string | null {
+    const board = this.getBoard();
+    if (board !== this.entriesBoard) {
+      this.pending = this.refresh();
+      return null;
+    }
+    return board;
+  }
+
   private onInstall(): void {
     const entry = this.selectedEntry();
     if (!entry) return;
-    this.run(() => this.installEntry(this.getBoard(), entry));
+    const board = this.boardForEntries();
+    if (!board) return; // stale catalog mid-switch — refresh kicked instead
+    this.run(() => this.installEntry(board, entry));
   }
 
   private onSideload(): void {
@@ -334,8 +386,11 @@ export class LanguagePanel {
   }
 
   private onReset(): void {
+    // Same stale-catalog guard as Install: the en_US entry (or its absence)
+    // belongs to `entriesBoard`, so acting on another board would be wrong.
+    const board = this.boardForEntries();
+    if (!board) return;
     this.run(async () => {
-      const board = this.getBoard();
       const en = this.entries.find((e) => e.isoLocal === "en_US");
       if (en) { await this.installEntry(board, en); return; }
       // No en_US pack (sideload-only / unavailable catalog): clear the persisted
