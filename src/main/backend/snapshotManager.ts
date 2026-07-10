@@ -287,6 +287,14 @@ export class SnapshotManager {
    * URI (`file:` + forward-slash migr path) to hand the boot spawn. Returns null
    * when no valid bundle exists or the SPI copy fails (bundle invalidated) — the
    * caller then cold-boots.
+   *
+   * NOTE (deliberate): if the restore BOOT later fails, the retry invalidates the
+   * bundle and cold-boots against the snapshot's SPI we copied here — NOT the
+   * pre-restore working SPI. That is safe by design: the bundle SPI is a complete,
+   * consistent flash image captured from a live session, so a cold boot from it is
+   * a normal boot (and the existing wipe fallback still regenerates a pristine
+   * image if even that stalls). We intentionally keep no third "pre-restore" SPI
+   * copy — the working SPI is disposable, regenerable state.
    */
   async prepareRestore(board: PlatformId): Promise<string | null> {
     const bundle = await this.bundleFor(board);
@@ -315,6 +323,19 @@ export class SnapshotManager {
    * copies the working SPI and writes meta.json LAST (atomic temp+rename). NEVER
    * throws; any failure or cancellation deletes the partial bundle. If the guest
    * was paused (`stop` succeeded) it is ALWAYS resumed, even on failure.
+   *
+   * The saved runstate is therefore PAUSED (stop-before-migrate); the restore side
+   * compensates: pebble-tool's patch 17b resumes the guest (`cont`) after the
+   * incoming migration completes, since qemu preserves the source runstate and
+   * autostart does not apply to a paused-source stream.
+   *
+   * Monitor contention: qemu's HMP TCP chardev serves ONE client at a time, and
+   * the backlight keepalive (backlight.ts "back" method) opens short-lived
+   * connections to this same port (~1/s while enabled). Both sides only ever hold
+   * the socket for milliseconds (keepalive: one sendkey write; here: a few
+   * commands over ~1s), so a collision at worst delays/skips one keepalive pulse
+   * or fails this creation's connect — which is swallowed and retried on a later
+   * cold boot. No deadlock is possible; not worth a shared-connection layer.
    */
   async createAfterLive(board: PlatformId, monitorPort: number, opts: CreateOpts = {}): Promise<void> {
     if (!this.eligible(board)) return;
