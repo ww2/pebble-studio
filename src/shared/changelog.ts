@@ -13,7 +13,13 @@ export interface ChangelogEntry {
 export const CHANGELOG: ChangelogEntry[] = [
   // The 2.x line is the native-Windows track (no WSL); the 1.x line is the
   // WSL-connected track. 2.0.1 is the first native release. 3.0.0 is the first
-  // public open-source release.
+  // public open-source release. (3.0.6 was never released.)
+  { version: "3.0.7", date: "2026-07-10", changes: [
+    "Fixed (#8, #11): uploading a newer Pebble SDK now actually updates the emulator's firmware. Previously Studio silently stamped its own bundled (older) firmware over every uploaded SDK to preserve the full PebbleOS launcher, so apps built with a newer SDK were rejected with \"This app requires a newer version of the Pebble firmware\". The launcher firmware is now only applied to a watch model when it wouldn't be a downgrade — an upload newer than the bundled firmware keeps its own firmware (that model then uses the SDK's stock launcher).",
+    "Also fixed as part of that: uploading or resetting an SDK now discards the instant-launch snapshots for the affected version, so the next launch can't restore a pre-swap firmware image; and \"Reset to bundled\" now stops an in-flight or background pre-booted emulator before switching, like Upload already did.",
+    "Emulator app logs (#6): the \"Emulator logs\" panel is now on by default — watchface APP_LOG output and PebbleKit JS console messages stream live in a collapsible panel under the emulator. The stream now rides Studio's existing emulator connection instead of a separate one, so it no longer competes with app installs for the emulator bridge's limited client slots — logs keep flowing during installs (previously the stream was paused exactly then, and the panel was hidden behind Settings → Advanced).",
+    "For contributors (PR #10, thanks @ww2): npm install now automatically repairs an Electron install that newer Node versions silently truncate during extraction.",
+  ]},
   { version: "3.0.5", date: "2026-07-10", changes: [
     "The emulator now launches almost instantly on every watch model: Pebble Studio keeps a ready-to-run snapshot of a booted watch and restores it instead of booting from scratch. The boot pipeline is faster overall on every board too. (The first launch of each watch after this update boots normally once while its snapshot is created.)",
     "New option (Settings → \"Pre-boot emulator on app start\"): have Pebble Studio start your startup watch booting in the background the moment you open it, so your first Launch is near-instant. Off by default — turn it on if you'd like it.",
