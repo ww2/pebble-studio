@@ -9,6 +9,11 @@ export interface VncEndpoint { host: string; port: number; wsPath: string; }
  * (1 === Success); null when the helper produced no parseable status. */
 export interface HealthActivateResult { ok: boolean; status: number | null; detail: string; }
 
+/** Handle for a live app-log stream. `viaChannel` marks a stream riding the
+ * persistent input helper's shared pypkjs connection (no extra bridge client) —
+ * such a stream never needs pausing around installs/health ops. */
+export interface AppLogHandle { kill(): void; viaChannel?: boolean; }
+
 export interface BackendDriver {
   setPlatform(id: PlatformId): void;
   /** Boot the emulator. An optional cancellation token lets an in-flight boot
@@ -68,7 +73,7 @@ export interface BackendDriver {
   /** Stream the emulator app log (`pebble logs`) as whole lines until killed.
    * Optional: windows-native + native + WSL implement it; returns null when the
    * driver/stack can't stream (caller shows an empty panel). */
-  streamLogs?(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null;
+  streamLogs?(id: PlatformId, onLine: (line: string) => void): AppLogHandle | null;
   /**
    * Create a QEMU snapshot bundle for `board` after a COLD boot reached Live, so
    * the NEXT launch restores instantly. Fire-and-forget: reads the qemu monitor

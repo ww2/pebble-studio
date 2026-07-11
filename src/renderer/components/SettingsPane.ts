@@ -1162,8 +1162,8 @@ export class SettingsPane {
 
     const emuLogsRow = this.makeSwitchRow(
       "Show emulator logs",
-      "Stream the watch app logs (the output of pebble install --logs) in a collapsible panel under the emulator. Default off.",
-      localStorage.getItem(EMU_LOGS_KEY) === "true", // default OFF
+      "Stream the watch app logs (the output of pebble install --logs) in a collapsible panel under the emulator. Default on.",
+      localStorage.getItem(EMU_LOGS_KEY) !== "false", // default ON (v3.0.7, #6)
       (on) => {
         localStorage.setItem(EMU_LOGS_KEY, on ? "true" : "false");
         window.dispatchEvent(new Event("pebble-studio:emu-logs-changed"));

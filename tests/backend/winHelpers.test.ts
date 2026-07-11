@@ -20,6 +20,29 @@ describe("INPUT_HELPER_PY pin support", () => {
   });
 });
 
+describe("INPUT_HELPER_PY app-log stream (#6)", () => {
+  it("registers the watch + pkjs log endpoints on the shared connection", () => {
+    expect(INPUT_HELPER_PY).toContain("from libpebble2.protocol.logs import AppLogMessage, AppLogShippingControl");
+    expect(INPUT_HELPER_PY).toContain("WebSocketPhoneAppLog");
+    expect(INPUT_HELPER_PY).toContain("register_endpoint(AppLogMessage");
+    expect(INPUT_HELPER_PY).toContain("register_transport_endpoint(MessageTargetPhone, WebSocketPhoneAppLog");
+    expect(INPUT_HELPER_PY).toContain("AppLogShippingControl(enable=True)");
+  });
+  it("handles the 'logs' verb idempotently and emits 'LOG ' lines", () => {
+    expect(INPUT_HELPER_PY).toContain("cmd == 'logs'");
+    expect(INPUT_HELPER_PY).toContain("_ensure_logs(transport)");
+    expect(INPUT_HELPER_PY).toContain("_emit('LOG ");
+  });
+  it("serializes stdout so LOG lines can't interleave with acks", () => {
+    expect(INPUT_HELPER_PY).toContain("_stdout_lock");
+    expect(INPUT_HELPER_PY).toContain("def _emit(");
+  });
+  it("keeps multi-line log messages on ONE protocol line", () => {
+    expect(INPUT_HELPER_PY).toContain("def _one_line(");
+    expect(INPUT_HELPER_PY).toContain("splitlines()");
+  });
+});
+
 describe("LANG_HELPER_PY language-pack helper", () => {
   it("pushes the .pbl as a raw PutBytes File object named 'lang'", () => {
     expect(LANG_HELPER_PY).toContain("from libpebble2.services.putbytes import PutBytes, PutBytesType");

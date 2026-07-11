@@ -321,8 +321,10 @@ export class EmulatorView {
     this.syncSunlightOverlay();
   };
 
-  /** Issue 3: emulator app-log panel state. */
-  private emuLogsEnabled = localStorage.getItem(EMU_LOGS_KEY) === "true";
+  /** Issue 3: emulator app-log panel state. Default ON since v3.0.7 (#6): the
+   * stream rides the input helper's shared pypkjs connection, so showing logs
+   * no longer costs an extra bridge client. */
+  private emuLogsEnabled = localStorage.getItem(EMU_LOGS_KEY) !== "false";
   private emuLogsExpanded = false;
   private readonly emuLogLines: string[] = [];
   private appLogDispose: (() => void) | null = null;
@@ -332,7 +334,7 @@ export class EmulatorView {
    * can't inject the history twice. Reset when the line buffer is cleared (boot). */
   private emuLogsBackfilled = false;
   private readonly onEmuLogsChanged = (): void => {
-    this.emuLogsEnabled = localStorage.getItem(EMU_LOGS_KEY) === "true";
+    this.emuLogsEnabled = localStorage.getItem(EMU_LOGS_KEY) !== "false";
     // Tell main to start/stop the actual `pebble logs` stream. The stream only runs
     // while this is on, so the default (off) keeps the pypkjs bridge uncontended.
     void window.studio.setLogCapture(this.emuLogsEnabled);

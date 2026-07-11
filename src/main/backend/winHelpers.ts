@@ -64,6 +64,10 @@ _SUNLIGHT_SNAP = [(0,85,170,255)[min(3,(v+42)//85)] for v in range(256)]
 # the pure-input path pays nothing.
 _pebble = None
 _pebble_lock = threading.Lock()
+# stdout is shared by ack writes (stdin-loop thread) and app-log lines (the
+# PebbleConnection dispatch thread), so serialize whole-line writes.
+_stdout_lock = threading.Lock()
+_logs_started = False
 # We only SEND on this websocket (button/tap/pin relays), but pypkjs BROADCASTS
 # everything to every client: the watchface's constant traffic AND, on each Clay
 # gear open, a ~98KB AppConfigURL frame. If nobody reads our socket, those frames
@@ -125,6 +129,65 @@ def _get_pebble(transport):
         return _pebble
 
 
+def _emit(s):
+    with _stdout_lock:
+        sys.stdout.write(s + '\\n')
+        sys.stdout.flush()
+
+
+def _one_line(s):
+    return ' | '.join(str(s).splitlines())
+
+
+def _start_app_logs(transport):
+    # Stream watch APP_LOG + pkjs console output as 'LOG ...' stdout lines, over
+    # the SAME PebbleConnection the screenshot path uses — so app logs cost no
+    # extra pypkjs client (the bridge only accepts a couple). Triggered by the
+    # 'logs' stdin command, which the app sends at Live, so the run_async
+    # handshake finds a booted watch; short retries cover a still-settling
+    # bridge. Failure only disables the log stream (input/screenshot unaffected).
+    from libpebble2.protocol.logs import AppLogMessage, AppLogShippingControl
+    from libpebble2.communication.transports.websocket.protocol import WebSocketPhoneAppLog
+    pebble = None
+    err = 'unknown'
+    for _ in range(5):
+        try:
+            pebble = _get_pebble(transport)
+            break
+        except Exception as e:
+            err = e
+            time.sleep(2.0)
+    if pebble is None:
+        sys.stderr.write('app-log: bridge unavailable (%s)\\n' % err)
+        sys.stderr.flush()
+        return
+
+    def on_watch(packet):
+        _emit('LOG [%s] %s:%s> %s' % (time.strftime('%H:%M:%S'),
+              packet.filename, packet.line_number, _one_line(packet.message)))
+
+    def on_phone(packet):
+        try:
+            text = packet.payload.decode('utf-8', 'replace')
+        except Exception:
+            text = str(packet.payload)
+        _emit('LOG [%s] pkjs> %s' % (time.strftime('%H:%M:%S'), _one_line(text)))
+
+    pebble.register_endpoint(AppLogMessage, on_watch)
+    pebble.register_transport_endpoint(MessageTargetPhone, WebSocketPhoneAppLog, on_phone)
+    pebble.send_packet(AppLogShippingControl(enable=True))
+
+
+def _ensure_logs(transport):
+    global _logs_started
+    if _logs_started:
+        return
+    _logs_started = True
+    t = threading.Thread(target=_start_app_logs, args=(transport,))
+    t.daemon = True
+    t.start()
+
+
 def _grab_png(transport, out_path):
     # Framebuffer grab → PNG with Pebble sunlight colour correction (matches
     # pebble-tool's _correct_colours; only invoked when the UI toggle is on).
@@ -165,12 +228,11 @@ def do_screenshot(transport, out_path, timeout=8.0):
     t.start()
     t.join(timeout)
     if t.is_alive():
-        sys.stdout.write('ERR screenshot timed out\\n')
+        _emit('ERR screenshot timed out')
     elif result.get('ok'):
-        sys.stdout.write('OK %s\\n' % out_path)
+        _emit('OK %s' % out_path)
     else:
-        sys.stdout.write('ERR %s\\n' % result.get('err', 'screenshot failed'))
-    sys.stdout.flush()
+        _emit('ERR %s' % result.get('err', 'screenshot failed'))
 
 
 def main():
@@ -252,12 +314,14 @@ def main():
                 rest = line.split(None, 3)
                 title = rest[3].strip() if len(rest) > 3 else 'Sample Pin'
                 send_pin(pin_id, unix_time, title)
-                sys.stdout.write('OK pin %s\\n' % pin_id)
-                sys.stdout.flush()
+                _emit('OK pin %s' % pin_id)
             elif cmd == 'unpin':
                 send_unpin(parts[1])
-                sys.stdout.write('OK unpin\\n')
-                sys.stdout.flush()
+                _emit('OK unpin')
+            elif cmd == 'logs':
+                # Fire-and-forget (no ack): start streaming app logs as
+                # 'LOG ...' lines. Idempotent — repeat sends are no-ops.
+                _ensure_logs(transport)
         except Exception as e:
             # Input errors go to stderr (fire-and-forget); a screenshot error is
             # reported on stdout by do_screenshot, so report any stray failure
@@ -265,8 +329,7 @@ def main():
             sys.stderr.write('input-helper error: %s\\n' % e)
             sys.stderr.flush()
             if parts and parts[0] in ('screenshot', 'pin', 'unpin'):
-                sys.stdout.write('ERR %s\\n' % e)
-                sys.stdout.flush()
+                _emit('ERR %s' % e)
 
 
 main()

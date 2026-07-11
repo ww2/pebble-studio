@@ -40,6 +40,33 @@ describe("WindowsNativeDriver", () => {
     expect(spawned[0].args).toContain("--vnc");
   });
 
+  it("streamLogs prefers the input channel (viaChannel, no CLI spawn) when available (#6)", () => {
+    const kill = vi.fn();
+    const streamAppLogs = vi.fn(() => ({ kill }));
+    const inputChannel = { streamAppLogs } as unknown as import("../../src/main/backend/winInputChannel.js").WinInputChannel;
+    const logSpawn = vi.fn(() => ({ kill: () => {} }));
+    const d = new WindowsNativeDriver({ run: vi.fn(async () => ({ code: 0, stdout: "", stderr: "" })), logSpawn, boot: async () => ep, stop: async () => {}, inputChannel });
+
+    const h = d.streamLogs("emery", () => {});
+    expect(h?.viaChannel).toBe(true);
+    expect(streamAppLogs).toHaveBeenCalledTimes(1);
+    expect(logSpawn).not.toHaveBeenCalled();
+    h!.kill();
+    expect(kill).toHaveBeenCalled();
+  });
+
+  it("streamLogs falls back to the CLI stream when the channel is unavailable (#6)", () => {
+    const streamAppLogs = vi.fn(() => null); // not booted / helper dead
+    const inputChannel = { streamAppLogs } as unknown as import("../../src/main/backend/winInputChannel.js").WinInputChannel;
+    const spawned: { cmd: string; args: string[] }[] = [];
+    const logSpawn = vi.fn((cmd: string, args: string[]) => { spawned.push({ cmd, args }); return { kill: () => {} }; });
+    const d = new WindowsNativeDriver({ run: vi.fn(async () => ({ code: 0, stdout: "", stderr: "" })), logSpawn, boot: async () => ep, stop: async () => {}, inputChannel });
+
+    const h = d.streamLogs("emery", () => {});
+    expect(h?.viaChannel).toBeUndefined();
+    expect(spawned[0].args).toContain("logs");
+  });
+
   it("routes discrete pebble commands through the injected bundled invocation (python + run_tool + env)", async () => {
     const calls: { cmd: string; args: string[]; env?: Record<string, string> }[] = [];
     const run = vi.fn(async (cmd: string, args: string[], env?: Record<string, string>) => { calls.push({ cmd, args, env }); return { code: 0, stdout: "", stderr: "" }; });

@@ -3,7 +3,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { AppLogStream } from "./backend/appLogStream.js";
 import { createDriver } from "./backend/createDriver.js";
-import type { BackendDriver } from "./backend/BackendDriver.js";
+import type { AppLogHandle, BackendDriver } from "./backend/BackendDriver.js";
 import { makeNativeShell, makeWslShell, type BootToken } from "./backend/bootEmulator.js";
 import { WarmStandby } from "./backend/warmStandby.js";
 import type { VncEndpoint } from "./backend/BackendDriver.js";
@@ -239,12 +239,13 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   const appLog = new AppLogStream({
     onLine: (line) => getMainWindow()?.webContents.send("emu:app-log", line),
   });
-  let logHandle: { kill(): void } | null = null;
+  let logHandle: AppLogHandle | null = null;
   // The log stream runs ONLY while the renderer's "Show emulator logs" toggle is on
-  // (set via emu:logCapture). Default off ⇒ no persistent `pebble logs` client, so
-  // the default experience has zero extra load on the limited pypkjs bridge (the
-  // pre-v3.0.2 behavior). `emuLive` gates a mid-session toggle-on so we never spawn
-  // `pebble logs` against a dead emulator (which would LAUNCH a rogue one).
+  // (set via emu:logCapture; the renderer pushes the persisted value at startup —
+  // default ON since v3.0.7, #6: the windows-native stream rides the input
+  // helper's shared pypkjs connection, so it no longer loads the bridge).
+  // `emuLive` gates a mid-session toggle-on so we never spawn a CLI `pebble logs`
+  // against a dead emulator (which would LAUNCH a rogue one).
   let logCaptureEnabled = false;
   let emuLive = false;
   const startAppLog = (id: PlatformId, opts: { clear?: boolean } = {}): void => {
@@ -271,7 +272,10 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // remains the real safety net if the slot is still busy after it.
   const BRIDGE_SLOT_SETTLE_MS = 250;
   const withAppLogPaused = async <T>(fn: () => Promise<T>): Promise<T> => {
-    const wasRunning = logHandle != null;
+    // A channel-based stream (viaChannel) shares the input helper's existing
+    // pypkjs client, so it occupies no bridge slot — never pause it (pausing
+    // would drop exactly the install-time logs the user wants to see).
+    const wasRunning = logHandle != null && !logHandle.viaChannel;
     if (wasRunning) {
       stopAppLog();
       await new Promise<void>((resolve) => setTimeout(resolve, BRIDGE_SLOT_SETTLE_MS));

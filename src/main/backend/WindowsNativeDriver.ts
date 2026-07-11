@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import type { PlatformId, ButtonId, ButtonAction } from "../../shared/types.js";
-import type { BackendDriver, HealthActivateResult, RunResult, Runner, VncEndpoint } from "./BackendDriver.js";
+import type { AppLogHandle, BackendDriver, HealthActivateResult, RunResult, Runner, VncEndpoint } from "./BackendDriver.js";
 import { NativeDriver, type BootFn, type StopFn } from "./NativeDriver.js";
 import type { BootToken, OnStep } from "./bootEmulator.js";
 import type { PebbleCmdBuilder } from "./winBootDeps.js";
@@ -345,7 +345,13 @@ export class WindowsNativeDriver implements BackendDriver {
     await this.deps.snapshotCreate?.(board, isCancelled);
   }
 
-  streamLogs(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null {
+  streamLogs(id: PlatformId, onLine: (line: string) => void): AppLogHandle | null {
+    // Preferred (#6): ride the persistent input helper's shared pypkjs
+    // connection — no second bridge client, so installs need no log pause and
+    // the stream can run by default. Falls back to the `pebble logs` process
+    // when the channel isn't up (e.g. helper died and nothing respawned it yet).
+    const viaChannel = this.deps.inputChannel?.streamAppLogs(onLine) ?? null;
+    if (viaChannel) return { kill: viaChannel.kill, viaChannel: true };
     const spawnFn = this.deps.logSpawn ?? spawnLineStream;
     // --vnc is REQUIRED: a `--emulator` command without it makes pebble-tool
     // SIGKILL the running VNC qemu and respawn a non-VNC one (see withVnc in

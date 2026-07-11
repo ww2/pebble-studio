@@ -97,6 +97,9 @@ export class WinInputChannel {
    * emits exactly one OK/ERR line per such command, and they can't fire
    * concurrently, so a single slot suffices. */
   private pendingAck: ((ok: boolean) => void) | null = null;
+  /** Live app-log subscribers ('LOG ' lines from the helper, prefix stripped).
+   * Kept on the channel (not the child) so they survive a helper respawn. */
+  private readonly logSubscribers = new Set<(line: string) => void>();
 
   constructor(private readonly deps: WinInputChannelDeps) {
     this.spawnChild = deps.spawnChild ?? defaultSpawnChild;
@@ -125,12 +128,35 @@ export class WinInputChannel {
     this.port = port;
     // Wire stdout acks for the framebuffer screenshot path. The input path never
     // reads stdout, so this never affects button/tap latency. The `ready` line
-    // and any stray output are ignored; only `OK`/`ERR` resolve a pending shot.
+    // and any stray output are ignored; only `OK`/`ERR` resolve a pending shot,
+    // and `LOG ` lines fan out to the app-log subscribers.
     this.child.onLine?.((line) => {
+      if (line.startsWith("LOG ")) {
+        const entry = line.slice(4);
+        for (const cb of this.logSubscribers) cb(entry);
+        return;
+      }
       const tok = line.trim().split(/\s+/, 1)[0];
       if (tok === "OK" || tok === "ERR") this.resolveAck(tok === "OK");
     });
+    // A respawn (reboot → new port) starts a fresh helper with no log stream;
+    // re-arm it when anyone is subscribed so logs survive an emulator relaunch.
+    if (this.logSubscribers.size > 0) {
+      try { this.child.stdinWrite("logs on\n"); } catch { /* next command respawns */ }
+    }
     return true;
+  }
+
+  /**
+   * Stream live app logs (watch APP_LOG + pkjs console) via the persistent
+   * helper's shared pypkjs connection — costs NO extra bridge client, unlike a
+   * `pebble logs` process. Returns a kill handle, or null when the channel is
+   * unavailable (not booted); the caller may fall back to the CLI stream.
+   */
+  streamAppLogs(onLine: (line: string) => void): { kill(): void } | null {
+    if (!this.send("logs on")) return null;
+    this.logSubscribers.add(onLine);
+    return { kill: () => { this.logSubscribers.delete(onLine); } };
   }
 
   /** Resolve the in-flight ack request (if any) and clear the slot. */
