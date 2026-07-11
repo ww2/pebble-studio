@@ -237,6 +237,7 @@ export class SettingsPane {
   private readonly sdkStatus: HTMLSpanElement;
   private sdkFullBtn!: HTMLButtonElement;
   private sdkFull = false;
+  private sdkSource: "custom" | "bundled" = "bundled";
   private bootMode: BootMode;
   /** Switches the live preview to the chosen platform (wired from main.ts). */
   private readonly onPlatformChange: (id: PlatformId) => void;
@@ -1738,6 +1739,7 @@ export class SettingsPane {
   private applySdkInfo(info: { version: string; source: "custom" | "bundled"; fullLauncher: boolean }): void {
     this.sdkVersionValue.textContent = this.sdkLabel(info);
     this.sdkFull = info.fullLauncher;
+    this.sdkSource = info.source;
     const custom = info.source === "custom";
     this.sdkFullBtn.disabled = !custom;
     this.sdkFullBtn.textContent = info.fullLauncher ? "Revert to stock firmware" : "Make full-featured";
@@ -1794,6 +1796,10 @@ export class SettingsPane {
       relaunch = wasLive; // the backend may have torn the emulator down before failing
     } finally {
       for (const b of btns) b.disabled = false;
+      // The re-enable loop above includes sdkFullBtn; keep it disabled on a
+      // bundled SDK (a failed/cancelled upload never ran applySdkInfo, so the
+      // loop would otherwise leave the toggle spuriously enabled).
+      this.sdkFullBtn.disabled = this.sdkSource !== "custom";
     }
     await this.maybeRelaunchAfterSdk(relaunch);
   }
