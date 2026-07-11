@@ -986,36 +986,30 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     await teardownEmulator();
     return resetToBundledSdk(await defaultCtx(), { onProgress: sdkProgress });
   });
-  ipcMain.handle("sdk:applyFullLauncher", async (e) => {
+  // Dry-run preview: what a normal apply WOULD do (which boards are newer than
+  // our launcher, etc.), with no teardown and no mutation. The renderer uses this
+  // to show its own themed dialog and decide whether to downgrade — replacing the
+  // old OS message box that lived here (and whose focus-steal over-zoomed the
+  // emulator on relaunch).
+  ipcMain.handle("sdk:previewFullLauncher", async (e) => {
+    assertMainSender(e);
+    const preview = await applyFullLauncherToActiveSdk(await defaultCtx(), { dryRun: true });
+    return { report: preview.report, info: preview.info };
+  });
+  ipcMain.handle("sdk:applyFullLauncher", async (e, opts?: { force?: boolean }) => {
     assertMainSender(e);
     const ctx = await defaultCtx();
-    // 1. Dry preview — no teardown, no mutation — to learn what a normal apply would do.
+    const force = opts?.force === true;
+    // Re-derive what will change from a fresh dry run (the renderer already asked
+    // the user; this is the authoritative check the mutation gates on).
     const preview = await applyFullLauncherToActiveSdk(ctx, { dryRun: true });
-    // 2. If some models would be skipped for being newer, ask before downgrading them.
-    let force = false;
-    if (preview.report.skippedNewer.length > 0) {
-      const win = getMainWindow();
-      const box = {
-        type: "warning" as const,
-        buttons: ["Apply anyway", "Cancel"],
-        defaultId: 1,
-        cancelId: 1,
-        title: "SDK newer than our launcher",
-        message: "This SDK is newer than Pebble Studio's launcher firmware.",
-        detail:
-          `Adding the full launcher would replace the newer firmware on ${preview.report.skippedNewer.join(", ")} ` +
-          `with Studio's older build. The launcher will work, but apps built with this SDK may be rejected ` +
-          `("requires a newer version of the Pebble firmware"). You can Revert to stock firmware at any time.\n\nApply anyway?`,
-      };
-      const { response } = win ? await dialog.showMessageBox(win, box) : await dialog.showMessageBox(box);
-      force = response === 0;
-    }
-    // 3. Nothing to do (no eligible boards, force not granted)? Don't tear down.
-    const willChange = preview.report.applied.length > 0 || (force && preview.report.skippedNewer.length > 0);
+    const willChange =
+      preview.report.applied.length > 0 || (force && preview.report.skippedNewer.length > 0);
+    // Nothing to do (no eligible boards, downgrade not granted)? Don't tear down.
     if (!willChange) {
       return { report: preview.report, info: preview.info, changed: false };
     }
-    // 4. Real apply — firmware changes, so tear down first like sdk:install.
+    // Real apply — firmware changes, so tear down first like sdk:install.
     if (currentBootToken) currentBootToken.cancelled = true;
     await teardownEmulator();
     const applied = await applyFullLauncherToActiveSdk(ctx, { force, onProgress: sdkProgress });

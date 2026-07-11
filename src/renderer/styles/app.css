@@ -1178,6 +1178,42 @@ body {
   visibility: visible;
   transform: translateY(0);
 }
+/* Hover tooltip for an action button (e.g. the SDK upload buttons): a themed
+   bubble that says what the button accepts. Mirrors .help-tip__bubble but anchors
+   the wrapper around the whole button and reveals on hover OR keyboard focus. */
+.btn-tip {
+  position: relative;
+  display: inline-flex;
+}
+.btn-tip__bubble {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%) translateY(3px);
+  z-index: 60;
+  width: max-content;
+  max-width: 240px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+  text-align: left;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  pointer-events: none;
+}
+.btn-tip:hover .btn-tip__bubble,
+.btn-tip:focus-within .btn-tip__bubble {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(0);
+}
 .settings-row-label { color: var(--text); }
 .settings-row-desc { color: var(--text-secondary); margin: 0; }
 /* Keyboard section (I): stacked per-action rows + an active rebind affordance. */
@@ -1587,3 +1623,48 @@ body {
 .cl-ev { font-weight: 700; color: var(--accent); }
 .cl-entry ul { margin: 4px 0 0; padding-left: 18px; }
 .cl-entry li { margin: 2px 0; }
+
+/* ── Bespoke confirm/info dialog (ConfirmDialog.ts) ─────────────────────────
+   The themed replacement for the OS message box. Shares the changelog modal's
+   surface language (Mica card, hairline border) so it reads as part of Studio. */
+.dlg-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  display: grid; place-items: center;
+  background: rgba(0, 0, 0, 0.5);
+}
+.dlg-card {
+  width: min(480px, 92vw); max-height: 80vh; display: flex; flex-direction: column;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-card);
+  box-shadow: var(--elev-1); overflow: hidden;
+}
+.dlg-head { display: flex; align-items: center; gap: 12px; padding: 16px 18px 4px; }
+.dlg-title { flex: 1; }
+.dlg-body { padding: 4px 18px 8px; overflow-y: auto; }
+.dlg-body p { margin: 8px 0; color: var(--text-secondary); line-height: 1.5; }
+.dlg-body p:first-child { color: var(--text); }
+.dlg-actions {
+  display: flex; justify-content: flex-end; gap: 8px;
+  padding: 12px 18px 18px; flex-wrap: wrap;
+}
+.dlg-btn {
+  padding: 7px 16px; border-radius: var(--radius-control);
+  border: 1px solid var(--border-strong); background: var(--control); color: var(--text);
+  font-size: var(--type-body); cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.dlg-btn:hover { background: var(--control-hover); border-color: var(--border-strong); }
+.dlg-btn:active { transform: translateY(1px); }
+.dlg-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--accent); }
+.dlg-btn--primary {
+  background: var(--accent); border-color: var(--accent); color: var(--accent-fg);
+}
+.dlg-btn--primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.dlg-btn--danger {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border-strong));
+  color: var(--danger);
+}
+.dlg-btn--danger:hover {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+}

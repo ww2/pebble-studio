@@ -1216,7 +1216,11 @@ export class EmulatorView {
     // Exclude #emu-sunlight — it's the overlay we write, not the noVNC source.
     const canvas = this.findVncCanvas();
     if (!canvas || canvas.width === 0 || canvas.height === 0) return null;
-    const N = 8; // sample into an 8×8 thumbnail
+    // 32×32 (was 8×8): a coarse 8×8 downscale averages small updates — a single
+    // ticking digit or a few-pixel animation step — into unchanged cells, so the
+    // hash misses them and "~fps" under-reads. A finer grid registers those
+    // changes and still costs ~1k pixels per tick (negligible).
+    const N = 32;
     if (!this.fpsSampleCtx) {
       const off = document.createElement("canvas");
       off.width = N;

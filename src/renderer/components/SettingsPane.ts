@@ -25,6 +25,8 @@ import {
 } from "../../shared/simEnv.js";
 import { LIVE_SUNLIGHT_KEY, LIVE_SUNLIGHT_EVENT } from "../liveSunlight.js";
 import { LanguagePanel } from "./LanguagePanel.js";
+import { openDialog } from "./ConfirmDialog.js";
+import { planFullLauncherApply } from "../fullLauncherPlan.js";
 
 type ThemeChoice = "light" | "dark";
 type BootMode = "auto" | "manual";
@@ -152,6 +154,25 @@ function clampHelpBubble(tip: HTMLElement, bubble: HTMLElement): void {
   if (rect.right > rightLimit) shift = rightLimit - rect.right; // slide left to fit
   if (rect.left + shift < leftLimit) shift = leftLimit - rect.left; // but not past the left edge
   bubble.style.left = `${shift}px`;
+}
+
+/**
+ * Wrap a button in a hover/focus tooltip that explains what it accepts, returning
+ * the wrapper to mount in place of the bare button. The button reference stays
+ * valid (callers keep enabling/disabling it directly). Themed via `.btn-tip`
+ * (see app.css) so it matches the rest of Settings rather than the OS `title`.
+ */
+export function withButtonTooltip(btn: HTMLButtonElement, text: string): HTMLElement {
+  const wrap = document.createElement("span");
+  wrap.className = "btn-tip";
+  const bubble = document.createElement("span");
+  bubble.className = "btn-tip__bubble";
+  bubble.setAttribute("role", "tooltip");
+  bubble.textContent = text;
+  // Also expose it to assistive tech / as an OS fallback for touch.
+  btn.setAttribute("aria-label", `${btn.textContent} — ${text}`);
+  wrap.append(btn, bubble);
+  return wrap;
 }
 
 /** UI state -> persisted SimEnvConfig. tempInput is in `units`; stored as canonical tempC. */
@@ -1219,13 +1240,13 @@ export class SettingsPane {
     const sdkUploadBtn = document.createElement("button");
     sdkUploadBtn.type = "button";
     sdkUploadBtn.className = "lib-pick-btn";
-    sdkUploadBtn.textContent = "Upload archive…";
+    sdkUploadBtn.textContent = "Upload archive";
     // Windows' open dialog cannot pick a file and a directory in one picker, so
     // an extracted SDK tree needs its own entry point into the same install path.
     const sdkUploadDirBtn = document.createElement("button");
     sdkUploadDirBtn.type = "button";
     sdkUploadDirBtn.className = "lib-pick-btn";
-    sdkUploadDirBtn.textContent = "Upload folder…";
+    sdkUploadDirBtn.textContent = "Upload folder";
     const sdkResetBtn = document.createElement("button");
     sdkResetBtn.type = "button";
     sdkResetBtn.className = "lib-pick-btn";
@@ -1239,7 +1260,14 @@ export class SettingsPane {
 
     const sdkBtns = document.createElement("div");
     sdkBtns.className = "settings-row-actions";
-    sdkBtns.append(sdkUploadBtn, sdkUploadDirBtn, sdkFullBtn, sdkResetBtn);
+    // The two upload buttons carry a hover/focus tooltip naming what they accept
+    // (a themed bubble, not the slow OS `title`), so the labels can stay short.
+    sdkBtns.append(
+      withButtonTooltip(sdkUploadBtn, "A Pebble SDK archive: .tar.bz2 / .tbz2 / .tar.gz / .tgz / .tar / .zip (a sdk-core bundle)."),
+      withButtonTooltip(sdkUploadDirBtn, "A folder holding an extracted Pebble SDK (contains sdk-core/manifest.json)."),
+      sdkFullBtn,
+      sdkResetBtn,
+    );
 
     this.sdkStatus = document.createElement("span");
     this.sdkStatus.className = "settings-row-desc type-caption";
@@ -1865,30 +1893,86 @@ export class SettingsPane {
     return msg;
   }
 
-  /** Apply or revert the full launcher on the active custom SDK. */
+  /** Apply or revert the full launcher on the active custom SDK. Apply first does a
+   * dry-run preview: if any board's firmware is newer than our launcher, a themed
+   * dialog (not the OS message box) surfaces the downgrade risk and defaults to the
+   * safe choice — a downgrade is only ever an explicit opt-in. */
   private async toggleFullLauncher(btns: HTMLButtonElement[]): Promise<void> {
     const wasLive = this.isEmuLive?.() ?? false;
     const goingFull = !this.sdkFull;
-    for (const b of btns) b.disabled = true;
-    this.setSdkStatus(goingFull ? "Adding the full launcher…" : "Reverting to stock firmware…", { sticky: true });
-    try {
-      if (goingFull) {
-        const { report, info, changed } = await window.studio.sdkApplyFullLauncher();
+
+    if (goingFull) {
+      // Preview BEFORE disabling buttons / showing progress, so a cancel leaves the
+      // UI exactly as it was (no teardown, no mutation happened).
+      let force: boolean;
+      try {
+        const preview = await window.studio.sdkPreviewFullLauncher();
+        const decided = await this.decideFullLauncher(preview.report, preview.info.version);
+        if (decided === null) return; // user cancelled — nothing changed
+        force = decided;
+      } catch (err) {
+        const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
+        this.setSdkStatus(`Couldn't check the SDK: ${reason || "see console"}`);
+        return;
+      }
+      for (const b of btns) b.disabled = true;
+      this.setSdkStatus("Adding the full launcher…", { sticky: true });
+      try {
+        const { report, info, changed } = await window.studio.sdkApplyFullLauncher({ force });
         this.applySdkInfo(info);
         await this.finishSdkOp(this.describeApply(report), changed, wasLive);
-      } else {
-        const { info, changed } = await window.studio.sdkRevertFullLauncher();
-        this.applySdkInfo(info);
-        await this.finishSdkOp("Reverted to the SDK's own firmware.", changed, wasLive);
+      } catch (err) {
+        const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
+        this.setSdkStatus(`Apply failed: ${reason || "see console"}`);
+        await this.maybeRelaunchAfterSdk(wasLive); // safety: backend may have torn down
+      } finally {
+        for (const b of btns) b.disabled = false;
+        this.sdkFullBtn.disabled = this.sdkSource !== "custom";
       }
+      return;
+    }
+
+    // Revert — no preview needed.
+    for (const b of btns) b.disabled = true;
+    this.setSdkStatus("Reverting to stock firmware…", { sticky: true });
+    try {
+      const { info, changed } = await window.studio.sdkRevertFullLauncher();
+      this.applySdkInfo(info);
+      await this.finishSdkOp("Reverted to the SDK's own firmware.", changed, wasLive);
     } catch (err) {
       const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
-      this.setSdkStatus(`${goingFull ? "Apply" : "Revert"} failed: ${reason || "see console"}`);
+      this.setSdkStatus(`Revert failed: ${reason || "see console"}`);
       await this.maybeRelaunchAfterSdk(wasLive); // safety: backend may have torn down
     } finally {
       for (const b of btns) b.disabled = false;
       this.sdkFullBtn.disabled = this.sdkSource !== "custom";
     }
+  }
+
+  /**
+   * Given a dry-run report, decide the `force` value for the apply — showing the
+   * themed downgrade dialog when needed. Returns `null` when the user cancels
+   * (apply should not run at all). No dialog (no downgrade risk) → force=false.
+   */
+  private async decideFullLauncher(
+    report: { applied: string[]; skippedNewer: string[]; skippedMissing: string[] },
+    version: string,
+  ): Promise<boolean | null> {
+    const plan = planFullLauncherApply(report, version);
+    if (!plan.dialog) return plan.autoForce;
+
+    const d = plan.dialog;
+    const buttons = [
+      { label: d.safeLabel, value: "safe", variant: "primary" as const },
+      ...(d.downgradeLabel
+        ? [{ label: d.downgradeLabel, value: "downgrade", variant: "danger" as const }]
+        : []),
+      { label: "Cancel", value: "cancel", variant: "default" as const },
+    ];
+    const choice = await openDialog({ title: d.title, lines: d.lines, buttons, dismissValue: "cancel" });
+    if (choice === "downgrade") return true;
+    if (choice === "safe") return d.safeForce;
+    return null; // cancel / dismissed
   }
 
   private toggleTheme(): void {
