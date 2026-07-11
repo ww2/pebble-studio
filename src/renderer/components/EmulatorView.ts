@@ -1060,15 +1060,19 @@ export class EmulatorView {
     }
   }
 
-  /** Copy the full session log to the clipboard, with brief button feedback. */
-  private async copySessionLog(): Promise<void> {
-    const text = this.sessionLog.toText();
-    let ok = false;
+  /**
+   * Copy text to the clipboard, returning whether it succeeded. `navigator.
+   * clipboard.writeText` needs the `clipboard-write` permission, which the app's
+   * blanket permission-check deny (main/index.ts — hardening for untrusted Clay
+   * pages) refuses, so it rejects here. We fall back to a hidden-textarea
+   * `execCommand("copy")`, which runs on the click's user gesture and doesn't go
+   * through the permission system. Shared by both copy buttons.
+   */
+  private async writeClipboard(text: string): Promise<boolean> {
     try {
       await navigator.clipboard.writeText(text);
-      ok = true;
+      return true;
     } catch {
-      // Fallback for environments without the async clipboard API.
       try {
         const ta = document.createElement("textarea");
         ta.value = text;
@@ -1076,12 +1080,18 @@ export class EmulatorView {
         ta.style.opacity = "0";
         document.body.appendChild(ta);
         ta.select();
-        ok = document.execCommand("copy");
+        const ok = document.execCommand("copy");
         ta.remove();
+        return ok;
       } catch {
-        ok = false;
+        return false;
       }
     }
+  }
+
+  /** Copy the full session log to the clipboard, with brief button feedback. */
+  private async copySessionLog(): Promise<void> {
+    const ok = await this.writeClipboard(this.sessionLog.toText());
     const btn = this.diagCopyBtn;
     const prev = btn.textContent;
     btn.textContent = ok ? "Copied!" : "Copy failed";
@@ -1148,10 +1158,8 @@ export class EmulatorView {
   }
 
   private async copyEmuLog(): Promise<void> {
-    const text = this.emuLogLines.join("\n");
+    const ok = await this.writeClipboard(this.emuLogLines.join("\n"));
     const btn = this.el.querySelector<HTMLButtonElement>("#emu-logs-copy")!;
-    let ok = false;
-    try { await navigator.clipboard.writeText(text); ok = true; } catch { ok = false; }
     const prev = btn.textContent;
     btn.textContent = ok ? "Copied!" : "Copy failed";
     setTimeout(() => { btn.textContent = prev; }, 1500);
