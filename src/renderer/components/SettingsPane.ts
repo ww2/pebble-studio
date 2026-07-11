@@ -238,6 +238,8 @@ export class SettingsPane {
   private sdkFullBtn!: HTMLButtonElement;
   private sdkFull = false;
   private sdkSource: "custom" | "bundled" = "bundled";
+  private sdkStatusTimer?: ReturnType<typeof setTimeout>;
+  private static readonly SDK_STATUS_DISMISS_MS = 6000;
   private bootMode: BootMode;
   /** Switches the live preview to the chosen platform (wired from main.ts). */
   private readonly onPlatformChange: (id: PlatformId) => void;
@@ -1773,35 +1775,57 @@ export class SettingsPane {
     }
   }
 
+  /** Set the SDK status line. Terminal messages auto-dismiss after a few seconds;
+   * in-progress messages pass { sticky: true } so they persist until replaced. */
+  private setSdkStatus(msg: string, opts: { sticky?: boolean } = {}): void {
+    if (this.sdkStatusTimer) { clearTimeout(this.sdkStatusTimer); this.sdkStatusTimer = undefined; }
+    this.sdkStatus.textContent = msg;
+    if (msg && !opts.sticky) {
+      this.sdkStatusTimer = setTimeout(() => {
+        this.sdkStatus.textContent = "";
+        this.sdkStatusTimer = undefined;
+      }, SettingsPane.SDK_STATUS_DISMISS_MS);
+    }
+  }
+
+  /** Finish an SDK op: append the right tail, relaunch only when firmware changed
+   * and the emulator was live, and replace "Relaunching…" once it completes. */
+  private async finishSdkOp(base: string, changed: boolean, wasLive: boolean): Promise<void> {
+    if (changed && wasLive) {
+      this.setSdkStatus(`${base} Relaunching the emulator…`, { sticky: true });
+      await this.maybeRelaunchAfterSdk(true);
+      this.setSdkStatus(`${base} Relaunched.`);
+    } else if (changed) {
+      this.setSdkStatus(`${base} Relaunch the emulator to use it.`);
+    } else {
+      this.setSdkStatus(base);
+    }
+  }
+
   /** Upload + install a user-chosen SDK (Replace & persist + full-launcher overlay). */
   private async uploadSdk(mode: "file" | "folder", btns: HTMLButtonElement[]): Promise<void> {
     const wasLive = this.isEmuLive?.() ?? false;
     for (const b of btns) b.disabled = true;
-    this.sdkStatus.textContent = "Installing…";
-    let relaunch = false;
+    this.setSdkStatus("Installing…", { sticky: true });
     try {
       const info = await window.studio.sdkInstall(mode);
       if (info == null) {
-        this.sdkStatus.textContent = ""; // cancelled — emulator untouched
+        this.setSdkStatus(""); // cancelled — emulator untouched
       } else {
         this.applySdkInfo(info);
-        relaunch = wasLive; // a real install tore the live emulator down
-        const tail = wasLive ? " Relaunching the emulator…" : " Relaunch the emulator to use it.";
-        this.sdkStatus.textContent =
-          `Installed SDK ${info.version}. Use "Make full-featured" to add the full PebbleOS launcher.${tail}`;
+        await this.finishSdkOp(
+          `Installed SDK ${info.version}. Use "Make full-featured" to add the full PebbleOS launcher.`,
+          true, wasLive,
+        );
       }
     } catch (err) {
       const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
-      this.sdkStatus.textContent = `Upload failed: ${reason || "see console"}`;
-      relaunch = wasLive; // the backend may have torn the emulator down before failing
+      this.setSdkStatus(`Upload failed: ${reason || "see console"}`);
+      await this.maybeRelaunchAfterSdk(wasLive); // backend may have torn down before failing
     } finally {
       for (const b of btns) b.disabled = false;
-      // The re-enable loop above includes sdkFullBtn; keep it disabled on a
-      // bundled SDK (a failed/cancelled upload never ran applySdkInfo, so the
-      // loop would otherwise leave the toggle spuriously enabled).
       this.sdkFullBtn.disabled = this.sdkSource !== "custom";
     }
-    await this.maybeRelaunchAfterSdk(relaunch);
   }
 
   /** Drop the user override and return to the bundled SDK. */
@@ -1809,29 +1833,24 @@ export class SettingsPane {
     const wasLive = this.isEmuLive?.() ?? false;
     uploadBtn.disabled = true;
     resetBtn.disabled = true;
-    this.sdkStatus.textContent = "Resetting…";
+    this.setSdkStatus("Resetting…", { sticky: true });
     try {
       const info = await window.studio.sdkReset();
       this.applySdkInfo(info);
-      const tail = wasLive ? " Relaunching the emulator…" : " Relaunch the emulator to use it.";
-      this.sdkStatus.textContent = `Reset to bundled SDK ${info.version}.${tail}`;
+      await this.finishSdkOp(`Reset to bundled SDK ${info.version}.`, true, wasLive);
     } catch (err) {
       const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
-      this.sdkStatus.textContent = `Reset failed: ${reason || "see console"}`;
+      this.setSdkStatus(`Reset failed: ${reason || "see console"}`);
+      await this.maybeRelaunchAfterSdk(wasLive);
     } finally {
       uploadBtn.disabled = false;
       resetBtn.disabled = false;
     }
-    await this.maybeRelaunchAfterSdk(wasLive);
   }
 
-  /** Turn a per-board apply report into a user-facing line (surfaces the
-   * "deviated too far from v4.13" skip). */
-  private describeApply(
-    report: { applied: string[]; skippedNewer: string[]; skippedMissing: string[] },
-    wasLive: boolean,
-  ): string {
-    const tail = wasLive ? " Relaunching the emulator…" : " Relaunch the emulator to use it.";
+  /** Turn a per-board apply report into the base status line (no relaunch tail;
+   * finishSdkOp adds that). Surfaces the never-downgrade skip honestly. */
+  private describeApply(report: { applied: string[]; skippedNewer: string[]; skippedMissing: string[] }): string {
     if (report.applied.length === 0) {
       if (report.skippedNewer.length > 0) {
         return `Couldn't add the full launcher — this SDK is newer than our bundled launcher firmware ` +
@@ -1843,7 +1862,7 @@ export class SettingsPane {
     if (report.skippedNewer.length > 0) {
       msg += ` ${report.skippedNewer.join(", ")} kept their own firmware (newer than our launcher).`;
     }
-    return msg + tail;
+    return msg;
   }
 
   /** Apply or revert the full launcher on the active custom SDK. */
@@ -1851,25 +1870,25 @@ export class SettingsPane {
     const wasLive = this.isEmuLive?.() ?? false;
     const goingFull = !this.sdkFull;
     for (const b of btns) b.disabled = true;
-    this.sdkStatus.textContent = goingFull ? "Adding the full launcher…" : "Reverting to stock firmware…";
+    this.setSdkStatus(goingFull ? "Adding the full launcher…" : "Reverting to stock firmware…", { sticky: true });
     try {
       if (goingFull) {
-        const { report, info } = await window.studio.sdkApplyFullLauncher();
+        const { report, info, changed } = await window.studio.sdkApplyFullLauncher();
         this.applySdkInfo(info);
-        this.sdkStatus.textContent = this.describeApply(report, wasLive);
+        await this.finishSdkOp(this.describeApply(report), changed, wasLive);
       } else {
-        const { info } = await window.studio.sdkRevertFullLauncher();
+        const { info, changed } = await window.studio.sdkRevertFullLauncher();
         this.applySdkInfo(info);
-        const tail = wasLive ? " Relaunching the emulator…" : " Relaunch the emulator to use it.";
-        this.sdkStatus.textContent = `Reverted to the SDK's own firmware.${tail}`;
+        await this.finishSdkOp("Reverted to the SDK's own firmware.", changed, wasLive);
       }
     } catch (err) {
       const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
-      this.sdkStatus.textContent = `${goingFull ? "Apply" : "Revert"} failed: ${reason || "see console"}`;
+      this.setSdkStatus(`${goingFull ? "Apply" : "Revert"} failed: ${reason || "see console"}`);
+      await this.maybeRelaunchAfterSdk(wasLive); // safety: backend may have torn down
     } finally {
       for (const b of btns) b.disabled = false;
+      this.sdkFullBtn.disabled = this.sdkSource !== "custom";
     }
-    await this.maybeRelaunchAfterSdk(wasLive);
   }
 
   private toggleTheme(): void {
