@@ -547,9 +547,14 @@ export async function applyFullLauncherToActiveSdk(
 ): Promise<{ report: FullLauncherReport; info: SdkInfo }> {
   const log = deps.onProgress ?? (() => {});
   const { version, persistSdkRoot, paths } = await activeCustomSdkPaths(ctx);
-  const report = await applyFullLauncherFirmware(realProvisionFs(), paths, log);
-  await invalidateVersionSnapshots(realProvisionFs(), persistSdkRoot, version).catch(() => {});
-  return { report, info: await currentSdkInfo(ctx) };
+  try {
+    const report = await applyFullLauncherFirmware(realProvisionFs(), paths, log);
+    return { report, info: await currentSdkInfo(ctx) };
+  } finally {
+    // Firmware bytes may have changed even on a partial/throwing apply — drop
+    // snapshots on ALL paths so no stale restore can boot pre-toggle firmware.
+    await invalidateVersionSnapshots(realProvisionFs(), persistSdkRoot, version).catch(() => {});
+  }
 }
 
 /** Revert the active custom SDK to its own firmware, then drop its snapshots.
@@ -560,9 +565,14 @@ export async function revertFullLauncherOnActiveSdk(
 ): Promise<{ reverted: string[]; info: SdkInfo }> {
   const log = deps.onProgress ?? (() => {});
   const { version, persistSdkRoot, paths } = await activeCustomSdkPaths(ctx);
-  const reverted = await revertFullLauncherFirmware(realProvisionFs(), paths, log);
-  await invalidateVersionSnapshots(realProvisionFs(), persistSdkRoot, version).catch(() => {});
-  return { reverted, info: await currentSdkInfo(ctx) };
+  try {
+    const reverted = await revertFullLauncherFirmware(realProvisionFs(), paths, log);
+    return { reverted, info: await currentSdkInfo(ctx) };
+  } finally {
+    // Firmware bytes may have changed even on a partial/throwing revert — drop
+    // snapshots on ALL paths so no stale restore can boot pre-toggle firmware.
+    await invalidateVersionSnapshots(realProvisionFs(), persistSdkRoot, version).catch(() => {});
+  }
 }
 
 /**
