@@ -85,8 +85,12 @@ def _drain_loop(transport):
             transport.read_packet()  # consume + discard one inbound frame
         except Exception:
             # WebSocketTimeoutException (idle, expected) -> keep draining;
-            # a real close -> exit so we don't spin.
-            if not transport.connected():
+            # a real close -> exit so we don't spin. NOTE: 'connected' is a
+            # @property — calling it crashed this thread with a TypeError on
+            # the FIRST idle timeout (shipped in v3.0.3..v3.0.5), silently
+            # disabling the drain that keeps pypkjs broadcasts from backing
+            # up on our socket (the Clay "No config page" wedge protection).
+            if not transport.connected:
                 return
 
 
@@ -176,6 +180,8 @@ def _start_app_logs(transport):
     pebble.register_endpoint(AppLogMessage, on_watch)
     pebble.register_transport_endpoint(MessageTargetPhone, WebSocketPhoneAppLog, on_phone)
     pebble.send_packet(AppLogShippingControl(enable=True))
+    # Positive signal for the UI panel (and live tests) that the stream is up.
+    _emit('LOG [%s] (app log stream connected)' % time.strftime('%H:%M:%S'))
 
 
 def _ensure_logs(transport):
