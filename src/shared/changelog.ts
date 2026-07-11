@@ -14,6 +14,10 @@ export const CHANGELOG: ChangelogEntry[] = [
   // The 2.x line is the native-Windows track (no WSL); the 1.x line is the
   // WSL-connected track. 2.0.1 is the first native release. 3.0.0 is the first
   // public open-source release. (3.0.6 was never released.)
+  { version: "3.0.8", date: "2026-07-11", changes: [
+    "The full PebbleOS launcher is now opt-in for uploaded SDKs. A freshly uploaded SDK runs its own firmware as-is; a new \"Make full-featured\" button in Settings → Pebble SDK overlays Studio's full launcher (Settings, Health, full menu) on demand and reports, per watch model, whether it could — a model whose firmware is newer than our launcher is left alone instead of being silently downgraded.",
+    "The launcher overlay is now reversible: applying it stashes each model's original firmware, so \"Revert to stock firmware\" restores the SDK's own firmware in one click without re-uploading.",
+  ] },
   { version: "3.0.7", date: "2026-07-10", changes: [
     "Fixed (#8, #11): uploading a newer Pebble SDK now actually updates the emulator's firmware. Previously Studio silently stamped its own bundled (older) firmware over every uploaded SDK to preserve the full PebbleOS launcher, so apps built with a newer SDK were rejected with \"This app requires a newer version of the Pebble firmware\". The launcher firmware is now only applied to a watch model when it wouldn't be a downgrade — an upload newer than the bundled firmware keeps its own firmware (that model then uses the SDK's stock launcher).",
     "Also fixed as part of that: uploading or resetting an SDK now discards the instant-launch snapshots for the affected version, so the next launch can't restore a pre-swap firmware image; and \"Reset to bundled\" now stops an in-flight or background pre-booted emulator before switching, like Upload already did.",
