@@ -976,7 +976,10 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     return installCustomSdk(await defaultCtx(), result.filePaths[0], { run: spawnRunner, onProgress: sdkProgress });
   });
   ipcMain.handle("sdk:reset", async () => {
-    if (emuLive) await teardownEmulator();
+    // Mirror sdk:install: an in-flight boot or warm-standby pre-boot may still
+    // be running against the SDK we're about to drop — `emuLive` alone missed both.
+    if (currentBootToken) currentBootToken.cancelled = true;
+    await teardownEmulator();
     return resetToBundledSdk(await defaultCtx(), { onProgress: sdkProgress });
   });
 

@@ -54,6 +54,40 @@ export interface SdkInfo {
  * overlay has been applied to it. */
 export const FULL_LAUNCHER_MARKER = ".full-launcher";
 
+/**
+ * Firmware version each board's BUNDLED overlay blobs actually are. The overlay
+ * must never DOWNGRADE an uploaded SDK (#8/#11: a 4.17 upload overlaid with these
+ * boots old firmware, and 4.17-built .pbws are rejected with "requires a newer
+ * version of the Pebble firmware"). Modern boards carry the normal-shell v4.13.0
+ * build (2026-06-15, coredevices/PebbleOS); legacy boards carry the 4.9.169
+ * sdk-core firmware (health-seeded SPI). Update alongside vendor/pebble-sdk fw.
+ */
+export const BUNDLED_FW_VERSIONS: Readonly<Record<string, string>> = {
+  emery: "4.13.0",
+  gabbro: "4.13.0",
+  flint: "4.13.0",
+  basalt: "4.9.169",
+  chalk: "4.9.169",
+  diorite: "4.9.169",
+};
+
+/**
+ * True when dotted version `a` is strictly newer than `b` (numeric per segment,
+ * missing segments are 0). Unparseable input → false, so callers conservatively
+ * keep today's behavior for weird version strings. PURE.
+ */
+export function isVersionNewer(a: string, b: string): boolean {
+  const parse = (v: string): number[] | null =>
+    /^\d+(\.\d+)*$/.test(v.trim()) ? v.trim().split(".").map(Number) : null;
+  const pa = parse(a), pb = parse(b);
+  if (!pa || !pb) return false;
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] ?? 0, y = pb[i] ?? 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+
 /** Paths the full-launcher firmware overlay touches (PURE — resolved by caller). */
 export interface FullLauncherPaths {
   /** Bundled (full-launcher) sdk-core to copy firmware FROM. */
@@ -64,6 +98,10 @@ export interface FullLauncherPaths {
   marker: string;
   /** pebble-tool's decompressed spi for a board (deleted so it regenerates). */
   decompressedSpi: (board: string) => string;
+  /** The uploaded SDK's declared version. When set, a board is overlaid only if
+   * its bundled firmware is same-or-newer (never downgrade an upload). Absent →
+   * legacy behavior (overlay whatever is present). */
+  uploadVersion?: string;
 }
 
 /**
@@ -84,7 +122,15 @@ export async function applyFullLauncherFirmware(
 ): Promise<string[]> {
   const { win32: wp } = await import("node:path");
   const done: string[] = [];
+  const skippedNewer: string[] = [];
   for (const board of FW_REFRESH_BOARDS) {
+    // #8/#11: never downgrade — skip a board whose bundled blobs are OLDER than
+    // the uploaded SDK's firmware. The upload keeps its own (newer) firmware for
+    // that board, at the cost of the stock (sdkshell) launcher there.
+    if (p.uploadVersion && isVersionNewer(p.uploadVersion, BUNDLED_FW_VERSIONS[board] ?? "")) {
+      skippedNewer.push(board);
+      continue;
+    }
     const src = wp.join(p.bundleSdkCore, "pebble", board, "qemu");
     const dst = wp.join(p.targetSdkCore, "pebble", board, "qemu");
     if (!(await fs.exists(wp.join(src, FW_REFRESH_BLOBS[0])))) continue; // bundle lacks this board
@@ -101,7 +147,34 @@ export async function applyFullLauncherFirmware(
     await fs.writeText(p.marker, "1");
     log(`Applied full PebbleOS launcher firmware (${done.join(", ")}).`);
   }
+  if (skippedNewer.length > 0) {
+    log(
+      `SDK ${p.uploadVersion} is newer than the bundled launcher firmware — ` +
+      `keeping its own firmware on ${skippedNewer.join(", ")}.`,
+    );
+  }
   return done;
+}
+
+/**
+ * Delete every board's QEMU snapshot bundle for a version
+ * (`<persistSdkRoot>\<version>\<board>\.snapshot`). #8/#11: snapshot bundles are
+ * keyed on {fwRev, sdkVer, exeStamp} — NOT firmware content — so swapping the
+ * SDK in place (upload or reset) could otherwise serve an instant-launch restore
+ * of the PREVIOUS firmware. Best-effort: enumerates whatever board dirs exist;
+ * a version string that isn't a plain dotted number is refused (path safety).
+ */
+export async function invalidateVersionSnapshots(
+  fs: Pick<ProvisionFs, "list" | "exists" | "remove">,
+  persistSdkRoot: string,
+  version: string,
+): Promise<void> {
+  if (!/^\d+(\.\d+)*$/.test(version)) return;
+  const verDir = winPath.join(persistSdkRoot, version);
+  for (const name of await fs.list(verDir)) {
+    const snap = winPath.join(verDir, name, ".snapshot");
+    if (await fs.exists(snap)) await fs.remove(snap);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -352,12 +425,18 @@ export async function installCustomSdk(
           targetSdkCore: target,
           marker: winPath.join(persistSdkRoot, "SDKs", version, FULL_LAUNCHER_MARKER),
           decompressedSpi: (board) => winPath.join(persistSdkRoot, version, board, "qemu_spi_flash.bin"),
+          uploadVersion: version,
         }, log);
         if (boards.length === 0) log("No full-launcher firmware to apply (uploaded SDK keeps its own firmware).");
       }
     } catch (e) {
       log(`Full-launcher overlay skipped (non-fatal): ${(e as Error)?.message ?? e}`);
     }
+    // 7. Drop any QEMU snapshot bundles for this version: they may hold a
+    //    restore image of DIFFERENT firmware bytes under the same {fwRev, sdkVer,
+    //    exeStamp} key, and an instant-launch restore would boot the old
+    //    firmware, bypassing this upload entirely. Best-effort.
+    await invalidateVersionSnapshots(realProvisionFs(), persistSdkRoot, version).catch(() => {});
   } finally {
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -418,6 +497,13 @@ export async function resetToBundledSdk(
   const customVersion = (await readFile(marker, "utf8").catch(() => "")).trim();
   if (await exists(marker)) await rm(marker, { force: true }).catch(() => {});
   if (customVersion) await removeCustomVersionTree(persistSdkRoot, customVersion);
+  // Snapshots for the dropped custom version AND the bundle version we're
+  // returning to may both hold pre-reset firmware images — drop them so the
+  // next launch cold-boots the freshly provisioned firmware (see install).
+  const snapFs = realProvisionFs();
+  if (customVersion) await invalidateVersionSnapshots(snapFs, persistSdkRoot, customVersion).catch(() => {});
+  const bundleVersion = pickSdkVersion(await snapFs.list(winPath.join(sdkBundleRoot(ctx), "SDKs")));
+  if (bundleVersion) await invalidateVersionSnapshots(snapFs, persistSdkRoot, bundleVersion).catch(() => {});
   const reprovision = deps.reprovision ?? (async (c: WinRuntimeCtx) => {
     _resetProvisionState();
     await provisionWinSdk(c, { onProgress: log });

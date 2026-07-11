@@ -5,6 +5,8 @@ import {
   looksLikeArchive,
   applyFullLauncherFirmware,
   isPathInside,
+  isVersionNewer,
+  invalidateVersionSnapshots,
   EXTRACT_PY,
   EXTRACT_OK_TOKEN,
   type SdkFsProbe,
@@ -215,5 +217,110 @@ describe("applyFullLauncherFirmware", () => {
     const done = await applyFullLauncherFirmware(fs, paths);
     expect(done).toEqual([]);
     expect(fs.calls.some((c) => c.startsWith("write"))).toBe(false);
+  });
+
+  // ── #8/#11 fix: never DOWNGRADE an upload that is newer than the bundled fw ──
+  // The overlay exists to keep the unlocked launcher, but the bundled blobs are
+  // pinned versions (modern boards 4.13.0, legacy boards 4.9.169). An SDK upload
+  // NEWER than a board's bundled firmware must keep its own (newer) firmware, or
+  // .pbws built with the new SDK hit "requires a newer version of the firmware".
+  it("skips EVERY board when the upload is newer than all bundled firmware (4.17)", async () => {
+    const fs = fakeFwFs(fullPresent());
+    const done = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.17" });
+    expect(done).toEqual([]);
+    expect(fs.calls.some((c) => c.startsWith("copy"))).toBe(false);
+    expect(fs.has(MARKER)).toBe(false);
+  });
+
+  it("overlays only the boards whose bundled fw is >= the upload (4.11: modern yes, legacy no)", async () => {
+    const fs = fakeFwFs(fullPresent());
+    const done = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.11" });
+    // modern boards carry 4.13.0 (>= 4.11) → overlaid; legacy carry 4.9.169 (< 4.11) → kept.
+    expect(done.sort()).toEqual(["emery", "flint", "gabbro"]);
+    expect(fs.calls.some((c) => c.includes("\\basalt\\"))).toBe(false);
+    expect(fs.has(MARKER)).toBe(true); // some boards did get the launcher
+  });
+
+  it("still overlays everything for a same-or-older upload (4.9.169)", async () => {
+    const fs = fakeFwFs(fullPresent());
+    const done = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.9.169" });
+    expect(done).toEqual([...FW_REFRESH_BOARDS]);
+  });
+
+  it("treats an unparseable upload version like today (overlay everything)", async () => {
+    const fs = fakeFwFs(fullPresent());
+    const done = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "weird" });
+    expect(done).toEqual([...FW_REFRESH_BOARDS]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isVersionNewer (pure dotted-version comparator for the overlay gate)
+// ---------------------------------------------------------------------------
+
+describe("isVersionNewer", () => {
+  it("compares dotted versions numerically", () => {
+    expect(isVersionNewer("4.17", "4.13.0")).toBe(true);
+    expect(isVersionNewer("4.13.0", "4.17")).toBe(false);
+    expect(isVersionNewer("4.9.170", "4.9.169")).toBe(true);
+    expect(isVersionNewer("4.10", "4.9.169")).toBe(true); // 10 > 9, not lexicographic
+  });
+  it("is false for equal versions (missing segments are zero)", () => {
+    expect(isVersionNewer("4.13", "4.13.0")).toBe(false);
+    expect(isVersionNewer("4.13.0", "4.13")).toBe(false);
+  });
+  it("is false when either side is unparseable (conservative: keep old behavior)", () => {
+    expect(isVersionNewer("weird", "4.13.0")).toBe(false);
+    expect(isVersionNewer("4.17", "")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// invalidateVersionSnapshots (#8/#11 fix: SDK swap must drop stale snapshots)
+// ---------------------------------------------------------------------------
+
+describe("invalidateVersionSnapshots", () => {
+  const ROOT = "C:\\persist\\pebble-sdk";
+  /** Fake fs: `dirs` maps a dir path → entry names; remove() records. */
+  function fakeSnapFs(dirs: Record<string, string[]>, present: string[] = []) {
+    const removed: string[] = [];
+    const set = new Set(present);
+    return {
+      removed,
+      async list(p: string) { return dirs[p] ?? []; },
+      async exists(p: string) { return set.has(p); },
+      async remove(p: string) { removed.push(p); },
+      // unused ProvisionFs members
+      async copyFile() {}, async writeText() {}, async readText() { return ""; },
+      async mkdirp() {}, async copyTree() {}, async ensureJunction() {},
+    };
+  }
+
+  it("removes the .snapshot dir under every board dir of the version", async () => {
+    const verDir = winPath.join(ROOT, "4.17");
+    const fs = fakeSnapFs(
+      { [verDir]: ["basalt", "emery", "robert.txt"] },
+      [
+        winPath.join(verDir, "basalt", ".snapshot"),
+        winPath.join(verDir, "emery", ".snapshot"),
+      ],
+    );
+    await invalidateVersionSnapshots(fs, ROOT, "4.17");
+    expect(fs.removed.sort()).toEqual([
+      winPath.join(verDir, "basalt", ".snapshot"),
+      winPath.join(verDir, "emery", ".snapshot"),
+    ]);
+  });
+
+  it("is a no-op when the version dir has no boards or no snapshots", async () => {
+    const fs = fakeSnapFs({});
+    await invalidateVersionSnapshots(fs, ROOT, "4.17");
+    expect(fs.removed).toEqual([]);
+  });
+
+  it("rejects a version string that could escape the SDK store", async () => {
+    const fs = fakeSnapFs({ [winPath.join(ROOT, "..")]: ["x"] }, [winPath.join(ROOT, "..", "x", ".snapshot")]);
+    await invalidateVersionSnapshots(fs, ROOT, "..");
+    expect(fs.removed).toEqual([]);
   });
 });
