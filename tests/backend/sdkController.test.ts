@@ -285,12 +285,22 @@ describe("applyFullLauncherFirmware", () => {
     );
   });
 
-  it("force overlays newer boards too (skippedNewer becomes empty)", async () => {
-    const fs = fakeFwFs(fullPresent());
+  it("force overlays newer boards too, still stashing (skippedNewer becomes empty)", async () => {
+    // Seed dst blobs so the stash copy has something to copy (like the stash test).
+    const present = fullPresent();
+    for (const b of FW_REFRESH_BOARDS) for (const blob of FW_REFRESH_BLOBS) present.push(winPath.join(dstQemu(b), blob));
+    const fs = fakeFwFs(present);
     const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.17" }, undefined, { force: true });
     expect(r.applied).toEqual([...FW_REFRESH_BOARDS]);
     expect(r.skippedNewer).toEqual([]);
     expect(fs.has(MARKER)).toBe(true);
+    // force MUST still stash + overlay (reversibility): prove both mutations ran for a newer board.
+    expect(fs.calls).toContain(
+      `copy ${winPath.join(dstQemu("emery"), FW_REFRESH_BLOBS[0])} -> ${winPath.join(STASH("emery"), FW_REFRESH_BLOBS[0])}`,
+    );
+    expect(fs.calls).toContain(
+      `copy ${winPath.join(srcQemu("emery"), FW_REFRESH_BLOBS[0])} -> ${winPath.join(dstQemu("emery"), FW_REFRESH_BLOBS[0])}`,
+    );
   });
 
   it("dryRun computes the report without mutating anything", async () => {
@@ -301,12 +311,13 @@ describe("applyFullLauncherFirmware", () => {
     expect(fs.has(MARKER)).toBe(false);                 // no marker written
   });
 
-  it("dryRun still reports skippedNewer without mutating", async () => {
+  it("force + dryRun: reports newer boards as applied but mutates nothing", async () => {
     const fs = fakeFwFs(fullPresent());
-    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.17" }, undefined, { dryRun: true });
-    expect(r.applied).toEqual([]);
-    expect(r.skippedNewer.sort()).toEqual([...FW_REFRESH_BOARDS].sort());
-    expect(fs.calls).toEqual([]);
+    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.17" }, undefined, { force: true, dryRun: true });
+    expect(r.applied).toEqual([...FW_REFRESH_BOARDS]); // force reaches them
+    expect(r.skippedNewer).toEqual([]);
+    expect(fs.calls).toEqual([]);                       // dryRun blocked all mutation
+    expect(fs.has(MARKER)).toBe(false);
   });
 });
 
