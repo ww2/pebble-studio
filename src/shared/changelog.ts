@@ -13,7 +13,34 @@ export interface ChangelogEntry {
 export const CHANGELOG: ChangelogEntry[] = [
   // The 2.x line is the native-Windows track (no WSL); the 1.x line is the
   // WSL-connected track. 2.0.1 is the first native release. 3.0.0 is the first
-  // public open-source release.
+  // public open-source release. (3.0.6 was never released.)
+  { version: "3.0.11", date: "2026-07-11", changes: [
+    "\"Make full-featured\" now gives the modern watches (Pebble Time 2 / Pebble 2 Duo / the new Pebble) the full launcher AND runs apps built with newer SDKs. Previously the bundled launcher firmware was one app-version behind the current SDK, so those apps were rejected with \"requires a newer version of the Pebble firmware\"; the launcher firmware for those models has been rebuilt to accept them.",
+    "Whether the launcher can be added is now decided by real app compatibility (the SDK version your apps actually require vs the launcher firmware) instead of the SDK's release number, so the warning only appears when apps would genuinely be rejected.",
+  ] },
+  { version: "3.0.10", date: "2026-07-11", changes: [
+    "\"Make full-featured\" no longer risks silently breaking your apps. When your SDK is newer than Studio's bundled launcher, it now keeps your firmware by default and explains, in a themed in-app dialog (not a plain Windows pop-up), that overlaying Studio's older launcher would downgrade the firmware and cause apps to be rejected with \"requires a newer version of the Pebble firmware.\" Downgrading is still possible, but only as a clearly-labelled, deliberate choice — and \"Revert to stock firmware\" always undoes it.",
+    "Removing that Windows pop-up also fixes the emulator zooming in by itself after \"Make full-featured.\"",
+    "Settings → Pebble SDK: the \"Upload archive\" and \"Upload folder\" buttons lost their \"…\" and now show a hover tooltip listing exactly which files they accept.",
+    "Sharper, more responsive emulator display: the watch's screen stream is now tuned for the local connection (crisper image, less CPU), and the diagnostic FPS read-out is more accurate.",
+  ] },
+  { version: "3.0.9", date: "2026-07-11", changes: [
+    "\"Make full-featured\" can now add the launcher to an SDK that is newer than Studio's bundled launcher firmware: it asks first (\"Apply anyway?\") and then overlays Studio's launcher on those models. The launcher works, but apps built with the newer SDK may be rejected — use \"Revert to stock firmware\" to undo it. SDKs at or below our firmware are unaffected.",
+    "Applying the launcher no longer reboots the emulator when nothing actually changes (for example when you decline the downgrade), and the emulator no longer over-zooms after a relaunch.",
+    "SDK status messages now clear themselves: \"Relaunching…\" is replaced once the relaunch finishes, and messages auto-dismiss after a few seconds.",
+  ] },
+  { version: "3.0.8", date: "2026-07-11", changes: [
+    "The full PebbleOS launcher is now opt-in for uploaded SDKs. A freshly uploaded SDK runs its own firmware as-is; a new \"Make full-featured\" button in Settings → Pebble SDK overlays Studio's full launcher (Settings, Health, full menu) on demand and reports, per watch model, whether it could — a model whose firmware is newer than our launcher is left alone instead of being silently downgraded.",
+    "The launcher overlay is now reversible: applying it stashes each model's original firmware, so \"Revert to stock firmware\" restores the SDK's own firmware in one click without re-uploading.",
+  ] },
+  { version: "3.0.7", date: "2026-07-10", changes: [
+    "Fixed (#8, #11): uploading a newer Pebble SDK now actually updates the emulator's firmware. Previously Studio silently stamped its own bundled (older) firmware over every uploaded SDK to preserve the full PebbleOS launcher, so apps built with a newer SDK were rejected with \"This app requires a newer version of the Pebble firmware\". The launcher firmware is now only applied to a watch model when it wouldn't be a downgrade — an upload newer than the bundled firmware keeps its own firmware (that model then uses the SDK's stock launcher).",
+    "Also fixed as part of that: uploading or resetting an SDK now discards the instant-launch snapshots for the affected version, so the next launch can't restore a pre-swap firmware image; and \"Reset to bundled\" now stops an in-flight or background pre-booted emulator before switching, like Upload already did.",
+    "Emulator app logs (#6): the \"Emulator logs\" panel is now on by default — watchface APP_LOG output and PebbleKit JS console messages stream live in a collapsible panel under the emulator. The stream now rides Studio's existing emulator connection instead of a separate one, so it no longer competes with app installs for the emulator bridge's limited client slots — logs keep flowing during installs (previously the stream was paused exactly then, and the panel was hidden behind Settings → Advanced).",
+    "npm install now automatically repairs an Electron install that newer Node versions can silently truncate during extraction.",
+    "Fixed: the background reader that keeps Studio's emulator connection drained (the protection against config pages dying with \"No config page\" after repeated opens) crashed silently the first time the connection went idle, so it effectively never ran — broken since v3.0.3. The \"Emulator logs\" panel also now prints a confirmation line when the app-log stream connects.",
+    "Where's v3.0.6? It was an internal build we used for performance experiments. It didn't meet our quality bar in testing, so it was never released — we've skipped the number and rolled the best of that work into future updates.",
+  ]},
   { version: "3.0.5", date: "2026-07-10", changes: [
     "The emulator now launches almost instantly on every watch model: Pebble Studio keeps a ready-to-run snapshot of a booted watch and restores it instead of booting from scratch. The boot pipeline is faster overall on every board too. (The first launch of each watch after this update boots normally once while its snapshot is created.)",
     "New option (Settings → \"Pre-boot emulator on app start\"): have Pebble Studio start your startup watch booting in the background the moment you open it, so your first Launch is near-instant. Off by default — turn it on if you'd like it.",

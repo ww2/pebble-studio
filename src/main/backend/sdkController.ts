@@ -19,6 +19,7 @@
 
 import { win32 as winPath } from "node:path";
 import { mkdir, readdir, readFile, rm, cp, stat, writeFile, statfs } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import type { WinRuntimeCtx } from "./winRuntime.js";
 import { pebbleDataDir, pebblePyExe, sdkBundleRoot } from "./winRuntime.js";
 import type { RunResult } from "./BackendDriver.js";
@@ -54,6 +55,79 @@ export interface SdkInfo {
  * overlay has been applied to it. */
 export const FULL_LAUNCHER_MARKER = ".full-launcher";
 
+/** Per-board stash dir name for an uploaded SDK's ORIGINAL qemu firmware, so the
+ * full-launcher overlay is reversible. Lives at
+ * `<persistSdkRoot>\SDKs\<ver>\.stock-fw\<board>`. */
+export const STOCK_FW_STASH = ".stock-fw";
+
+/** Per-board outcome of a full-launcher overlay attempt. `applied` = boards now
+ * running our launcher; `skippedNewer` = boards left alone because the SDK's own
+ * firmware is newer than ours (never downgrade); `skippedMissing` = boards the
+ * bundle or the SDK doesn't ship. */
+export interface FullLauncherReport {
+  applied: string[];
+  skippedNewer: string[];
+  skippedMissing: string[];
+}
+
+/**
+ * Firmware version each board's BUNDLED overlay blobs actually are. The overlay
+ * must never DOWNGRADE an uploaded SDK (#8/#11: a 4.17 upload overlaid with these
+ * boots old firmware, and 4.17-built .pbws are rejected with "requires a newer
+ * version of the Pebble firmware"). Modern boards carry the normal-shell v4.13.0
+ * build (2026-06-15, coredevices/PebbleOS); legacy boards carry the 4.9.169
+ * sdk-core firmware (health-seeded SPI). Update alongside vendor/pebble-sdk fw.
+ */
+export const BUNDLED_FW_VERSIONS: Readonly<Record<string, string>> = {
+  emery: "4.13.0",
+  gabbro: "4.13.0",
+  flint: "4.13.0",
+  basalt: "4.9.169",
+  chalk: "4.9.169",
+  diorite: "4.9.169",
+};
+
+/**
+ * The app-compat SDK-version MINOR each board's BUNDLED overlay firmware
+ * ADVERTISES (firmware accepts an app iff app.minor <= this AND major==5 — see
+ * PebbleOS app_install_manager.c). Modern boards carry the normal-shell gate-101
+ * build (v4.13.0 code with PROCESS_INFO_CURRENT_SDK_VERSION_MINOR raised to
+ * 0x65); legacy boards carry the 4.9.169 firmware (minor 86). This is the REAL
+ * "will apps be rejected?" signal — a per-board number, not the SDK's release
+ * string. Update alongside vendor/pebble-sdk fw. (Major is 5 for all.)
+ */
+export const BUNDLED_FW_MINORS: Readonly<Record<string, number>> = {
+  emery: 101, gabbro: 101, flint: 101,
+  basalt: 86, chalk: 86, diorite: 86,
+};
+
+/** Decimal value of PROCESS_INFO_CURRENT_SDK_VERSION_MINOR in a board's
+ * pebble_process_info.h (hex `0x..` or decimal), or null when absent/unparseable.
+ * PURE. */
+export function parseAppSdkMinor(headerText: string): number | null {
+  const m = /PROCESS_INFO_CURRENT_SDK_VERSION_MINOR\s+(0x[0-9a-fA-F]+|\d+)/.exec(headerText);
+  if (!m) return null;
+  const v = m[1].startsWith("0x") ? parseInt(m[1], 16) : parseInt(m[1], 10);
+  return Number.isFinite(v) ? v : null;
+}
+
+/**
+ * True when dotted version `a` is strictly newer than `b` (numeric per segment,
+ * missing segments are 0). Unparseable input → false, so callers conservatively
+ * keep today's behavior for weird version strings. PURE.
+ */
+export function isVersionNewer(a: string, b: string): boolean {
+  const parse = (v: string): number[] | null =>
+    /^\d+(\.\d+)*$/.test(v.trim()) ? v.trim().split(".").map(Number) : null;
+  const pa = parse(a), pb = parse(b);
+  if (!pa || !pb) return false;
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] ?? 0, y = pb[i] ?? 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+
 /** Paths the full-launcher firmware overlay touches (PURE — resolved by caller). */
 export interface FullLauncherPaths {
   /** Bundled (full-launcher) sdk-core to copy firmware FROM. */
@@ -64,6 +138,19 @@ export interface FullLauncherPaths {
   marker: string;
   /** pebble-tool's decompressed spi for a board (deleted so it regenerates). */
   decompressedSpi: (board: string) => string;
+  /** Per-board stash dir for the SDK's ORIGINAL qemu blobs (revert source).
+   * Resolved by the caller to `<persistSdkRoot>\SDKs\<ver>\.stock-fw\<board>`. */
+  stashQemuDir: (board: string) => string;
+  /** The uploaded SDK's declared version. Informational only now (used in the
+   * skip log line) — the never-downgrade gate is driven by `appMinorFor` below,
+   * not this release string. */
+  uploadVersion?: string;
+  /** Per-board app SDK-minor reader for the UPLOADED SDK (from its
+   * pebble/<board>/include/pebble_process_info.h). null → unknown, treated as
+   * compatible (preserve legacy overlay-when-unknown behavior). This is the real
+   * compat signal (app accepted iff app.minor <= fw.minor), superseding the
+   * uploadVersion/isVersionNewer manifest heuristic. */
+  appMinorFor?: (board: string) => number | null;
 }
 
 /**
@@ -81,27 +168,117 @@ export async function applyFullLauncherFirmware(
   fs: ProvisionFs,
   p: FullLauncherPaths,
   log: (msg: string) => void = () => {},
-): Promise<string[]> {
+  opts: { force?: boolean; dryRun?: boolean } = {},
+): Promise<FullLauncherReport> {
   const { win32: wp } = await import("node:path");
-  const done: string[] = [];
+  const applied: string[] = [];
+  const skippedNewer: string[] = [];
+  const skippedMissing: string[] = [];
   for (const board of FW_REFRESH_BOARDS) {
+    // Never make apps un-installable: skip a board whose bundled firmware
+    // advertises a LOWER app SDK-minor than the uploaded SDK stamps into apps
+    // (firmware accepts an app iff app.minor <= fw.minor). This is the real compat
+    // test — not the SDK's release string. `force` bypasses it (still stashes, so
+    // it stays reversible). Unknown app-minor (null) → treat as compatible.
+    const appMinor = p.appMinorFor?.(board) ?? null;
+    const fwMinor = BUNDLED_FW_MINORS[board];
+    if (!opts.force && appMinor != null && fwMinor != null && appMinor > fwMinor) {
+      skippedNewer.push(board);
+      continue;
+    }
     const src = wp.join(p.bundleSdkCore, "pebble", board, "qemu");
     const dst = wp.join(p.targetSdkCore, "pebble", board, "qemu");
-    if (!(await fs.exists(wp.join(src, FW_REFRESH_BLOBS[0])))) continue; // bundle lacks this board
-    if (!(await fs.exists(dst))) continue; // uploaded SDK lacks this board → replace-only
+    if (!(await fs.exists(wp.join(src, FW_REFRESH_BLOBS[0])))) { skippedMissing.push(board); continue; }
+    if (!(await fs.exists(dst))) { skippedMissing.push(board); continue; }
+    // dryRun: report what WOULD apply, but perform no fs mutation.
+    if (!opts.dryRun) {
+      // Stash the SDK's OWN blobs BEFORE overwriting so revert can restore them.
+      // PER-BLOB guard: stash a blob only when it isn't already stashed. A single
+      // blob[0]-only guard was unsafe — a crash between the two copyFiles left a
+      // half stash (blob[0] only) that a later apply then trusted, overwriting the
+      // still-original blob[1] in dst with launcher bytes that revert could never
+      // undo. Per-blob, an interrupted apply re-stashes the missing blob next time,
+      // while a fully-stashed board is still never overwritten with overlaid bytes.
+      const stashDir = p.stashQemuDir(board);
+      await fs.mkdirp(stashDir);
+      for (const blob of FW_REFRESH_BLOBS) {
+        const cur = wp.join(dst, blob);
+        const stashed = wp.join(stashDir, blob);
+        if (!(await fs.exists(stashed)) && (await fs.exists(cur))) {
+          await fs.copyFile(cur, stashed);
+        }
+      }
+      for (const blob of FW_REFRESH_BLOBS) {
+        const s = wp.join(src, blob);
+        if (await fs.exists(s)) await fs.copyFile(s, wp.join(dst, blob));
+      }
+      // Drop the stale decompressed spi so pebble-tool regenerates it.
+      await fs.remove(p.decompressedSpi(board));
+    }
+    applied.push(board);
+  }
+  if (applied.length > 0) {
+    if (!opts.dryRun) await fs.writeText(p.marker, "1");
+    log(`Applied full PebbleOS launcher firmware (${applied.join(", ")}).`);
+  }
+  if (skippedNewer.length > 0) {
+    log(
+      `Apps built with SDK ${p.uploadVersion ?? "(unknown)"} need a firmware newer than ` +
+      `Studio's bundled launcher — keeping each board's own firmware on ${skippedNewer.join(", ")}.`,
+    );
+  }
+  return { applied, skippedNewer, skippedMissing };
+}
+
+/**
+ * Undo a full-launcher overlay by restoring the SDK's OWN firmware from the
+ * `.stock-fw` stash. Per board: copy stashed blobs back over the overlaid ones
+ * and drop the decompressed spi so it regenerates. Removes the `.full-launcher`
+ * marker at the end (always, so state is clean even if no board had a stash). A
+ * board with no stash is skipped. Returns the boards actually reverted.
+ */
+export async function revertFullLauncherFirmware(
+  fs: ProvisionFs,
+  p: Pick<FullLauncherPaths, "targetSdkCore" | "marker" | "decompressedSpi" | "stashQemuDir">,
+  log: (msg: string) => void = () => {},
+): Promise<string[]> {
+  const { win32: wp } = await import("node:path");
+  const reverted: string[] = [];
+  for (const board of FW_REFRESH_BOARDS) {
+    const stashDir = p.stashQemuDir(board);
+    if (!(await fs.exists(wp.join(stashDir, FW_REFRESH_BLOBS[0])))) continue; // nothing stashed
+    const dst = wp.join(p.targetSdkCore, "pebble", board, "qemu");
     for (const blob of FW_REFRESH_BLOBS) {
-      const s = wp.join(src, blob);
+      const s = wp.join(stashDir, blob);
       if (await fs.exists(s)) await fs.copyFile(s, wp.join(dst, blob));
     }
-    // Drop the stale decompressed spi so pebble-tool regenerates it from the new template.
     await fs.remove(p.decompressedSpi(board));
-    done.push(board);
+    reverted.push(board);
   }
-  if (done.length > 0) {
-    await fs.writeText(p.marker, "1");
-    log(`Applied full PebbleOS launcher firmware (${done.join(", ")}).`);
+  await fs.remove(p.marker);
+  if (reverted.length > 0) log(`Reverted to the SDK's own firmware (${reverted.join(", ")}).`);
+  return reverted;
+}
+
+/**
+ * Delete every board's QEMU snapshot bundle for a version
+ * (`<persistSdkRoot>\<version>\<board>\.snapshot`). #8/#11: snapshot bundles are
+ * keyed on {fwRev, sdkVer, exeStamp} — NOT firmware content — so swapping the
+ * SDK in place (upload or reset) could otherwise serve an instant-launch restore
+ * of the PREVIOUS firmware. Best-effort: enumerates whatever board dirs exist;
+ * a version string that isn't a plain dotted number is refused (path safety).
+ */
+export async function invalidateVersionSnapshots(
+  fs: Pick<ProvisionFs, "list" | "exists" | "remove">,
+  persistSdkRoot: string,
+  version: string,
+): Promise<void> {
+  if (!/^\d+(\.\d+)*$/.test(version)) return;
+  const verDir = winPath.join(persistSdkRoot, version);
+  for (const name of await fs.list(verDir)) {
+    const snap = winPath.join(verDir, name, ".snapshot");
+    if (await fs.exists(snap)) await fs.remove(snap);
   }
-  return done;
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +505,16 @@ export async function installCustomSdk(
     }
     await ensureFreeSpace(persistSdkRoot, SDK_INSTALL_MIN_FREE_BYTES, "install the SDK");
     await rm(target, { recursive: true, force: true }).catch(() => {});
+    // A fresh upload loads as-is / stock (commit "load as-is"). Clear any prior
+    // install's full-launcher state for this version dir — the `.full-launcher`
+    // marker and the `.stock-fw` stash are SIBLINGS of sdk-core, so the rm above
+    // (which only wipes sdk-core) leaves them behind. Left stale, a same-version
+    // re-upload of a DIFFERENT build would report fullLauncher=true for stock
+    // firmware, and a later Revert would restore the PREVIOUS build's stashed
+    // blobs over this one. Wiping them keeps currentSdkInfo and revert honest.
+    const versionDir = winPath.join(persistSdkRoot, "SDKs", version);
+    await rm(winPath.join(versionDir, FULL_LAUNCHER_MARKER), { force: true }).catch(() => {});
+    await rm(winPath.join(versionDir, STOCK_FW_STASH), { recursive: true, force: true }).catch(() => {});
     await mkdir(winPath.dirname(target), { recursive: true });
     await cp(sdkCoreDir, target, { recursive: true });
 
@@ -341,23 +528,11 @@ export async function installCustomSdk(
     // 5. Write the override marker so provisioning prefers this SDK from now on.
     await writeFile(winPath.join(persistSdkRoot, ACTIVE_SDK_MARKER), version);
 
-    // 6. Overlay the bundled full-launcher firmware so the upload keeps unlocked
-    //    PebbleOS (Settings/Health/full menu) instead of the stock sdkshell
-    //    launcher. Best-effort — never fail the install on a firmware hiccup.
-    try {
-      const bundleVersion = pickSdkVersion(await realProvisionFs().list(winPath.join(sdkBundleRoot(ctx), "SDKs")));
-      if (bundleVersion) {
-        const boards = await applyFullLauncherFirmware(realProvisionFs(), {
-          bundleSdkCore: winPath.join(sdkBundleRoot(ctx), "SDKs", bundleVersion, "sdk-core"),
-          targetSdkCore: target,
-          marker: winPath.join(persistSdkRoot, "SDKs", version, FULL_LAUNCHER_MARKER),
-          decompressedSpi: (board) => winPath.join(persistSdkRoot, version, board, "qemu_spi_flash.bin"),
-        }, log);
-        if (boards.length === 0) log("No full-launcher firmware to apply (uploaded SDK keeps its own firmware).");
-      }
-    } catch (e) {
-      log(`Full-launcher overlay skipped (non-fatal): ${(e as Error)?.message ?? e}`);
-    }
+    // 6. Drop any QEMU snapshot bundles for this version: they may hold a
+    //    restore image of DIFFERENT firmware bytes under the same {fwRev, sdkVer,
+    //    exeStamp} key, and an instant-launch restore would boot the old
+    //    firmware, bypassing this upload entirely. Best-effort.
+    await invalidateVersionSnapshots(realProvisionFs(), persistSdkRoot, version).catch(() => {});
   } finally {
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -396,6 +571,84 @@ export async function currentSdkInfo(ctx: WinRuntimeCtx): Promise<SdkInfo> {
 }
 
 /**
+ * Resolve the FullLauncherPaths for the currently-active CUSTOM SDK. Throws a
+ * user-facing error when no custom SDK is active — the bundled SDK is always
+ * full-launcher, so there is nothing to toggle.
+ */
+async function activeCustomSdkPaths(
+  ctx: WinRuntimeCtx,
+): Promise<{ version: string; persistSdkRoot: string; paths: FullLauncherPaths }> {
+  const persistSdkRoot = winPath.join(pebbleDataDir(ctx), "pebble-sdk");
+  const version = await readActiveSdkOverride(realProvisionFs(), persistSdkRoot);
+  if (!version) {
+    throw new Error("Upload a custom SDK first — the bundled SDK already has the full launcher.");
+  }
+  const bundleVersion = pickSdkVersion(await realProvisionFs().list(winPath.join(sdkBundleRoot(ctx), "SDKs")));
+  const paths: FullLauncherPaths = {
+    bundleSdkCore: bundleVersion ? winPath.join(sdkBundleRoot(ctx), "SDKs", bundleVersion, "sdk-core") : "",
+    targetSdkCore: winPath.join(persistSdkRoot, "SDKs", version, "sdk-core"),
+    marker: winPath.join(persistSdkRoot, "SDKs", version, FULL_LAUNCHER_MARKER),
+    decompressedSpi: (board) => winPath.join(persistSdkRoot, version, board, "qemu_spi_flash.bin"),
+    stashQemuDir: (board) => winPath.join(persistSdkRoot, "SDKs", version, STOCK_FW_STASH, board),
+    uploadVersion: version,
+    appMinorFor: (board) => {
+      // The uploaded SDK stamps this board's app SDK-minor from its own
+      // pebble/<board>/include/pebble_process_info.h — the real "will apps be
+      // rejected?" number. Missing/unreadable → null (treated as compatible).
+      const hdr = winPath.join(
+        persistSdkRoot, "SDKs", version, "sdk-core",
+        "pebble", board, "include", "pebble_process_info.h",
+      );
+      try {
+        return parseAppSdkMinor(readFileSync(hdr, "utf8"));
+      } catch {
+        return null;
+      }
+    },
+  };
+  return { version, persistSdkRoot, paths };
+}
+
+/** Apply the full-launcher overlay to the active custom SDK on demand, then drop
+ * its snapshots (firmware changed). Returns the per-board report + refreshed info. */
+export async function applyFullLauncherToActiveSdk(
+  ctx: WinRuntimeCtx,
+  deps: { onProgress?: (msg: string) => void; force?: boolean; dryRun?: boolean } = {},
+): Promise<{ report: FullLauncherReport; info: SdkInfo }> {
+  const log = deps.onProgress ?? (() => {});
+  const { version, persistSdkRoot, paths } = await activeCustomSdkPaths(ctx);
+  try {
+    const report = await applyFullLauncherFirmware(realProvisionFs(), paths, log, { force: deps.force, dryRun: deps.dryRun });
+    return { report, info: await currentSdkInfo(ctx) };
+  } finally {
+    // Firmware bytes may have changed even on a partial/throwing apply — drop
+    // snapshots on ALL paths so no stale restore can boot pre-toggle firmware.
+    // dryRun mutates nothing, so leave the snapshots intact.
+    if (!deps.dryRun) {
+      await invalidateVersionSnapshots(realProvisionFs(), persistSdkRoot, version).catch(() => {});
+    }
+  }
+}
+
+/** Revert the active custom SDK to its own firmware, then drop its snapshots.
+ * Returns the reverted boards + refreshed info. */
+export async function revertFullLauncherOnActiveSdk(
+  ctx: WinRuntimeCtx,
+  deps: { onProgress?: (msg: string) => void } = {},
+): Promise<{ reverted: string[]; info: SdkInfo }> {
+  const log = deps.onProgress ?? (() => {});
+  const { version, persistSdkRoot, paths } = await activeCustomSdkPaths(ctx);
+  try {
+    const reverted = await revertFullLauncherFirmware(realProvisionFs(), paths, log);
+    return { reverted, info: await currentSdkInfo(ctx) };
+  } finally {
+    // Firmware bytes may have changed even on a partial/throwing revert — drop
+    // snapshots on ALL paths so no stale restore can boot pre-toggle firmware.
+    await invalidateVersionSnapshots(realProvisionFs(), persistSdkRoot, version).catch(() => {});
+  }
+}
+
+/**
  * Drop the user override and return to the bundled SDK. Removes the marker AND
  * the custom version tree it named, then re-provisions so `current` points back
  * at a FRESH bundled copy.
@@ -418,6 +671,13 @@ export async function resetToBundledSdk(
   const customVersion = (await readFile(marker, "utf8").catch(() => "")).trim();
   if (await exists(marker)) await rm(marker, { force: true }).catch(() => {});
   if (customVersion) await removeCustomVersionTree(persistSdkRoot, customVersion);
+  // Snapshots for the dropped custom version AND the bundle version we're
+  // returning to may both hold pre-reset firmware images — drop them so the
+  // next launch cold-boots the freshly provisioned firmware (see install).
+  const snapFs = realProvisionFs();
+  if (customVersion) await invalidateVersionSnapshots(snapFs, persistSdkRoot, customVersion).catch(() => {});
+  const bundleVersion = pickSdkVersion(await snapFs.list(winPath.join(sdkBundleRoot(ctx), "SDKs")));
+  if (bundleVersion) await invalidateVersionSnapshots(snapFs, persistSdkRoot, bundleVersion).catch(() => {});
   const reprovision = deps.reprovision ?? (async (c: WinRuntimeCtx) => {
     _resetProvisionState();
     await provisionWinSdk(c, { onProgress: log });

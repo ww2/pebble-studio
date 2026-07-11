@@ -319,3 +319,65 @@ describe("readPypkjsPort", () => {
     expect(readPypkjsPort("x", () => noPort)).toBeNull();
   });
 });
+
+describe("WinInputChannel.streamAppLogs (#6 app-log stream)", () => {
+  it("sends 'logs on' and forwards LOG lines with the prefix stripped", () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+    const lines: string[] = [];
+
+    const handle = ch.streamAppLogs((l) => lines.push(l));
+    expect(handle).not.toBeNull();
+    expect(fake.writes).toEqual(["logs on\n"]);
+
+    fake.emit("LOG [12:00:01] main.c:42> hello world");
+    fake.emit("LOG [12:00:02] pkjs> ready");
+    expect(lines).toEqual(["[12:00:01] main.c:42> hello world", "[12:00:02] pkjs> ready"]);
+  });
+
+  it("kill() unsubscribes without killing the helper (input keeps working)", () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+    const lines: string[] = [];
+
+    const handle = ch.streamAppLogs((l) => lines.push(l))!;
+    handle.kill();
+    fake.emit("LOG [12:00:01] main.c:1> after kill");
+    expect(lines).toEqual([]);
+    expect(ch.send("click select")).toBe(true); // channel itself still alive
+  });
+
+  it("returns null when not booted (no port) — caller falls back to CLI", () => {
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => null, spawnChild: vi.fn() });
+    expect(ch.streamAppLogs(() => {})).toBeNull();
+  });
+
+  it("LOG lines do not resolve a pending screenshot ack", async () => {
+    const fake = makeShotChild();
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => 5555, spawnChild: () => fake.child });
+    ch.streamAppLogs(() => {});
+
+    const p = ch.screenshot("C:/caps/shot.png");
+    fake.emit("LOG [12:00:01] main.c:1> not an ack");
+    fake.emit("OK C:/caps/shot.png");
+    expect(await p).toBe(true);
+  });
+
+  it("re-arms 'logs on' on the NEW helper after a respawn (port change)", () => {
+    const first = makeShotChild();
+    const second = makeShotChild();
+    const children = [first.child, second.child];
+    let idx = 0;
+    let port = 5555;
+    const ch = new WinInputChannel({ helper: HELPER, readPort: () => port, spawnChild: () => children[idx++] });
+    const lines: string[] = [];
+
+    ch.streamAppLogs((l) => lines.push(l));
+    port = 6666; // reboot → new pypkjs port
+    ch.send("click select"); // respawns against the new port
+
+    expect(second.writes).toContain("logs on\n");
+    second.emit("LOG [12:00:03] main.c:7> survived reboot");
+    expect(lines).toEqual(["[12:00:03] main.c:7> survived reboot"]);
+  });
+});

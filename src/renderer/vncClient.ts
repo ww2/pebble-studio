@@ -21,6 +21,15 @@ export function connectVnc(
   rfb.viewOnly = !touchEnabled; // only emery/gabbro forward pointer events
   rfb.scaleViewport = true;
   rfb.clipViewport = false;
+  // The emulator's VNC server is on localhost, so bandwidth is free and the
+  // bottleneck is per-frame encode/decode CPU + latency. Default noVNC leans on
+  // Tight+JPEG (tuned for slow links), which spends CPU compressing and adds
+  // artifacts on the crisp watch UI. Prefer near-lossless, near-uncompressed:
+  // highest quality (9) + no zlib (0) → sharper frames and less CPU on both ends,
+  // which keeps interaction feeling responsive. (The frame *cadence* ceiling is
+  // qemu's VNC refresh, which this path can't tune.)
+  rfb.qualityLevel = 9;
+  rfb.compressionLevel = 0;
   rfb.addEventListener("connect", () => console.log("[vnc] connected", url));
   rfb.addEventListener("disconnect", (e: Event) => {
     const clean = (e as CustomEvent<{ clean?: boolean }>).detail?.clean;

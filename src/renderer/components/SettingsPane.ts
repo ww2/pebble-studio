@@ -25,6 +25,8 @@ import {
 } from "../../shared/simEnv.js";
 import { LIVE_SUNLIGHT_KEY, LIVE_SUNLIGHT_EVENT } from "../liveSunlight.js";
 import { LanguagePanel } from "./LanguagePanel.js";
+import { openDialog } from "./ConfirmDialog.js";
+import { planFullLauncherApply } from "../fullLauncherPlan.js";
 
 type ThemeChoice = "light" | "dark";
 type BootMode = "auto" | "manual";
@@ -154,6 +156,25 @@ function clampHelpBubble(tip: HTMLElement, bubble: HTMLElement): void {
   bubble.style.left = `${shift}px`;
 }
 
+/**
+ * Wrap a button in a hover/focus tooltip that explains what it accepts, returning
+ * the wrapper to mount in place of the bare button. The button reference stays
+ * valid (callers keep enabling/disabling it directly). Themed via `.btn-tip`
+ * (see app.css) so it matches the rest of Settings rather than the OS `title`.
+ */
+export function withButtonTooltip(btn: HTMLButtonElement, text: string): HTMLElement {
+  const wrap = document.createElement("span");
+  wrap.className = "btn-tip";
+  const bubble = document.createElement("span");
+  bubble.className = "btn-tip__bubble";
+  bubble.setAttribute("role", "tooltip");
+  bubble.textContent = text;
+  // Also expose it to assistive tech / as an OS fallback for touch.
+  btn.setAttribute("aria-label", `${btn.textContent} — ${text}`);
+  wrap.append(btn, bubble);
+  return wrap;
+}
+
 /** UI state -> persisted SimEnvConfig. tempInput is in `units`; stored as canonical tempC. */
 export function buildSimConfigFromUi(s: {
   enabled: boolean; lat: number; lon: number; name: string;
@@ -235,6 +256,15 @@ export class SettingsPane {
   private readonly captureDirValue: HTMLSpanElement;
   private readonly sdkVersionValue: HTMLSpanElement;
   private readonly sdkStatus: HTMLSpanElement;
+  private sdkFullBtn!: HTMLButtonElement;
+  private sdkFull = false;
+  private sdkSource: "custom" | "bundled" = "bundled";
+  /** Guards toggleFullLauncher against re-entry: its apply branch disables the
+   * buttons only AFTER an async preview + dialog, so without this a double-click
+   * would spawn two concurrent flows (stacked dialogs, double apply). */
+  private sdkOpBusy = false;
+  private sdkStatusTimer?: ReturnType<typeof setTimeout>;
+  private static readonly SDK_STATUS_DISMISS_MS = 6000;
   private bootMode: BootMode;
   /** Switches the live preview to the chosen platform (wired from main.ts). */
   private readonly onPlatformChange: (id: PlatformId) => void;
@@ -1162,8 +1192,8 @@ export class SettingsPane {
 
     const emuLogsRow = this.makeSwitchRow(
       "Show emulator logs",
-      "Stream the watch app logs (the output of pebble install --logs) in a collapsible panel under the emulator. Default off.",
-      localStorage.getItem(EMU_LOGS_KEY) === "true", // default OFF
+      "Stream the watch app logs (the output of pebble install --logs) in a collapsible panel under the emulator. Default on.",
+      localStorage.getItem(EMU_LOGS_KEY) !== "false", // default ON (v3.0.7, #6)
       (on) => {
         localStorage.setItem(EMU_LOGS_KEY, on ? "true" : "false");
         window.dispatchEvent(new Event("pebble-studio:emu-logs-changed"));
@@ -1190,8 +1220,9 @@ export class SettingsPane {
       sdkHeading,
       makeHelpTip(
         "Upload a Pebble SDK (a sdk-core .tar.bz2 / .zip archive or its folder) to replace the bundled one. " +
-          "It persists across updates until you upload another or reset. The full PebbleOS launcher " +
-          "(Settings, Health, full menu) is kept automatically. Relaunch the emulator to use a newly installed SDK.",
+          "An uploaded SDK runs its own firmware as-is; use \"Make full-featured\" to overlay the full PebbleOS " +
+          "launcher (Settings, Health, full menu) — Studio reports any watch model it can't do without downgrading. " +
+          "Relaunch the emulator to use a newly installed SDK.",
       ),
     );
 
@@ -1213,27 +1244,42 @@ export class SettingsPane {
     const sdkUploadBtn = document.createElement("button");
     sdkUploadBtn.type = "button";
     sdkUploadBtn.className = "lib-pick-btn";
-    sdkUploadBtn.textContent = "Upload archive…";
+    sdkUploadBtn.textContent = "Upload archive";
     // Windows' open dialog cannot pick a file and a directory in one picker, so
     // an extracted SDK tree needs its own entry point into the same install path.
     const sdkUploadDirBtn = document.createElement("button");
     sdkUploadDirBtn.type = "button";
     sdkUploadDirBtn.className = "lib-pick-btn";
-    sdkUploadDirBtn.textContent = "Upload folder…";
+    sdkUploadDirBtn.textContent = "Upload folder";
     const sdkResetBtn = document.createElement("button");
     sdkResetBtn.type = "button";
     sdkResetBtn.className = "lib-pick-btn";
     sdkResetBtn.textContent = "Reset to bundled";
+    const sdkFullBtn = document.createElement("button");
+    sdkFullBtn.type = "button";
+    sdkFullBtn.className = "lib-pick-btn";
+    sdkFullBtn.textContent = "Make full-featured";
+    sdkFullBtn.disabled = true; // enabled by applySdkInfo when a custom SDK is active
+    this.sdkFullBtn = sdkFullBtn;
+
     const sdkBtns = document.createElement("div");
     sdkBtns.className = "settings-row-actions";
-    sdkBtns.append(sdkUploadBtn, sdkUploadDirBtn, sdkResetBtn);
+    // The two upload buttons carry a hover/focus tooltip naming what they accept
+    // (a themed bubble, not the slow OS `title`), so the labels can stay short.
+    sdkBtns.append(
+      withButtonTooltip(sdkUploadBtn, "A Pebble SDK archive: .tar.bz2 / .tbz2 / .tar.gz / .tgz / .tar / .zip (a sdk-core bundle)."),
+      withButtonTooltip(sdkUploadDirBtn, "A folder holding an extracted Pebble SDK (contains sdk-core/manifest.json)."),
+      sdkFullBtn,
+      sdkResetBtn,
+    );
 
     this.sdkStatus = document.createElement("span");
     this.sdkStatus.className = "settings-row-desc type-caption";
 
-    const sdkAllBtns = [sdkUploadBtn, sdkUploadDirBtn, sdkResetBtn];
+    const sdkAllBtns = [sdkUploadBtn, sdkUploadDirBtn, sdkFullBtn, sdkResetBtn];
     sdkUploadBtn.addEventListener("click", () => void this.uploadSdk("file", sdkAllBtns));
     sdkUploadDirBtn.addEventListener("click", () => void this.uploadSdk("folder", sdkAllBtns));
+    sdkFullBtn.addEventListener("click", () => void this.toggleFullLauncher(sdkAllBtns));
     sdkResetBtn.addEventListener("click", () => void this.resetSdk(sdkUploadBtn, sdkResetBtn));
 
     sdk.append(sdkHeader, sdkRow, sdkBtns, this.sdkStatus);
@@ -1723,13 +1769,29 @@ export class SettingsPane {
     return `${info.version} (${info.source} · ${fw})`;
   }
 
+  /** Render the active SDK's version + drive the full-launcher toggle's state. */
+  private applySdkInfo(info: { version: string; source: "custom" | "bundled"; fullLauncher: boolean }): void {
+    this.sdkVersionValue.textContent = this.sdkLabel(info);
+    this.sdkFull = info.fullLauncher;
+    this.sdkSource = info.source;
+    const custom = info.source === "custom";
+    this.sdkFullBtn.disabled = !custom;
+    this.sdkFullBtn.textContent = info.fullLauncher ? "Revert to stock firmware" : "Make full-featured";
+    this.sdkFullBtn.title = custom
+      ? info.fullLauncher
+        ? "Restore this SDK's own firmware."
+        : "Overlay the full PebbleOS launcher onto this SDK."
+      : "Upload a custom SDK to toggle the full launcher.";
+  }
+
   /** Query main for the active SDK and render it. */
   private async refreshSdkInfo(): Promise<void> {
     try {
-      this.sdkVersionValue.textContent = this.sdkLabel(await window.studio.sdkInfo());
+      this.applySdkInfo(await window.studio.sdkInfo());
     } catch (err) {
       console.warn("[settings] sdkInfo failed (ignored):", err);
       this.sdkVersionValue.textContent = "unknown";
+      this.sdkFullBtn.disabled = true;
     }
   }
 
@@ -1745,31 +1807,57 @@ export class SettingsPane {
     }
   }
 
+  /** Set the SDK status line. Terminal messages auto-dismiss after a few seconds;
+   * in-progress messages pass { sticky: true } so they persist until replaced. */
+  private setSdkStatus(msg: string, opts: { sticky?: boolean } = {}): void {
+    if (this.sdkStatusTimer) { clearTimeout(this.sdkStatusTimer); this.sdkStatusTimer = undefined; }
+    this.sdkStatus.textContent = msg;
+    if (msg && !opts.sticky) {
+      this.sdkStatusTimer = setTimeout(() => {
+        this.sdkStatus.textContent = "";
+        this.sdkStatusTimer = undefined;
+      }, SettingsPane.SDK_STATUS_DISMISS_MS);
+    }
+  }
+
+  /** Finish an SDK op: append the right tail, relaunch only when firmware changed
+   * and the emulator was live, and replace "Relaunching…" once it completes. */
+  private async finishSdkOp(base: string, changed: boolean, wasLive: boolean): Promise<void> {
+    if (changed && wasLive) {
+      this.setSdkStatus(`${base} Relaunching the emulator…`, { sticky: true });
+      await this.maybeRelaunchAfterSdk(true);
+      this.setSdkStatus(`${base} Relaunched.`);
+    } else if (changed) {
+      this.setSdkStatus(`${base} Relaunch the emulator to use it.`);
+    } else {
+      this.setSdkStatus(base);
+    }
+  }
+
   /** Upload + install a user-chosen SDK (Replace & persist + full-launcher overlay). */
   private async uploadSdk(mode: "file" | "folder", btns: HTMLButtonElement[]): Promise<void> {
     const wasLive = this.isEmuLive?.() ?? false;
     for (const b of btns) b.disabled = true;
-    this.sdkStatus.textContent = "Installing…";
-    let relaunch = false;
+    this.setSdkStatus("Installing…", { sticky: true });
     try {
       const info = await window.studio.sdkInstall(mode);
       if (info == null) {
-        this.sdkStatus.textContent = ""; // cancelled — emulator untouched
+        this.setSdkStatus(""); // cancelled — emulator untouched
       } else {
-        this.sdkVersionValue.textContent = this.sdkLabel(info);
-        relaunch = wasLive; // a real install tore the live emulator down
-        const tail = wasLive ? " Relaunching the emulator…" : " Relaunch the emulator to use it.";
-        this.sdkStatus.textContent =
-          `Installed SDK ${info.version}${info.fullLauncher ? " with the full PebbleOS launcher" : ""}.${tail}`;
+        this.applySdkInfo(info);
+        await this.finishSdkOp(
+          `Installed SDK ${info.version}. Use "Make full-featured" to add the full PebbleOS launcher.`,
+          true, wasLive,
+        );
       }
     } catch (err) {
       const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
-      this.sdkStatus.textContent = `Upload failed: ${reason || "see console"}`;
-      relaunch = wasLive; // the backend may have torn the emulator down before failing
+      this.setSdkStatus(`Upload failed: ${reason || "see console"}`);
+      await this.maybeRelaunchAfterSdk(wasLive); // backend may have torn down before failing
     } finally {
       for (const b of btns) b.disabled = false;
+      this.sdkFullBtn.disabled = this.sdkSource !== "custom";
     }
-    await this.maybeRelaunchAfterSdk(relaunch);
   }
 
   /** Drop the user override and return to the bundled SDK. */
@@ -1777,20 +1865,131 @@ export class SettingsPane {
     const wasLive = this.isEmuLive?.() ?? false;
     uploadBtn.disabled = true;
     resetBtn.disabled = true;
-    this.sdkStatus.textContent = "Resetting…";
+    this.setSdkStatus("Resetting…", { sticky: true });
     try {
       const info = await window.studio.sdkReset();
-      this.sdkVersionValue.textContent = this.sdkLabel(info);
-      const tail = wasLive ? " Relaunching the emulator…" : " Relaunch the emulator to use it.";
-      this.sdkStatus.textContent = `Reset to bundled SDK ${info.version}.${tail}`;
+      this.applySdkInfo(info);
+      await this.finishSdkOp(`Reset to bundled SDK ${info.version}.`, true, wasLive);
     } catch (err) {
       const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
-      this.sdkStatus.textContent = `Reset failed: ${reason || "see console"}`;
+      this.setSdkStatus(`Reset failed: ${reason || "see console"}`);
+      await this.maybeRelaunchAfterSdk(wasLive);
     } finally {
       uploadBtn.disabled = false;
       resetBtn.disabled = false;
     }
-    await this.maybeRelaunchAfterSdk(wasLive);
+  }
+
+  /** Turn a per-board apply report into the base status line (no relaunch tail;
+   * finishSdkOp adds that). Surfaces the never-downgrade skip honestly. */
+  private describeApply(report: { applied: string[]; skippedNewer: string[]; skippedMissing: string[] }): string {
+    if (report.applied.length === 0) {
+      if (report.skippedNewer.length > 0) {
+        return `Couldn't add the full launcher — this SDK is newer than our bundled launcher firmware ` +
+          `(${report.skippedNewer.join(", ")}), so swapping it in would downgrade those models. Kept the SDK's own firmware.`;
+      }
+      return "Nothing to apply — this SDK doesn't ship the watch models we have launcher firmware for.";
+    }
+    let msg = `Full launcher applied to ${report.applied.join(", ")}.`;
+    if (report.skippedNewer.length > 0) {
+      msg += ` ${report.skippedNewer.join(", ")} kept their own firmware (newer than our launcher).`;
+    }
+    return msg;
+  }
+
+  /** Apply or revert the full launcher on the active custom SDK. Apply first does a
+   * dry-run preview: if any board's firmware is newer than our launcher, a themed
+   * dialog (not the OS message box) surfaces the downgrade risk and defaults to the
+   * safe choice — a downgrade is only ever an explicit opt-in. */
+  private async toggleFullLauncher(btns: HTMLButtonElement[]): Promise<void> {
+    // Re-entrancy guard: the apply branch below disables the buttons only after
+    // an async preview + dialog, so a double-click could otherwise start a second
+    // concurrent flow. Ignore clicks while one is already in progress.
+    if (this.sdkOpBusy) return;
+    this.sdkOpBusy = true;
+    try {
+      await this.toggleFullLauncherInner(btns);
+    } finally {
+      this.sdkOpBusy = false;
+    }
+  }
+
+  private async toggleFullLauncherInner(btns: HTMLButtonElement[]): Promise<void> {
+    const wasLive = this.isEmuLive?.() ?? false;
+    const goingFull = !this.sdkFull;
+
+    if (goingFull) {
+      // Preview BEFORE disabling buttons / showing progress, so a cancel leaves the
+      // UI exactly as it was (no teardown, no mutation happened).
+      let force: boolean;
+      try {
+        const preview = await window.studio.sdkPreviewFullLauncher();
+        const decided = await this.decideFullLauncher(preview.report, preview.info.version);
+        if (decided === null) return; // user cancelled — nothing changed
+        force = decided;
+      } catch (err) {
+        const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
+        this.setSdkStatus(`Couldn't check the SDK: ${reason || "see console"}`);
+        return;
+      }
+      for (const b of btns) b.disabled = true;
+      this.setSdkStatus("Adding the full launcher…", { sticky: true });
+      try {
+        const { report, info, changed } = await window.studio.sdkApplyFullLauncher({ force });
+        this.applySdkInfo(info);
+        await this.finishSdkOp(this.describeApply(report), changed, wasLive);
+      } catch (err) {
+        const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
+        this.setSdkStatus(`Apply failed: ${reason || "see console"}`);
+        await this.maybeRelaunchAfterSdk(wasLive); // safety: backend may have torn down
+      } finally {
+        for (const b of btns) b.disabled = false;
+        this.sdkFullBtn.disabled = this.sdkSource !== "custom";
+      }
+      return;
+    }
+
+    // Revert — no preview needed.
+    for (const b of btns) b.disabled = true;
+    this.setSdkStatus("Reverting to stock firmware…", { sticky: true });
+    try {
+      const { info, changed } = await window.studio.sdkRevertFullLauncher();
+      this.applySdkInfo(info);
+      await this.finishSdkOp("Reverted to the SDK's own firmware.", changed, wasLive);
+    } catch (err) {
+      const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
+      this.setSdkStatus(`Revert failed: ${reason || "see console"}`);
+      await this.maybeRelaunchAfterSdk(wasLive); // safety: backend may have torn down
+    } finally {
+      for (const b of btns) b.disabled = false;
+      this.sdkFullBtn.disabled = this.sdkSource !== "custom";
+    }
+  }
+
+  /**
+   * Given a dry-run report, decide the `force` value for the apply — showing the
+   * themed downgrade dialog when needed. Returns `null` when the user cancels
+   * (apply should not run at all). No dialog (no downgrade risk) → force=false.
+   */
+  private async decideFullLauncher(
+    report: { applied: string[]; skippedNewer: string[]; skippedMissing: string[] },
+    version: string,
+  ): Promise<boolean | null> {
+    const plan = planFullLauncherApply(report, version);
+    if (!plan.dialog) return plan.autoForce;
+
+    const d = plan.dialog;
+    const buttons = [
+      { label: d.safeLabel, value: "safe", variant: "primary" as const },
+      ...(d.downgradeLabel
+        ? [{ label: d.downgradeLabel, value: "downgrade", variant: "danger" as const }]
+        : []),
+      { label: "Cancel", value: "cancel", variant: "default" as const },
+    ];
+    const choice = await openDialog({ title: d.title, lines: d.lines, buttons, dismissValue: "cancel" });
+    if (choice === "downgrade") return true;
+    if (choice === "safe") return d.safeForce;
+    return null; // cancel / dismissed
   }
 
   private toggleTheme(): void {

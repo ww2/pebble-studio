@@ -3,7 +3,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { AppLogStream } from "./backend/appLogStream.js";
 import { createDriver } from "./backend/createDriver.js";
-import type { BackendDriver } from "./backend/BackendDriver.js";
+import type { AppLogHandle, BackendDriver } from "./backend/BackendDriver.js";
 import { makeNativeShell, makeWslShell, type BootToken } from "./backend/bootEmulator.js";
 import { WarmStandby } from "./backend/warmStandby.js";
 import type { VncEndpoint } from "./backend/BackendDriver.js";
@@ -24,7 +24,7 @@ import { deployWinHelpers } from "./backend/winHelpers.js";
 import { makeLanguageController, type LanguageController, type PackRef, type Selection } from "./backend/languageController.js";
 import { makeLangHandlers, kickLangReassert } from "./langIpc.js";
 import { ensureWinSdkProvisioned } from "./backend/winSdkProvision.js";
-import { currentSdkInfo, installCustomSdk, resetToBundledSdk } from "./backend/sdkController.js";
+import { currentSdkInfo, installCustomSdk, resetToBundledSdk, applyFullLauncherToActiveSdk, revertFullLauncherOnActiveSdk } from "./backend/sdkController.js";
 import { readSimEnv, writeSimEnv } from "./backend/simEnv.js";
 import { clearWeatherCacheArgv, refreshWeatherAfterSimChange } from "./backend/weatherCacheRefresh.js";
 import { spawnRunner } from "./backend/spawnRunner.js";
@@ -239,12 +239,13 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   const appLog = new AppLogStream({
     onLine: (line) => getMainWindow()?.webContents.send("emu:app-log", line),
   });
-  let logHandle: { kill(): void } | null = null;
+  let logHandle: AppLogHandle | null = null;
   // The log stream runs ONLY while the renderer's "Show emulator logs" toggle is on
-  // (set via emu:logCapture). Default off ⇒ no persistent `pebble logs` client, so
-  // the default experience has zero extra load on the limited pypkjs bridge (the
-  // pre-v3.0.2 behavior). `emuLive` gates a mid-session toggle-on so we never spawn
-  // `pebble logs` against a dead emulator (which would LAUNCH a rogue one).
+  // (set via emu:logCapture; the renderer pushes the persisted value at startup —
+  // default ON since v3.0.7, #6: the windows-native stream rides the input
+  // helper's shared pypkjs connection, so it no longer loads the bridge).
+  // `emuLive` gates a mid-session toggle-on so we never spawn a CLI `pebble logs`
+  // against a dead emulator (which would LAUNCH a rogue one).
   let logCaptureEnabled = false;
   let emuLive = false;
   const startAppLog = (id: PlatformId, opts: { clear?: boolean } = {}): void => {
@@ -271,7 +272,10 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   // remains the real safety net if the slot is still busy after it.
   const BRIDGE_SLOT_SETTLE_MS = 250;
   const withAppLogPaused = async <T>(fn: () => Promise<T>): Promise<T> => {
-    const wasRunning = logHandle != null;
+    // A channel-based stream (viaChannel) shares the input helper's existing
+    // pypkjs client, so it occupies no bridge slot — never pause it (pausing
+    // would drop exactly the install-time logs the user wants to see).
+    const wasRunning = logHandle != null && !logHandle.viaChannel;
     if (wasRunning) {
       stopAppLog();
       await new Promise<void>((resolve) => setTimeout(resolve, BRIDGE_SLOT_SETTLE_MS));
@@ -975,9 +979,49 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     await teardownEmulator();
     return installCustomSdk(await defaultCtx(), result.filePaths[0], { run: spawnRunner, onProgress: sdkProgress });
   });
-  ipcMain.handle("sdk:reset", async () => {
-    if (emuLive) await teardownEmulator();
+  ipcMain.handle("sdk:reset", async (e) => {
+    assertMainSender(e);
+    // Mirror sdk:install: an in-flight boot or warm-standby pre-boot may still
+    // be running against the SDK we're about to drop — `emuLive` alone missed both.
+    if (currentBootToken) currentBootToken.cancelled = true;
+    await teardownEmulator();
     return resetToBundledSdk(await defaultCtx(), { onProgress: sdkProgress });
+  });
+  // Dry-run preview: what a normal apply WOULD do (which boards are newer than
+  // our launcher, etc.), with no teardown and no mutation. The renderer uses this
+  // to show its own themed dialog and decide whether to downgrade — replacing the
+  // old OS message box that lived here (and whose focus-steal over-zoomed the
+  // emulator on relaunch).
+  ipcMain.handle("sdk:previewFullLauncher", async (e) => {
+    assertMainSender(e);
+    const preview = await applyFullLauncherToActiveSdk(await defaultCtx(), { dryRun: true });
+    return { report: preview.report, info: preview.info };
+  });
+  ipcMain.handle("sdk:applyFullLauncher", async (e, opts?: { force?: boolean }) => {
+    assertMainSender(e);
+    const ctx = await defaultCtx();
+    const force = opts?.force === true;
+    // Re-derive what will change from a fresh dry run (the renderer already asked
+    // the user; this is the authoritative check the mutation gates on).
+    const preview = await applyFullLauncherToActiveSdk(ctx, { dryRun: true });
+    const willChange =
+      preview.report.applied.length > 0 || (force && preview.report.skippedNewer.length > 0);
+    // Nothing to do (no eligible boards, downgrade not granted)? Don't tear down.
+    if (!willChange) {
+      return { report: preview.report, info: preview.info, changed: false };
+    }
+    // Real apply — firmware changes, so tear down first like sdk:install.
+    if (currentBootToken) currentBootToken.cancelled = true;
+    await teardownEmulator();
+    const applied = await applyFullLauncherToActiveSdk(ctx, { force, onProgress: sdkProgress });
+    return { report: applied.report, info: applied.info, changed: true };
+  });
+  ipcMain.handle("sdk:revertFullLauncher", async (e) => {
+    assertMainSender(e);
+    if (currentBootToken) currentBootToken.cancelled = true;
+    await teardownEmulator();
+    const { reverted, info } = await revertFullLauncherOnActiveSdk(await defaultCtx(), { onProgress: sdkProgress });
+    return { reverted, info, changed: reverted.length > 0 };
   });
 
   // ── Language packs (native-Windows) ──────────────────────────────────────

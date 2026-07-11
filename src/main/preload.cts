@@ -83,6 +83,27 @@ const studio = {
     ipcRenderer.invoke("sdk:install", mode),
   sdkReset: (): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }> =>
     ipcRenderer.invoke("sdk:reset"),
+  // Toggle the full PebbleOS launcher on the active custom SDK (opt-in overlay).
+  // apply returns a per-board report; revert returns the reverted boards. Both
+  // return the refreshed SDK info.
+  // Dry-run preview so the renderer can show its own themed dialog before deciding
+  // whether to downgrade newer boards (force). No teardown, no mutation.
+  sdkPreviewFullLauncher: (): Promise<{
+    report: { applied: string[]; skippedNewer: string[]; skippedMissing: string[] };
+    info: { version: string; source: "custom" | "bundled"; fullLauncher: boolean };
+  }> => ipcRenderer.invoke("sdk:previewFullLauncher"),
+  // `force` downgrades boards whose own firmware is newer than our launcher — the
+  // renderer only sets it after an explicit user opt-in.
+  sdkApplyFullLauncher: (opts?: { force?: boolean }): Promise<{
+    report: { applied: string[]; skippedNewer: string[]; skippedMissing: string[] };
+    info: { version: string; source: "custom" | "bundled"; fullLauncher: boolean };
+    changed: boolean;
+  }> => ipcRenderer.invoke("sdk:applyFullLauncher", opts),
+  sdkRevertFullLauncher: (): Promise<{
+    reverted: string[];
+    info: { version: string; source: "custom" | "bundled"; fullLauncher: boolean };
+    changed: boolean;
+  }> => ipcRenderer.invoke("sdk:revertFullLauncher"),
   // Language packs (Task 10, native-Windows). catalog lists Rebble packs for the
   // active firmware; install/sideload apply a pack (resolving { language }/{ pack }
   // or a surfaced { error } string); active reports the watch's current language;

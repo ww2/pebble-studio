@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import type { PlatformId, ButtonId, ButtonAction } from "../../shared/types.js";
-import type { BackendDriver, HealthActivateResult, RunResult, Runner, VncEndpoint } from "./BackendDriver.js";
+import type { AppLogHandle, BackendDriver, HealthActivateResult, RunResult, Runner, VncEndpoint } from "./BackendDriver.js";
 import { NativeDriver, type BootFn, type StopFn } from "./NativeDriver.js";
 import type { BootToken, OnStep } from "./bootEmulator.js";
 import type { PebbleCmdBuilder } from "./winBootDeps.js";
@@ -39,8 +39,16 @@ export interface WindowsNativeDriverDeps {
   reap?: () => Promise<void>;
   /** Resolved python + helper paths for the legacy utc_offset time push. When
    * absent, setTzOffset degrades to a no-op (legacy time silently unavailable),
-   * mirroring how the POSIX path degrades when the tool isn't found. */
+   * mirroring how the POSIX path degrades when the tool isn't found. NOTE: left
+   * intentionally UNSET on native Windows so setTzOffset stays a no-op — custom
+   * time is driven by the qemu RTC fake clock and a SetUTC push would clobber it. */
   timeHelper?: WinTimeHelper;
+  /** Resolved python + a helpers-dir path for Pebble Health activation. Kept
+   * SEPARATE from timeHelper (which must stay unset on native Windows, above) so
+   * wiring health can't re-enable the SetUTC clobber. activateHealth writes its
+   * own pb-activate-health.py next to helperPath. Absent → activation is a no-op
+   * ("python helper not provisioned"). */
+  healthHelper?: WinTimeHelper;
   /** Persistent input channel. When set, button/accelTap go through the long-lived
    * helper (a stdin write, ~0ms) instead of a per-press `pebble emu-button` spawn.
    * Falls back to the inner CLI path when the channel is unavailable (not booted,
@@ -277,7 +285,7 @@ export class WindowsNativeDriver implements BackendDriver {
   }
 
   async activateHealth(): Promise<HealthActivateResult> {
-    const h = this.deps.timeHelper;
+    const h = this.deps.healthHelper;
     if (!h) return { ok: false, status: null, detail: "python helper not provisioned" };
     const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     // Re-deploy the helper once (cheap; self-repairs a stale/corrupt copy), mirroring
@@ -345,7 +353,13 @@ export class WindowsNativeDriver implements BackendDriver {
     await this.deps.snapshotCreate?.(board, isCancelled);
   }
 
-  streamLogs(id: PlatformId, onLine: (line: string) => void): { kill(): void } | null {
+  streamLogs(id: PlatformId, onLine: (line: string) => void): AppLogHandle | null {
+    // Preferred (#6): ride the persistent input helper's shared pypkjs
+    // connection — no second bridge client, so installs need no log pause and
+    // the stream can run by default. Falls back to the `pebble logs` process
+    // when the channel isn't up (e.g. helper died and nothing respawned it yet).
+    const viaChannel = this.deps.inputChannel?.streamAppLogs(onLine) ?? null;
+    if (viaChannel) return { kill: viaChannel.kill, viaChannel: true };
     const spawnFn = this.deps.logSpawn ?? spawnLineStream;
     // --vnc is REQUIRED: a `--emulator` command without it makes pebble-tool
     // SIGKILL the running VNC qemu and respawn a non-VNC one (see withVnc in

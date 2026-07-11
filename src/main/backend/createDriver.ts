@@ -240,6 +240,10 @@ export async function createDriver(override?: DriverKind): Promise<{ driver: Bac
       // before enabling Launch to self-heal a prior session's leftover stack.
       reap: () => winDeps.reap(),
       inputChannel,
+      // Health activation helper (writes/runs pb-activate-health.py next to this
+      // path). SEPARATE from timeHelper, which stays unset so setTzOffset remains
+      // a no-op (custom time is the qemu RTC; a SetUTC push would clobber it).
+      healthHelper: { pythonExe: pyExe, helperPath: inputHelperPath },
       timeShim: { ctlPath, ftLogPath },
       // Fire-and-forget snapshot creation after a cold boot reaches Live: read the
       // qemu monitor port, then drive the SnapshotManager (never throws).

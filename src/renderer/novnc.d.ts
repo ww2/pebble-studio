@@ -12,6 +12,10 @@ declare module "@novnc/novnc" {
     viewOnly: boolean;
     scaleViewport: boolean;
     clipViewport: boolean;
+    /** JPEG quality hint for Tight (0..9, 9 = best/least lossy). */
+    qualityLevel: number;
+    /** zlib level hint for Tight (0..9, 0 = store, least CPU). */
+    compressionLevel: number;
     disconnect(): void;
   }
 }
