@@ -70,6 +70,14 @@ interface StudioApi {
   sdkInfo(): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }>;
   sdkInstall(mode?: "file" | "folder"): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean } | null>;
   sdkReset(): Promise<{ version: string; source: "custom" | "bundled"; fullLauncher: boolean }>;
+  sdkApplyFullLauncher(): Promise<{
+    report: { applied: string[]; skippedNewer: string[]; skippedMissing: string[] };
+    info: { version: string; source: "custom" | "bundled"; fullLauncher: boolean };
+  }>;
+  sdkRevertFullLauncher(): Promise<{
+    reverted: string[];
+    info: { version: string; source: "custom" | "bundled"; fullLauncher: boolean };
+  }>;
   // v1.0.0: app version + application-menu action subscription.
   appVersion(): Promise<string>;
   onMenu(cb: (action: string) => void): () => void;

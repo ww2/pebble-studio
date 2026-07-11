@@ -24,7 +24,7 @@ import { deployWinHelpers } from "./backend/winHelpers.js";
 import { makeLanguageController, type LanguageController, type PackRef, type Selection } from "./backend/languageController.js";
 import { makeLangHandlers, kickLangReassert } from "./langIpc.js";
 import { ensureWinSdkProvisioned } from "./backend/winSdkProvision.js";
-import { currentSdkInfo, installCustomSdk, resetToBundledSdk } from "./backend/sdkController.js";
+import { currentSdkInfo, installCustomSdk, resetToBundledSdk, applyFullLauncherToActiveSdk, revertFullLauncherOnActiveSdk } from "./backend/sdkController.js";
 import { readSimEnv, writeSimEnv } from "./backend/simEnv.js";
 import { clearWeatherCacheArgv, refreshWeatherAfterSimChange } from "./backend/weatherCacheRefresh.js";
 import { spawnRunner } from "./backend/spawnRunner.js";
@@ -985,6 +985,20 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
     if (currentBootToken) currentBootToken.cancelled = true;
     await teardownEmulator();
     return resetToBundledSdk(await defaultCtx(), { onProgress: sdkProgress });
+  });
+  ipcMain.handle("sdk:applyFullLauncher", async (e) => {
+    assertMainSender(e);
+    // Firmware bytes change → cancel any in-flight boot and tear down first, like
+    // sdk:install, so nothing straddles the pre-toggle firmware.
+    if (currentBootToken) currentBootToken.cancelled = true;
+    await teardownEmulator();
+    return applyFullLauncherToActiveSdk(await defaultCtx(), { onProgress: sdkProgress });
+  });
+  ipcMain.handle("sdk:revertFullLauncher", async (e) => {
+    assertMainSender(e);
+    if (currentBootToken) currentBootToken.cancelled = true;
+    await teardownEmulator();
+    return revertFullLauncherOnActiveSdk(await defaultCtx(), { onProgress: sdkProgress });
   });
 
   // ── Language packs (native-Windows) ──────────────────────────────────────
