@@ -414,25 +414,7 @@ export async function installCustomSdk(
     // 5. Write the override marker so provisioning prefers this SDK from now on.
     await writeFile(winPath.join(persistSdkRoot, ACTIVE_SDK_MARKER), version);
 
-    // 6. Overlay the bundled full-launcher firmware so the upload keeps unlocked
-    //    PebbleOS (Settings/Health/full menu) instead of the stock sdkshell
-    //    launcher. Best-effort — never fail the install on a firmware hiccup.
-    try {
-      const bundleVersion = pickSdkVersion(await realProvisionFs().list(winPath.join(sdkBundleRoot(ctx), "SDKs")));
-      if (bundleVersion) {
-        const boards = await applyFullLauncherFirmware(realProvisionFs(), {
-          bundleSdkCore: winPath.join(sdkBundleRoot(ctx), "SDKs", bundleVersion, "sdk-core"),
-          targetSdkCore: target,
-          marker: winPath.join(persistSdkRoot, "SDKs", version, FULL_LAUNCHER_MARKER),
-          decompressedSpi: (board) => winPath.join(persistSdkRoot, version, board, "qemu_spi_flash.bin"),
-          uploadVersion: version,
-        }, log);
-        if (boards.length === 0) log("No full-launcher firmware to apply (uploaded SDK keeps its own firmware).");
-      }
-    } catch (e) {
-      log(`Full-launcher overlay skipped (non-fatal): ${(e as Error)?.message ?? e}`);
-    }
-    // 7. Drop any QEMU snapshot bundles for this version: they may hold a
+    // 6. Drop any QEMU snapshot bundles for this version: they may hold a
     //    restore image of DIFFERENT firmware bytes under the same {fwRev, sdkVer,
     //    exeStamp} key, and an instant-launch restore would boot the old
     //    firmware, bypassing this upload entirely. Best-effort.
