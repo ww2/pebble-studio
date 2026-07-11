@@ -280,18 +280,37 @@ describe("applyFullLauncherFirmware", () => {
     }
   });
 
-  it("does not re-stash a board that already has a stash (re-apply keeps the original)", async () => {
+  it("does not re-stash a board already fully stashed (re-apply keeps the original)", async () => {
     const present = fullPresent();
     for (const b of FW_REFRESH_BOARDS) for (const blob of FW_REFRESH_BLOBS) present.push(winPath.join(dstQemu(b), blob));
-    present.push(winPath.join(STASH("basalt"), FW_REFRESH_BLOBS[0])); // basalt already stashed
+    for (const blob of FW_REFRESH_BLOBS) present.push(winPath.join(STASH("basalt"), blob)); // basalt fully stashed
+    const fs = fakeFwFs(present);
+    await applyFullLauncherFirmware(fs, paths);
+    for (const blob of FW_REFRESH_BLOBS) {
+      expect(fs.calls).not.toContain(
+        `copy ${winPath.join(dstQemu("basalt"), blob)} -> ${winPath.join(STASH("basalt"), blob)}`,
+      );
+    }
+    // a board WITHOUT a prior stash is still stashed
+    expect(fs.calls).toContain(
+      `copy ${winPath.join(dstQemu("emery"), FW_REFRESH_BLOBS[0])} -> ${winPath.join(STASH("emery"), FW_REFRESH_BLOBS[0])}`,
+    );
+  });
+
+  it("re-stashes only the MISSING blob when a prior stash is partial (crash-atomicity)", async () => {
+    // Simulate an apply interrupted after stashing blob[0] but before blob[1]:
+    // the next apply must stash the still-missing blob[1] (not skip the whole
+    // board) so revert can restore both, while leaving the good blob[0] untouched.
+    const present = fullPresent();
+    for (const b of FW_REFRESH_BOARDS) for (const blob of FW_REFRESH_BLOBS) present.push(winPath.join(dstQemu(b), blob));
+    present.push(winPath.join(STASH("basalt"), FW_REFRESH_BLOBS[0])); // only blob[0] stashed
     const fs = fakeFwFs(present);
     await applyFullLauncherFirmware(fs, paths);
     expect(fs.calls).not.toContain(
       `copy ${winPath.join(dstQemu("basalt"), FW_REFRESH_BLOBS[0])} -> ${winPath.join(STASH("basalt"), FW_REFRESH_BLOBS[0])}`,
     );
-    // a board WITHOUT a prior stash is still stashed
     expect(fs.calls).toContain(
-      `copy ${winPath.join(dstQemu("emery"), FW_REFRESH_BLOBS[0])} -> ${winPath.join(STASH("emery"), FW_REFRESH_BLOBS[0])}`,
+      `copy ${winPath.join(dstQemu("basalt"), FW_REFRESH_BLOBS[1])} -> ${winPath.join(STASH("basalt"), FW_REFRESH_BLOBS[1])}`,
     );
   });
 

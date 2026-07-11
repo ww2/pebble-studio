@@ -259,6 +259,10 @@ export class SettingsPane {
   private sdkFullBtn!: HTMLButtonElement;
   private sdkFull = false;
   private sdkSource: "custom" | "bundled" = "bundled";
+  /** Guards toggleFullLauncher against re-entry: its apply branch disables the
+   * buttons only AFTER an async preview + dialog, so without this a double-click
+   * would spawn two concurrent flows (stacked dialogs, double apply). */
+  private sdkOpBusy = false;
   private sdkStatusTimer?: ReturnType<typeof setTimeout>;
   private static readonly SDK_STATUS_DISMISS_MS = 6000;
   private bootMode: BootMode;
@@ -1898,6 +1902,19 @@ export class SettingsPane {
    * dialog (not the OS message box) surfaces the downgrade risk and defaults to the
    * safe choice — a downgrade is only ever an explicit opt-in. */
   private async toggleFullLauncher(btns: HTMLButtonElement[]): Promise<void> {
+    // Re-entrancy guard: the apply branch below disables the buttons only after
+    // an async preview + dialog, so a double-click could otherwise start a second
+    // concurrent flow. Ignore clicks while one is already in progress.
+    if (this.sdkOpBusy) return;
+    this.sdkOpBusy = true;
+    try {
+      await this.toggleFullLauncherInner(btns);
+    } finally {
+      this.sdkOpBusy = false;
+    }
+  }
+
+  private async toggleFullLauncherInner(btns: HTMLButtonElement[]): Promise<void> {
     const wasLive = this.isEmuLive?.() ?? false;
     const goingFull = !this.sdkFull;
 

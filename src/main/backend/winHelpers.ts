@@ -152,6 +152,7 @@ def _start_app_logs(transport):
     # bridge. Failure only disables the log stream (input/screenshot unaffected).
     from libpebble2.protocol.logs import AppLogMessage, AppLogShippingControl
     from libpebble2.communication.transports.websocket.protocol import WebSocketPhoneAppLog
+    global _logs_started
     pebble = None
     err = 'unknown'
     for _ in range(5):
@@ -164,6 +165,9 @@ def _start_app_logs(transport):
     if pebble is None:
         sys.stderr.write('app-log: bridge unavailable (%s)\\n' % err)
         sys.stderr.flush()
+        # Clear the latch so a later 'logs' re-arm (panel re-open, or a reboot's
+        # fresh helper) retries instead of being swallowed as a no-op by _ensure_logs.
+        _logs_started = False
         return
 
     def on_watch(packet):
@@ -177,9 +181,15 @@ def _start_app_logs(transport):
             text = str(packet.payload)
         _emit('LOG [%s] pkjs> %s' % (time.strftime('%H:%M:%S'), _one_line(text)))
 
-    pebble.register_endpoint(AppLogMessage, on_watch)
-    pebble.register_transport_endpoint(MessageTargetPhone, WebSocketPhoneAppLog, on_phone)
-    pebble.send_packet(AppLogShippingControl(enable=True))
+    try:
+        pebble.register_endpoint(AppLogMessage, on_watch)
+        pebble.register_transport_endpoint(MessageTargetPhone, WebSocketPhoneAppLog, on_phone)
+        pebble.send_packet(AppLogShippingControl(enable=True))
+    except Exception as e:
+        sys.stderr.write('app-log: failed to start stream (%s)\\n' % e)
+        sys.stderr.flush()
+        _logs_started = False  # let a later re-arm retry
+        return
     # Positive signal for the UI panel (and live tests) that the stream is up.
     _emit('LOG [%s] (app log stream connected)' % time.strftime('%H:%M:%S'))
 

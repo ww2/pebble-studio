@@ -193,14 +193,19 @@ export async function applyFullLauncherFirmware(
     // dryRun: report what WOULD apply, but perform no fs mutation.
     if (!opts.dryRun) {
       // Stash the SDK's OWN blobs BEFORE overwriting so revert can restore them.
-      // Guard: only stash when none exists yet, so a re-apply can't overwrite a good
-      // stash (the SDK's firmware) with already-overlaid launcher bytes.
+      // PER-BLOB guard: stash a blob only when it isn't already stashed. A single
+      // blob[0]-only guard was unsafe — a crash between the two copyFiles left a
+      // half stash (blob[0] only) that a later apply then trusted, overwriting the
+      // still-original blob[1] in dst with launcher bytes that revert could never
+      // undo. Per-blob, an interrupted apply re-stashes the missing blob next time,
+      // while a fully-stashed board is still never overwritten with overlaid bytes.
       const stashDir = p.stashQemuDir(board);
-      if (!(await fs.exists(wp.join(stashDir, FW_REFRESH_BLOBS[0])))) {
-        await fs.mkdirp(stashDir);
-        for (const blob of FW_REFRESH_BLOBS) {
-          const cur = wp.join(dst, blob);
-          if (await fs.exists(cur)) await fs.copyFile(cur, wp.join(stashDir, blob));
+      await fs.mkdirp(stashDir);
+      for (const blob of FW_REFRESH_BLOBS) {
+        const cur = wp.join(dst, blob);
+        const stashed = wp.join(stashDir, blob);
+        if (!(await fs.exists(stashed)) && (await fs.exists(cur))) {
+          await fs.copyFile(cur, stashed);
         }
       }
       for (const blob of FW_REFRESH_BLOBS) {
@@ -500,6 +505,16 @@ export async function installCustomSdk(
     }
     await ensureFreeSpace(persistSdkRoot, SDK_INSTALL_MIN_FREE_BYTES, "install the SDK");
     await rm(target, { recursive: true, force: true }).catch(() => {});
+    // A fresh upload loads as-is / stock (commit "load as-is"). Clear any prior
+    // install's full-launcher state for this version dir — the `.full-launcher`
+    // marker and the `.stock-fw` stash are SIBLINGS of sdk-core, so the rm above
+    // (which only wipes sdk-core) leaves them behind. Left stale, a same-version
+    // re-upload of a DIFFERENT build would report fullLauncher=true for stock
+    // firmware, and a later Revert would restore the PREVIOUS build's stashed
+    // blobs over this one. Wiping them keeps currentSdkInfo and revert honest.
+    const versionDir = winPath.join(persistSdkRoot, "SDKs", version);
+    await rm(winPath.join(versionDir, FULL_LAUNCHER_MARKER), { force: true }).catch(() => {});
+    await rm(winPath.join(versionDir, STOCK_FW_STASH), { recursive: true, force: true }).catch(() => {});
     await mkdir(winPath.dirname(target), { recursive: true });
     await cp(sdkCoreDir, target, { recursive: true });
 
