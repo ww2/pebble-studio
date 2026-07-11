@@ -7,6 +7,8 @@ import {
   revertFullLauncherFirmware,
   isPathInside,
   isVersionNewer,
+  parseAppSdkMinor,
+  BUNDLED_FW_MINORS,
   invalidateVersionSnapshots,
   EXTRACT_PY,
   EXTRACT_OK_TOKEN,
@@ -224,38 +226,46 @@ describe("applyFullLauncherFirmware", () => {
     expect(fs.calls.some((c) => c.startsWith("write"))).toBe(false);
   });
 
-  // ── #8/#11 fix: never DOWNGRADE an upload that is newer than the bundled fw ──
-  // The overlay exists to keep the unlocked launcher, but the bundled blobs are
-  // pinned versions (modern boards 4.13.0, legacy boards 4.9.169). An SDK upload
-  // NEWER than a board's bundled firmware must keep its own (newer) firmware, or
-  // .pbws built with the new SDK hit "requires a newer version of the firmware".
-  it("skips EVERY board when the upload is newer than all bundled firmware (4.17)", async () => {
+  // ── #8/#11 fix (v3.0.11): never make apps un-installable ──────────────────
+  // The overlay keeps the unlocked launcher, but the bundled blobs advertise a
+  // pinned app SDK-minor (modern 101, legacy 86 — BUNDLED_FW_MINORS). Firmware
+  // accepts an app iff app.minor <= fw.minor (app_install_manager.c). So the gate
+  // compares the UPLOADED SDK's per-board app-minor against the bundled firmware's
+  // minor — the real "would apps be rejected?" test — NOT the SDK release string.
+  it("gates on app-minor: a 4.17-style SDK (modern app 101, legacy 86) is fully compatible", async () => {
     const fs = fakeFwFs(fullPresent());
-    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.17" });
-    expect(r.applied).toEqual([]);
-    expect(r.skippedNewer.sort()).toEqual([...FW_REFRESH_BOARDS].sort());
-    expect(fs.calls.some((c) => c.startsWith("copy"))).toBe(false);
-    expect(fs.has(MARKER)).toBe(false);
+    // emery/gabbro/flint app-minor 101 <= fw 101; basalt/chalk/diorite 86 <= 86.
+    const r = await applyFullLauncherFirmware(fs, {
+      ...paths,
+      appMinorFor: (b) => (["emery", "gabbro", "flint"].includes(b) ? 101 : 86),
+    });
+    expect(r.applied.sort()).toEqual([...FW_REFRESH_BOARDS].sort());
+    expect(r.skippedNewer).toEqual([]);
+    expect(fs.has(MARKER)).toBe(true);
   });
 
-  it("overlays only the boards whose bundled fw is >= the upload (4.11: modern yes, legacy no)", async () => {
+  it("gates on app-minor: an app needing 102 on emery is skipped as incompatible", async () => {
     const fs = fakeFwFs(fullPresent());
-    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.11" });
-    // modern boards carry 4.13.0 (>= 4.11) → overlaid; legacy carry 4.9.169 (< 4.11) → kept.
-    expect(r.applied.sort()).toEqual(["emery", "flint", "gabbro"]);
-    expect(fs.calls.some((c) => c.includes("\\basalt\\"))).toBe(false);
-    expect(fs.has(MARKER)).toBe(true); // some boards did get the launcher
+    const r = await applyFullLauncherFirmware(fs, {
+      ...paths,
+      appMinorFor: (b) => (b === "emery" ? 102 : null),
+    });
+    expect(r.skippedNewer).toContain("emery");
+    expect(r.applied).not.toContain("emery");
+    // every other board (unknown minor → treated compatible) is still overlaid.
+    expect(r.applied.sort()).toEqual(FW_REFRESH_BOARDS.filter((b) => b !== "emery").sort());
+    expect(fs.calls.some((c) => c.includes("\\emery\\"))).toBe(false);
   });
 
-  it("still overlays everything for a same-or-older upload (4.9.169)", async () => {
+  it("unknown app-minor (null) overlays everything (preserve overlay-when-unknown)", async () => {
     const fs = fakeFwFs(fullPresent());
-    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.9.169" });
+    const r = await applyFullLauncherFirmware(fs, { ...paths, appMinorFor: () => null });
     expect(r.applied).toEqual([...FW_REFRESH_BOARDS]);
   });
 
-  it("treats an unparseable upload version like today (overlay everything)", async () => {
+  it("with no appMinorFor at all, overlays everything (legacy behavior)", async () => {
     const fs = fakeFwFs(fullPresent());
-    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "weird" });
+    const r = await applyFullLauncherFirmware(fs, paths);
     expect(r.applied).toEqual([...FW_REFRESH_BOARDS]);
   });
 
@@ -285,12 +295,13 @@ describe("applyFullLauncherFirmware", () => {
     );
   });
 
-  it("force overlays newer boards too, still stashing (skippedNewer becomes empty)", async () => {
+  it("force overlays incompatible boards too, still stashing (skippedNewer becomes empty)", async () => {
     // Seed dst blobs so the stash copy has something to copy (like the stash test).
     const present = fullPresent();
     for (const b of FW_REFRESH_BOARDS) for (const blob of FW_REFRESH_BLOBS) present.push(winPath.join(dstQemu(b), blob));
     const fs = fakeFwFs(present);
-    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.17" }, undefined, { force: true });
+    // appMinorFor 999 would skip every board without force; force must overlay all.
+    const r = await applyFullLauncherFirmware(fs, { ...paths, appMinorFor: () => 999 }, undefined, { force: true });
     expect(r.applied).toEqual([...FW_REFRESH_BOARDS]);
     expect(r.skippedNewer).toEqual([]);
     expect(fs.has(MARKER)).toBe(true);
@@ -311,9 +322,9 @@ describe("applyFullLauncherFirmware", () => {
     expect(fs.has(MARKER)).toBe(false);                 // no marker written
   });
 
-  it("force + dryRun: reports newer boards as applied but mutates nothing", async () => {
+  it("force + dryRun: reports incompatible boards as applied but mutates nothing", async () => {
     const fs = fakeFwFs(fullPresent());
-    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.17" }, undefined, { force: true, dryRun: true });
+    const r = await applyFullLauncherFirmware(fs, { ...paths, appMinorFor: () => 999 }, undefined, { force: true, dryRun: true });
     expect(r.applied).toEqual([...FW_REFRESH_BOARDS]); // force reaches them
     expect(r.skippedNewer).toEqual([]);
     expect(fs.calls).toEqual([]);                       // dryRun blocked all mutation
@@ -375,6 +386,31 @@ describe("isVersionNewer", () => {
   it("is false when either side is unparseable (conservative: keep old behavior)", () => {
     expect(isVersionNewer("weird", "4.13.0")).toBe(false);
     expect(isVersionNewer("4.17", "")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseAppSdkMinor + BUNDLED_FW_MINORS (the real app-compat signal — a per-board
+// SDK-version MINOR, not the SDK's dotted release string)
+// ---------------------------------------------------------------------------
+
+describe("parseAppSdkMinor", () => {
+  it("reads the hex minor from a header", () => {
+    const h = "#define PROCESS_INFO_CURRENT_SDK_VERSION_MAJOR 0x5\n" +
+              "#define PROCESS_INFO_CURRENT_SDK_VERSION_MINOR 0x65\n";
+    expect(parseAppSdkMinor(h)).toBe(101);
+  });
+  it("reads a decimal minor too", () => {
+    expect(parseAppSdkMinor("PROCESS_INFO_CURRENT_SDK_VERSION_MINOR 86")).toBe(86);
+  });
+  it("returns null when absent", () => {
+    expect(parseAppSdkMinor("nope")).toBeNull();
+  });
+  it("bundled modern firmware advertises 101 after the rebuild", () => {
+    expect(BUNDLED_FW_MINORS.emery).toBe(101);
+    expect(BUNDLED_FW_MINORS.gabbro).toBe(101);
+    expect(BUNDLED_FW_MINORS.flint).toBe(101);
+    expect(BUNDLED_FW_MINORS.basalt).toBe(86);
   });
 });
 

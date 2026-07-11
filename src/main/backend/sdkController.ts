@@ -19,6 +19,7 @@
 
 import { win32 as winPath } from "node:path";
 import { mkdir, readdir, readFile, rm, cp, stat, writeFile, statfs } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import type { WinRuntimeCtx } from "./winRuntime.js";
 import { pebbleDataDir, pebblePyExe, sdkBundleRoot } from "./winRuntime.js";
 import type { RunResult } from "./BackendDriver.js";
@@ -87,6 +88,30 @@ export const BUNDLED_FW_VERSIONS: Readonly<Record<string, string>> = {
 };
 
 /**
+ * The app-compat SDK-version MINOR each board's BUNDLED overlay firmware
+ * ADVERTISES (firmware accepts an app iff app.minor <= this AND major==5 — see
+ * PebbleOS app_install_manager.c). Modern boards carry the normal-shell gate-101
+ * build (v4.13.0 code with PROCESS_INFO_CURRENT_SDK_VERSION_MINOR raised to
+ * 0x65); legacy boards carry the 4.9.169 firmware (minor 86). This is the REAL
+ * "will apps be rejected?" signal — a per-board number, not the SDK's release
+ * string. Update alongside vendor/pebble-sdk fw. (Major is 5 for all.)
+ */
+export const BUNDLED_FW_MINORS: Readonly<Record<string, number>> = {
+  emery: 101, gabbro: 101, flint: 101,
+  basalt: 86, chalk: 86, diorite: 86,
+};
+
+/** Decimal value of PROCESS_INFO_CURRENT_SDK_VERSION_MINOR in a board's
+ * pebble_process_info.h (hex `0x..` or decimal), or null when absent/unparseable.
+ * PURE. */
+export function parseAppSdkMinor(headerText: string): number | null {
+  const m = /PROCESS_INFO_CURRENT_SDK_VERSION_MINOR\s+(0x[0-9a-fA-F]+|\d+)/.exec(headerText);
+  if (!m) return null;
+  const v = m[1].startsWith("0x") ? parseInt(m[1], 16) : parseInt(m[1], 10);
+  return Number.isFinite(v) ? v : null;
+}
+
+/**
  * True when dotted version `a` is strictly newer than `b` (numeric per segment,
  * missing segments are 0). Unparseable input → false, so callers conservatively
  * keep today's behavior for weird version strings. PURE.
@@ -116,10 +141,16 @@ export interface FullLauncherPaths {
   /** Per-board stash dir for the SDK's ORIGINAL qemu blobs (revert source).
    * Resolved by the caller to `<persistSdkRoot>\SDKs\<ver>\.stock-fw\<board>`. */
   stashQemuDir: (board: string) => string;
-  /** The uploaded SDK's declared version. When set, a board is overlaid only if
-   * its bundled firmware is same-or-newer (never downgrade an upload). Absent →
-   * legacy behavior (overlay whatever is present). */
+  /** The uploaded SDK's declared version. Informational only now (used in the
+   * skip log line) — the never-downgrade gate is driven by `appMinorFor` below,
+   * not this release string. */
   uploadVersion?: string;
+  /** Per-board app SDK-minor reader for the UPLOADED SDK (from its
+   * pebble/<board>/include/pebble_process_info.h). null → unknown, treated as
+   * compatible (preserve legacy overlay-when-unknown behavior). This is the real
+   * compat signal (app accepted iff app.minor <= fw.minor), superseding the
+   * uploadVersion/isVersionNewer manifest heuristic. */
+  appMinorFor?: (board: string) => number | null;
 }
 
 /**
@@ -144,9 +175,14 @@ export async function applyFullLauncherFirmware(
   const skippedNewer: string[] = [];
   const skippedMissing: string[] = [];
   for (const board of FW_REFRESH_BOARDS) {
-    // Never downgrade: skip a board whose bundled blobs are OLDER than the upload.
-    // `force` bypasses this gate (still stashes, so it stays reversible).
-    if (!opts.force && p.uploadVersion && isVersionNewer(p.uploadVersion, BUNDLED_FW_VERSIONS[board] ?? "")) {
+    // Never make apps un-installable: skip a board whose bundled firmware
+    // advertises a LOWER app SDK-minor than the uploaded SDK stamps into apps
+    // (firmware accepts an app iff app.minor <= fw.minor). This is the real compat
+    // test — not the SDK's release string. `force` bypasses it (still stashes, so
+    // it stays reversible). Unknown app-minor (null) → treat as compatible.
+    const appMinor = p.appMinorFor?.(board) ?? null;
+    const fwMinor = BUNDLED_FW_MINORS[board];
+    if (!opts.force && appMinor != null && fwMinor != null && appMinor > fwMinor) {
       skippedNewer.push(board);
       continue;
     }
@@ -182,8 +218,8 @@ export async function applyFullLauncherFirmware(
   }
   if (skippedNewer.length > 0) {
     log(
-      `SDK ${p.uploadVersion} is newer than the bundled launcher firmware — ` +
-      `keeping its own firmware on ${skippedNewer.join(", ")}.`,
+      `Apps built with SDK ${p.uploadVersion ?? "(unknown)"} need a firmware newer than ` +
+      `Studio's bundled launcher — keeping each board's own firmware on ${skippedNewer.join(", ")}.`,
     );
   }
   return { applied, skippedNewer, skippedMissing };
@@ -540,6 +576,20 @@ async function activeCustomSdkPaths(
     decompressedSpi: (board) => winPath.join(persistSdkRoot, version, board, "qemu_spi_flash.bin"),
     stashQemuDir: (board) => winPath.join(persistSdkRoot, "SDKs", version, STOCK_FW_STASH, board),
     uploadVersion: version,
+    appMinorFor: (board) => {
+      // The uploaded SDK stamps this board's app SDK-minor from its own
+      // pebble/<board>/include/pebble_process_info.h — the real "will apps be
+      // rejected?" number. Missing/unreadable → null (treated as compatible).
+      const hdr = winPath.join(
+        persistSdkRoot, "SDKs", version, "sdk-core",
+        "pebble", board, "include", "pebble_process_info.h",
+      );
+      try {
+        return parseAppSdkMinor(readFileSync(hdr, "utf8"));
+      } catch {
+        return null;
+      }
+    },
   };
   return { version, persistSdkRoot, paths };
 }

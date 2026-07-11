@@ -20,3 +20,6 @@ docs/
 vendor/qemu-pebble-win/
 vendor/pebble-py/
 vendor/pebble-sdk/
+
+# Firmware build staging + backups (big binaries; not committed)
+vendor/factory-snapshots/
