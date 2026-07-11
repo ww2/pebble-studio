@@ -988,17 +988,45 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null = () => nu
   });
   ipcMain.handle("sdk:applyFullLauncher", async (e) => {
     assertMainSender(e);
-    // Firmware bytes change → cancel any in-flight boot and tear down first, like
-    // sdk:install, so nothing straddles the pre-toggle firmware.
+    const ctx = await defaultCtx();
+    // 1. Dry preview — no teardown, no mutation — to learn what a normal apply would do.
+    const preview = await applyFullLauncherToActiveSdk(ctx, { dryRun: true });
+    // 2. If some models would be skipped for being newer, ask before downgrading them.
+    let force = false;
+    if (preview.report.skippedNewer.length > 0) {
+      const win = getMainWindow();
+      const box = {
+        type: "warning" as const,
+        buttons: ["Apply anyway", "Cancel"],
+        defaultId: 1,
+        cancelId: 1,
+        title: "SDK newer than our launcher",
+        message: "This SDK is newer than Pebble Studio's launcher firmware.",
+        detail:
+          `Adding the full launcher would replace the newer firmware on ${preview.report.skippedNewer.join(", ")} ` +
+          `with Studio's older build. The launcher will work, but apps built with this SDK may be rejected ` +
+          `("requires a newer version of the Pebble firmware"). You can Revert to stock firmware at any time.\n\nApply anyway?`,
+      };
+      const { response } = win ? await dialog.showMessageBox(win, box) : await dialog.showMessageBox(box);
+      force = response === 0;
+    }
+    // 3. Nothing to do (no eligible boards, force not granted)? Don't tear down.
+    const willChange = preview.report.applied.length > 0 || (force && preview.report.skippedNewer.length > 0);
+    if (!willChange) {
+      return { report: preview.report, info: preview.info, changed: false };
+    }
+    // 4. Real apply — firmware changes, so tear down first like sdk:install.
     if (currentBootToken) currentBootToken.cancelled = true;
     await teardownEmulator();
-    return applyFullLauncherToActiveSdk(await defaultCtx(), { onProgress: sdkProgress });
+    const applied = await applyFullLauncherToActiveSdk(ctx, { force, onProgress: sdkProgress });
+    return { report: applied.report, info: applied.info, changed: true };
   });
   ipcMain.handle("sdk:revertFullLauncher", async (e) => {
     assertMainSender(e);
     if (currentBootToken) currentBootToken.cancelled = true;
     await teardownEmulator();
-    return revertFullLauncherOnActiveSdk(await defaultCtx(), { onProgress: sdkProgress });
+    const { reverted, info } = await revertFullLauncherOnActiveSdk(await defaultCtx(), { onProgress: sdkProgress });
+    return { reverted, info, changed: reverted.length > 0 };
   });
 
   // ── Language packs (native-Windows) ──────────────────────────────────────

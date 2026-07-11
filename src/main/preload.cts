@@ -89,10 +89,12 @@ const studio = {
   sdkApplyFullLauncher: (): Promise<{
     report: { applied: string[]; skippedNewer: string[]; skippedMissing: string[] };
     info: { version: string; source: "custom" | "bundled"; fullLauncher: boolean };
+    changed: boolean;
   }> => ipcRenderer.invoke("sdk:applyFullLauncher"),
   sdkRevertFullLauncher: (): Promise<{
     reverted: string[];
     info: { version: string; source: "custom" | "bundled"; fullLauncher: boolean };
+    changed: boolean;
   }> => ipcRenderer.invoke("sdk:revertFullLauncher"),
   // Language packs (Task 10, native-Windows). catalog lists Rebble packs for the
   // active firmware; install/sideload apply a pack (resolving { language }/{ pack }

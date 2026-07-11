@@ -73,10 +73,12 @@ interface StudioApi {
   sdkApplyFullLauncher(): Promise<{
     report: { applied: string[]; skippedNewer: string[]; skippedMissing: string[] };
     info: { version: string; source: "custom" | "bundled"; fullLauncher: boolean };
+    changed: boolean;
   }>;
   sdkRevertFullLauncher(): Promise<{
     reverted: string[];
     info: { version: string; source: "custom" | "bundled"; fullLauncher: boolean };
+    changed: boolean;
   }>;
   // v1.0.0: app version + application-menu action subscription.
   appVersion(): Promise<string>;
