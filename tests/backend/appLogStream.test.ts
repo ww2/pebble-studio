@@ -2,12 +2,10 @@ import { describe, it, expect, vi } from "vitest";
 import { AppLogStream } from "../../src/main/backend/appLogStream.js";
 
 describe("AppLogStream", () => {
-  it("accumulates partial chunks into whole lines and emits each once", () => {
+  it("splits a single push carrying multiple newline-separated lines (defensive)", () => {
     const seen: string[] = [];
     const s = new AppLogStream({ onLine: (l) => seen.push(l) });
-    s.push("hel");
-    s.push("lo\nwor");
-    s.push("ld\n");
+    s.push("hello\nworld\n");
     expect(seen).toEqual(["hello", "world"]);
     expect(s.history()).toEqual(["hello", "world"]);
   });
@@ -29,13 +27,30 @@ describe("AppLogStream", () => {
     s.push("y\n");
     expect(s.history()).toEqual(["y"]);
   });
-  it("clear() also drops a buffered partial so the next line has no stale prefix", () => {
+  it("emits a newline-less line immediately (no cross-push buffering)", () => {
     const seen: string[] = [];
     const s = new AppLogStream({ onLine: (l) => seen.push(l) });
-    s.push("stale-frag"); // no newline → held as the partial
-    s.clear();
-    s.push("fresh\n");
-    expect(s.history()).toEqual(["fresh"]);   // NOT "stale-fragfresh"
-    expect(seen).toEqual(["fresh"]);
+    s.push("a-complete-line"); // pre-split by the feeder, no terminator
+    expect(seen).toEqual(["a-complete-line"]);
+    expect(s.history()).toEqual(["a-complete-line"]);
+  });
+  // Regression (#6 app-log panel showed nothing): the feeders (spawnLineStream and
+  // the WinInputChannel) already deliver ONE complete, newline-STRIPPED line per
+  // push() — the CLI path with no terminator, the channel path with a trailing CR.
+  // push() must emit each such line; it previously re-split on "\n", found none, and
+  // buffered every line forever so nothing ever reached the panel.
+  it("emits a whole pre-split line with no trailing newline (CLI + channel feeders)", () => {
+    const seen: string[] = [];
+    const s = new AppLogStream({ onLine: (l) => seen.push(l) });
+    s.push("[12:00:00] (app log stream connected)\r"); // channel-style: CR-terminated, no \n
+    s.push("[12:00:01] main.c:42> hello world");        // CLI-style: no terminator at all
+    expect(seen).toEqual([
+      "[12:00:00] (app log stream connected)",
+      "[12:00:01] main.c:42> hello world",
+    ]);
+    expect(s.history()).toEqual([
+      "[12:00:00] (app log stream connected)",
+      "[12:00:01] main.c:42> hello world",
+    ]);
   });
 });
