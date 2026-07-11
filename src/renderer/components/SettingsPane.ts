@@ -235,6 +235,8 @@ export class SettingsPane {
   private readonly captureDirValue: HTMLSpanElement;
   private readonly sdkVersionValue: HTMLSpanElement;
   private readonly sdkStatus: HTMLSpanElement;
+  private sdkFullBtn!: HTMLButtonElement;
+  private sdkFull = false;
   private bootMode: BootMode;
   /** Switches the live preview to the chosen platform (wired from main.ts). */
   private readonly onPlatformChange: (id: PlatformId) => void;
@@ -1190,8 +1192,9 @@ export class SettingsPane {
       sdkHeading,
       makeHelpTip(
         "Upload a Pebble SDK (a sdk-core .tar.bz2 / .zip archive or its folder) to replace the bundled one. " +
-          "It persists across updates until you upload another or reset. The full PebbleOS launcher " +
-          "(Settings, Health, full menu) is kept automatically. Relaunch the emulator to use a newly installed SDK.",
+          "An uploaded SDK runs its own firmware as-is; use \"Make full-featured\" to overlay the full PebbleOS " +
+          "launcher (Settings, Health, full menu) — Studio reports any watch model it can't do without downgrading. " +
+          "Relaunch the emulator to use a newly installed SDK.",
       ),
     );
 
@@ -1224,16 +1227,24 @@ export class SettingsPane {
     sdkResetBtn.type = "button";
     sdkResetBtn.className = "lib-pick-btn";
     sdkResetBtn.textContent = "Reset to bundled";
+    const sdkFullBtn = document.createElement("button");
+    sdkFullBtn.type = "button";
+    sdkFullBtn.className = "lib-pick-btn";
+    sdkFullBtn.textContent = "Make full-featured";
+    sdkFullBtn.disabled = true; // enabled by applySdkInfo when a custom SDK is active
+    this.sdkFullBtn = sdkFullBtn;
+
     const sdkBtns = document.createElement("div");
     sdkBtns.className = "settings-row-actions";
-    sdkBtns.append(sdkUploadBtn, sdkUploadDirBtn, sdkResetBtn);
+    sdkBtns.append(sdkUploadBtn, sdkUploadDirBtn, sdkFullBtn, sdkResetBtn);
 
     this.sdkStatus = document.createElement("span");
     this.sdkStatus.className = "settings-row-desc type-caption";
 
-    const sdkAllBtns = [sdkUploadBtn, sdkUploadDirBtn, sdkResetBtn];
+    const sdkAllBtns = [sdkUploadBtn, sdkUploadDirBtn, sdkFullBtn, sdkResetBtn];
     sdkUploadBtn.addEventListener("click", () => void this.uploadSdk("file", sdkAllBtns));
     sdkUploadDirBtn.addEventListener("click", () => void this.uploadSdk("folder", sdkAllBtns));
+    sdkFullBtn.addEventListener("click", () => void this.toggleFullLauncher(sdkAllBtns));
     sdkResetBtn.addEventListener("click", () => void this.resetSdk(sdkUploadBtn, sdkResetBtn));
 
     sdk.append(sdkHeader, sdkRow, sdkBtns, this.sdkStatus);
@@ -1723,13 +1734,28 @@ export class SettingsPane {
     return `${info.version} (${info.source} · ${fw})`;
   }
 
+  /** Render the active SDK's version + drive the full-launcher toggle's state. */
+  private applySdkInfo(info: { version: string; source: "custom" | "bundled"; fullLauncher: boolean }): void {
+    this.sdkVersionValue.textContent = this.sdkLabel(info);
+    this.sdkFull = info.fullLauncher;
+    const custom = info.source === "custom";
+    this.sdkFullBtn.disabled = !custom;
+    this.sdkFullBtn.textContent = info.fullLauncher ? "Revert to stock firmware" : "Make full-featured";
+    this.sdkFullBtn.title = custom
+      ? info.fullLauncher
+        ? "Restore this SDK's own firmware."
+        : "Overlay the full PebbleOS launcher onto this SDK."
+      : "Upload a custom SDK to toggle the full launcher.";
+  }
+
   /** Query main for the active SDK and render it. */
   private async refreshSdkInfo(): Promise<void> {
     try {
-      this.sdkVersionValue.textContent = this.sdkLabel(await window.studio.sdkInfo());
+      this.applySdkInfo(await window.studio.sdkInfo());
     } catch (err) {
       console.warn("[settings] sdkInfo failed (ignored):", err);
       this.sdkVersionValue.textContent = "unknown";
+      this.sdkFullBtn.disabled = true;
     }
   }
 
@@ -1756,11 +1782,11 @@ export class SettingsPane {
       if (info == null) {
         this.sdkStatus.textContent = ""; // cancelled — emulator untouched
       } else {
-        this.sdkVersionValue.textContent = this.sdkLabel(info);
+        this.applySdkInfo(info);
         relaunch = wasLive; // a real install tore the live emulator down
         const tail = wasLive ? " Relaunching the emulator…" : " Relaunch the emulator to use it.";
         this.sdkStatus.textContent =
-          `Installed SDK ${info.version}${info.fullLauncher ? " with the full PebbleOS launcher" : ""}.${tail}`;
+          `Installed SDK ${info.version}. Use "Make full-featured" to add the full PebbleOS launcher.${tail}`;
       }
     } catch (err) {
       const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
@@ -1780,7 +1806,7 @@ export class SettingsPane {
     this.sdkStatus.textContent = "Resetting…";
     try {
       const info = await window.studio.sdkReset();
-      this.sdkVersionValue.textContent = this.sdkLabel(info);
+      this.applySdkInfo(info);
       const tail = wasLive ? " Relaunching the emulator…" : " Relaunch the emulator to use it.";
       this.sdkStatus.textContent = `Reset to bundled SDK ${info.version}.${tail}`;
     } catch (err) {
@@ -1789,6 +1815,53 @@ export class SettingsPane {
     } finally {
       uploadBtn.disabled = false;
       resetBtn.disabled = false;
+    }
+    await this.maybeRelaunchAfterSdk(wasLive);
+  }
+
+  /** Turn a per-board apply report into a user-facing line (surfaces the
+   * "deviated too far from v4.13" skip). */
+  private describeApply(
+    report: { applied: string[]; skippedNewer: string[]; skippedMissing: string[] },
+    wasLive: boolean,
+  ): string {
+    const tail = wasLive ? " Relaunching the emulator…" : " Relaunch the emulator to use it.";
+    if (report.applied.length === 0) {
+      if (report.skippedNewer.length > 0) {
+        return `Couldn't add the full launcher — this SDK is newer than our bundled launcher firmware ` +
+          `(${report.skippedNewer.join(", ")}), so swapping it in would downgrade those models. Kept the SDK's own firmware.`;
+      }
+      return "Nothing to apply — this SDK doesn't ship the watch models we have launcher firmware for.";
+    }
+    let msg = `Full launcher applied to ${report.applied.join(", ")}.`;
+    if (report.skippedNewer.length > 0) {
+      msg += ` ${report.skippedNewer.join(", ")} kept their own firmware (newer than our launcher).`;
+    }
+    return msg + tail;
+  }
+
+  /** Apply or revert the full launcher on the active custom SDK. */
+  private async toggleFullLauncher(btns: HTMLButtonElement[]): Promise<void> {
+    const wasLive = this.isEmuLive?.() ?? false;
+    const goingFull = !this.sdkFull;
+    for (const b of btns) b.disabled = true;
+    this.sdkStatus.textContent = goingFull ? "Adding the full launcher…" : "Reverting to stock firmware…";
+    try {
+      if (goingFull) {
+        const { report, info } = await window.studio.sdkApplyFullLauncher();
+        this.applySdkInfo(info);
+        this.sdkStatus.textContent = this.describeApply(report, wasLive);
+      } else {
+        const { info } = await window.studio.sdkRevertFullLauncher();
+        this.applySdkInfo(info);
+        const tail = wasLive ? " Relaunching the emulator…" : " Relaunch the emulator to use it.";
+        this.sdkStatus.textContent = `Reverted to the SDK's own firmware.${tail}`;
+      }
+    } catch (err) {
+      const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
+      this.sdkStatus.textContent = `${goingFull ? "Apply" : "Revert"} failed: ${reason || "see console"}`;
+    } finally {
+      for (const b of btns) b.disabled = false;
     }
     await this.maybeRelaunchAfterSdk(wasLive);
   }
