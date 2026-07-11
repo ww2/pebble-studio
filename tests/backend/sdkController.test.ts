@@ -284,6 +284,30 @@ describe("applyFullLauncherFirmware", () => {
       `copy ${winPath.join(dstQemu("emery"), FW_REFRESH_BLOBS[0])} -> ${winPath.join(STASH("emery"), FW_REFRESH_BLOBS[0])}`,
     );
   });
+
+  it("force overlays newer boards too (skippedNewer becomes empty)", async () => {
+    const fs = fakeFwFs(fullPresent());
+    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.17" }, undefined, { force: true });
+    expect(r.applied).toEqual([...FW_REFRESH_BOARDS]);
+    expect(r.skippedNewer).toEqual([]);
+    expect(fs.has(MARKER)).toBe(true);
+  });
+
+  it("dryRun computes the report without mutating anything", async () => {
+    const fs = fakeFwFs(fullPresent());
+    const r = await applyFullLauncherFirmware(fs, paths, undefined, { dryRun: true });
+    expect(r.applied).toEqual([...FW_REFRESH_BOARDS]); // would apply all
+    expect(fs.calls).toEqual([]);                       // but recorded no copy/remove/write
+    expect(fs.has(MARKER)).toBe(false);                 // no marker written
+  });
+
+  it("dryRun still reports skippedNewer without mutating", async () => {
+    const fs = fakeFwFs(fullPresent());
+    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.17" }, undefined, { dryRun: true });
+    expect(r.applied).toEqual([]);
+    expect(r.skippedNewer.sort()).toEqual([...FW_REFRESH_BOARDS].sort());
+    expect(fs.calls).toEqual([]);
+  });
 });
 
 describe("revertFullLauncherFirmware", () => {

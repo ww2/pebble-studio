@@ -137,6 +137,7 @@ export async function applyFullLauncherFirmware(
   fs: ProvisionFs,
   p: FullLauncherPaths,
   log: (msg: string) => void = () => {},
+  opts: { force?: boolean; dryRun?: boolean } = {},
 ): Promise<FullLauncherReport> {
   const { win32: wp } = await import("node:path");
   const applied: string[] = [];
@@ -144,7 +145,8 @@ export async function applyFullLauncherFirmware(
   const skippedMissing: string[] = [];
   for (const board of FW_REFRESH_BOARDS) {
     // Never downgrade: skip a board whose bundled blobs are OLDER than the upload.
-    if (p.uploadVersion && isVersionNewer(p.uploadVersion, BUNDLED_FW_VERSIONS[board] ?? "")) {
+    // `force` bypasses this gate (still stashes, so it stays reversible).
+    if (!opts.force && p.uploadVersion && isVersionNewer(p.uploadVersion, BUNDLED_FW_VERSIONS[board] ?? "")) {
       skippedNewer.push(board);
       continue;
     }
@@ -152,27 +154,30 @@ export async function applyFullLauncherFirmware(
     const dst = wp.join(p.targetSdkCore, "pebble", board, "qemu");
     if (!(await fs.exists(wp.join(src, FW_REFRESH_BLOBS[0])))) { skippedMissing.push(board); continue; }
     if (!(await fs.exists(dst))) { skippedMissing.push(board); continue; }
-    // Stash the SDK's OWN blobs BEFORE overwriting so revert can restore them.
-    // Guard: only stash when none exists yet, so a re-apply can't overwrite a good
-    // stash (the SDK's firmware) with already-overlaid launcher bytes.
-    const stashDir = p.stashQemuDir(board);
-    if (!(await fs.exists(wp.join(stashDir, FW_REFRESH_BLOBS[0])))) {
-      await fs.mkdirp(stashDir);
-      for (const blob of FW_REFRESH_BLOBS) {
-        const cur = wp.join(dst, blob);
-        if (await fs.exists(cur)) await fs.copyFile(cur, wp.join(stashDir, blob));
+    // dryRun: report what WOULD apply, but perform no fs mutation.
+    if (!opts.dryRun) {
+      // Stash the SDK's OWN blobs BEFORE overwriting so revert can restore them.
+      // Guard: only stash when none exists yet, so a re-apply can't overwrite a good
+      // stash (the SDK's firmware) with already-overlaid launcher bytes.
+      const stashDir = p.stashQemuDir(board);
+      if (!(await fs.exists(wp.join(stashDir, FW_REFRESH_BLOBS[0])))) {
+        await fs.mkdirp(stashDir);
+        for (const blob of FW_REFRESH_BLOBS) {
+          const cur = wp.join(dst, blob);
+          if (await fs.exists(cur)) await fs.copyFile(cur, wp.join(stashDir, blob));
+        }
       }
+      for (const blob of FW_REFRESH_BLOBS) {
+        const s = wp.join(src, blob);
+        if (await fs.exists(s)) await fs.copyFile(s, wp.join(dst, blob));
+      }
+      // Drop the stale decompressed spi so pebble-tool regenerates it.
+      await fs.remove(p.decompressedSpi(board));
     }
-    for (const blob of FW_REFRESH_BLOBS) {
-      const s = wp.join(src, blob);
-      if (await fs.exists(s)) await fs.copyFile(s, wp.join(dst, blob));
-    }
-    // Drop the stale decompressed spi so pebble-tool regenerates it.
-    await fs.remove(p.decompressedSpi(board));
     applied.push(board);
   }
   if (applied.length > 0) {
-    await fs.writeText(p.marker, "1");
+    if (!opts.dryRun) await fs.writeText(p.marker, "1");
     log(`Applied full PebbleOS launcher firmware (${applied.join(", ")}).`);
   }
   if (skippedNewer.length > 0) {
@@ -543,17 +548,20 @@ async function activeCustomSdkPaths(
  * its snapshots (firmware changed). Returns the per-board report + refreshed info. */
 export async function applyFullLauncherToActiveSdk(
   ctx: WinRuntimeCtx,
-  deps: { onProgress?: (msg: string) => void } = {},
+  deps: { onProgress?: (msg: string) => void; force?: boolean; dryRun?: boolean } = {},
 ): Promise<{ report: FullLauncherReport; info: SdkInfo }> {
   const log = deps.onProgress ?? (() => {});
   const { version, persistSdkRoot, paths } = await activeCustomSdkPaths(ctx);
   try {
-    const report = await applyFullLauncherFirmware(realProvisionFs(), paths, log);
+    const report = await applyFullLauncherFirmware(realProvisionFs(), paths, log, { force: deps.force, dryRun: deps.dryRun });
     return { report, info: await currentSdkInfo(ctx) };
   } finally {
     // Firmware bytes may have changed even on a partial/throwing apply — drop
     // snapshots on ALL paths so no stale restore can boot pre-toggle firmware.
-    await invalidateVersionSnapshots(realProvisionFs(), persistSdkRoot, version).catch(() => {});
+    // dryRun mutates nothing, so leave the snapshots intact.
+    if (!deps.dryRun) {
+      await invalidateVersionSnapshots(realProvisionFs(), persistSdkRoot, version).catch(() => {});
+    }
   }
 }
 
