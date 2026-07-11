@@ -515,6 +515,57 @@ export async function currentSdkInfo(ctx: WinRuntimeCtx): Promise<SdkInfo> {
 }
 
 /**
+ * Resolve the FullLauncherPaths for the currently-active CUSTOM SDK. Throws a
+ * user-facing error when no custom SDK is active — the bundled SDK is always
+ * full-launcher, so there is nothing to toggle.
+ */
+async function activeCustomSdkPaths(
+  ctx: WinRuntimeCtx,
+): Promise<{ version: string; persistSdkRoot: string; paths: FullLauncherPaths }> {
+  const persistSdkRoot = winPath.join(pebbleDataDir(ctx), "pebble-sdk");
+  const version = await readActiveSdkOverride(realProvisionFs(), persistSdkRoot);
+  if (!version) {
+    throw new Error("Upload a custom SDK first — the bundled SDK already has the full launcher.");
+  }
+  const bundleVersion = pickSdkVersion(await realProvisionFs().list(winPath.join(sdkBundleRoot(ctx), "SDKs")));
+  const paths: FullLauncherPaths = {
+    bundleSdkCore: bundleVersion ? winPath.join(sdkBundleRoot(ctx), "SDKs", bundleVersion, "sdk-core") : "",
+    targetSdkCore: winPath.join(persistSdkRoot, "SDKs", version, "sdk-core"),
+    marker: winPath.join(persistSdkRoot, "SDKs", version, FULL_LAUNCHER_MARKER),
+    decompressedSpi: (board) => winPath.join(persistSdkRoot, version, board, "qemu_spi_flash.bin"),
+    stashQemuDir: (board) => winPath.join(persistSdkRoot, "SDKs", version, STOCK_FW_STASH, board),
+    uploadVersion: version,
+  };
+  return { version, persistSdkRoot, paths };
+}
+
+/** Apply the full-launcher overlay to the active custom SDK on demand, then drop
+ * its snapshots (firmware changed). Returns the per-board report + refreshed info. */
+export async function applyFullLauncherToActiveSdk(
+  ctx: WinRuntimeCtx,
+  deps: { onProgress?: (msg: string) => void } = {},
+): Promise<{ report: FullLauncherReport; info: SdkInfo }> {
+  const log = deps.onProgress ?? (() => {});
+  const { version, persistSdkRoot, paths } = await activeCustomSdkPaths(ctx);
+  const report = await applyFullLauncherFirmware(realProvisionFs(), paths, log);
+  await invalidateVersionSnapshots(realProvisionFs(), persistSdkRoot, version).catch(() => {});
+  return { report, info: await currentSdkInfo(ctx) };
+}
+
+/** Revert the active custom SDK to its own firmware, then drop its snapshots.
+ * Returns the reverted boards + refreshed info. */
+export async function revertFullLauncherOnActiveSdk(
+  ctx: WinRuntimeCtx,
+  deps: { onProgress?: (msg: string) => void } = {},
+): Promise<{ reverted: string[]; info: SdkInfo }> {
+  const log = deps.onProgress ?? (() => {});
+  const { version, persistSdkRoot, paths } = await activeCustomSdkPaths(ctx);
+  const reverted = await revertFullLauncherFirmware(realProvisionFs(), paths, log);
+  await invalidateVersionSnapshots(realProvisionFs(), persistSdkRoot, version).catch(() => {});
+  return { reverted, info: await currentSdkInfo(ctx) };
+}
+
+/**
  * Drop the user override and return to the bundled SDK. Removes the marker AND
  * the custom version tree it named, then re-provisions so `current` points back
  * at a FRESH bundled copy.
