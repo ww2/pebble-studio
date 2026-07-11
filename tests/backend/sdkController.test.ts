@@ -167,7 +167,9 @@ describe("applyFullLauncherFirmware", () => {
     targetSdkCore: TARGET,
     marker: MARKER,
     decompressedSpi: (board: string) => `C:\\spi\\${board}\\qemu_spi_flash.bin`,
+    stashQemuDir: (board: string) => `C:\\t\\.stock-fw\\${board}`,
   };
+  const STASH = (b: string) => winPath.join("C:\\t\\.stock-fw", b);
   const srcQemu = (b: string) => winPath.join(BUNDLE, "pebble", b, "qemu");
   const dstQemu = (b: string) => winPath.join(TARGET, "pebble", b, "qemu");
   /** Seed: bundle has both blobs for every board; target ships every board's qemu dir. */
@@ -182,8 +184,8 @@ describe("applyFullLauncherFirmware", () => {
 
   it("overlays both blobs onto every board, drops stale spi, and stamps the marker", async () => {
     const fs = fakeFwFs(fullPresent());
-    const done = await applyFullLauncherFirmware(fs, paths);
-    expect(done).toEqual([...FW_REFRESH_BOARDS]);
+    const r = await applyFullLauncherFirmware(fs, paths);
+    expect(r.applied).toEqual([...FW_REFRESH_BOARDS]);
     for (const b of FW_REFRESH_BOARDS) {
       for (const blob of FW_REFRESH_BLOBS) {
         expect(fs.calls).toContain(`copy ${winPath.join(srcQemu(b), blob)} -> ${winPath.join(dstQemu(b), blob)}`);
@@ -198,9 +200,10 @@ describe("applyFullLauncherFirmware", () => {
     // Drop emery's dst qemu dir → emery should be skipped, the rest overlaid.
     const present = fullPresent().filter((p) => p !== dstQemu("emery"));
     const fs = fakeFwFs(present);
-    const done = await applyFullLauncherFirmware(fs, paths);
-    expect(done).not.toContain("emery");
-    expect(done.length).toBe(FW_REFRESH_BOARDS.length - 1);
+    const r = await applyFullLauncherFirmware(fs, paths);
+    expect(r.applied).not.toContain("emery");
+    expect(r.skippedMissing).toContain("emery");
+    expect(r.applied.length).toBe(FW_REFRESH_BOARDS.length - 1);
     expect(fs.calls.some((c) => c.includes(`\\emery\\`))).toBe(false);
   });
 
@@ -208,14 +211,15 @@ describe("applyFullLauncherFirmware", () => {
     // Remove chalk's bundle micro-flash blob → chalk skipped.
     const present = fullPresent().filter((p) => p !== winPath.join(srcQemu("chalk"), FW_REFRESH_BLOBS[0]));
     const fs = fakeFwFs(present);
-    const done = await applyFullLauncherFirmware(fs, paths);
-    expect(done).not.toContain("chalk");
+    const r = await applyFullLauncherFirmware(fs, paths);
+    expect(r.applied).not.toContain("chalk");
+    expect(r.skippedMissing).toContain("chalk");
   });
 
   it("writes no marker and returns [] when nothing can be overlaid", async () => {
     const fs = fakeFwFs([]); // empty: no bundle blobs, no dst dirs
-    const done = await applyFullLauncherFirmware(fs, paths);
-    expect(done).toEqual([]);
+    const r = await applyFullLauncherFirmware(fs, paths);
+    expect(r.applied).toEqual([]);
     expect(fs.calls.some((c) => c.startsWith("write"))).toBe(false);
   });
 
@@ -226,31 +230,58 @@ describe("applyFullLauncherFirmware", () => {
   // .pbws built with the new SDK hit "requires a newer version of the firmware".
   it("skips EVERY board when the upload is newer than all bundled firmware (4.17)", async () => {
     const fs = fakeFwFs(fullPresent());
-    const done = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.17" });
-    expect(done).toEqual([]);
+    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.17" });
+    expect(r.applied).toEqual([]);
+    expect(r.skippedNewer.sort()).toEqual([...FW_REFRESH_BOARDS].sort());
     expect(fs.calls.some((c) => c.startsWith("copy"))).toBe(false);
     expect(fs.has(MARKER)).toBe(false);
   });
 
   it("overlays only the boards whose bundled fw is >= the upload (4.11: modern yes, legacy no)", async () => {
     const fs = fakeFwFs(fullPresent());
-    const done = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.11" });
+    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.11" });
     // modern boards carry 4.13.0 (>= 4.11) → overlaid; legacy carry 4.9.169 (< 4.11) → kept.
-    expect(done.sort()).toEqual(["emery", "flint", "gabbro"]);
+    expect(r.applied.sort()).toEqual(["emery", "flint", "gabbro"]);
     expect(fs.calls.some((c) => c.includes("\\basalt\\"))).toBe(false);
     expect(fs.has(MARKER)).toBe(true); // some boards did get the launcher
   });
 
   it("still overlays everything for a same-or-older upload (4.9.169)", async () => {
     const fs = fakeFwFs(fullPresent());
-    const done = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.9.169" });
-    expect(done).toEqual([...FW_REFRESH_BOARDS]);
+    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "4.9.169" });
+    expect(r.applied).toEqual([...FW_REFRESH_BOARDS]);
   });
 
   it("treats an unparseable upload version like today (overlay everything)", async () => {
     const fs = fakeFwFs(fullPresent());
-    const done = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "weird" });
-    expect(done).toEqual([...FW_REFRESH_BOARDS]);
+    const r = await applyFullLauncherFirmware(fs, { ...paths, uploadVersion: "weird" });
+    expect(r.applied).toEqual([...FW_REFRESH_BOARDS]);
+  });
+
+  it("stashes the SDK's own blobs before overwriting (reversible)", async () => {
+    const present = fullPresent();
+    for (const b of FW_REFRESH_BOARDS) for (const blob of FW_REFRESH_BLOBS) present.push(winPath.join(dstQemu(b), blob));
+    const fs = fakeFwFs(present);
+    const r = await applyFullLauncherFirmware(fs, paths);
+    expect(r.applied).toEqual([...FW_REFRESH_BOARDS]);
+    for (const b of FW_REFRESH_BOARDS) for (const blob of FW_REFRESH_BLOBS) {
+      expect(fs.calls).toContain(`copy ${winPath.join(dstQemu(b), blob)} -> ${winPath.join(STASH(b), blob)}`);
+    }
+  });
+
+  it("does not re-stash a board that already has a stash (re-apply keeps the original)", async () => {
+    const present = fullPresent();
+    for (const b of FW_REFRESH_BOARDS) for (const blob of FW_REFRESH_BLOBS) present.push(winPath.join(dstQemu(b), blob));
+    present.push(winPath.join(STASH("basalt"), FW_REFRESH_BLOBS[0])); // basalt already stashed
+    const fs = fakeFwFs(present);
+    await applyFullLauncherFirmware(fs, paths);
+    expect(fs.calls).not.toContain(
+      `copy ${winPath.join(dstQemu("basalt"), FW_REFRESH_BLOBS[0])} -> ${winPath.join(STASH("basalt"), FW_REFRESH_BLOBS[0])}`,
+    );
+    // a board WITHOUT a prior stash is still stashed
+    expect(fs.calls).toContain(
+      `copy ${winPath.join(dstQemu("emery"), FW_REFRESH_BLOBS[0])} -> ${winPath.join(STASH("emery"), FW_REFRESH_BLOBS[0])}`,
+    );
   });
 });
 

@@ -54,6 +54,21 @@ export interface SdkInfo {
  * overlay has been applied to it. */
 export const FULL_LAUNCHER_MARKER = ".full-launcher";
 
+/** Per-board stash dir name for an uploaded SDK's ORIGINAL qemu firmware, so the
+ * full-launcher overlay is reversible. Lives at
+ * `<persistSdkRoot>\SDKs\<ver>\.stock-fw\<board>`. */
+export const STOCK_FW_STASH = ".stock-fw";
+
+/** Per-board outcome of a full-launcher overlay attempt. `applied` = boards now
+ * running our launcher; `skippedNewer` = boards left alone because the SDK's own
+ * firmware is newer than ours (never downgrade); `skippedMissing` = boards the
+ * bundle or the SDK doesn't ship. */
+export interface FullLauncherReport {
+  applied: string[];
+  skippedNewer: string[];
+  skippedMissing: string[];
+}
+
 /**
  * Firmware version each board's BUNDLED overlay blobs actually are. The overlay
  * must never DOWNGRADE an uploaded SDK (#8/#11: a 4.17 upload overlaid with these
@@ -98,6 +113,9 @@ export interface FullLauncherPaths {
   marker: string;
   /** pebble-tool's decompressed spi for a board (deleted so it regenerates). */
   decompressedSpi: (board: string) => string;
+  /** Per-board stash dir for the SDK's ORIGINAL qemu blobs (revert source).
+   * Resolved by the caller to `<persistSdkRoot>\SDKs\<ver>\.stock-fw\<board>`. */
+  stashQemuDir: (board: string) => string;
   /** The uploaded SDK's declared version. When set, a board is overlaid only if
    * its bundled firmware is same-or-newer (never downgrade an upload). Absent →
    * legacy behavior (overlay whatever is present). */
@@ -119,33 +137,43 @@ export async function applyFullLauncherFirmware(
   fs: ProvisionFs,
   p: FullLauncherPaths,
   log: (msg: string) => void = () => {},
-): Promise<string[]> {
+): Promise<FullLauncherReport> {
   const { win32: wp } = await import("node:path");
-  const done: string[] = [];
+  const applied: string[] = [];
   const skippedNewer: string[] = [];
+  const skippedMissing: string[] = [];
   for (const board of FW_REFRESH_BOARDS) {
-    // #8/#11: never downgrade — skip a board whose bundled blobs are OLDER than
-    // the uploaded SDK's firmware. The upload keeps its own (newer) firmware for
-    // that board, at the cost of the stock (sdkshell) launcher there.
+    // Never downgrade: skip a board whose bundled blobs are OLDER than the upload.
     if (p.uploadVersion && isVersionNewer(p.uploadVersion, BUNDLED_FW_VERSIONS[board] ?? "")) {
       skippedNewer.push(board);
       continue;
     }
     const src = wp.join(p.bundleSdkCore, "pebble", board, "qemu");
     const dst = wp.join(p.targetSdkCore, "pebble", board, "qemu");
-    if (!(await fs.exists(wp.join(src, FW_REFRESH_BLOBS[0])))) continue; // bundle lacks this board
-    if (!(await fs.exists(dst))) continue; // uploaded SDK lacks this board → replace-only
+    if (!(await fs.exists(wp.join(src, FW_REFRESH_BLOBS[0])))) { skippedMissing.push(board); continue; }
+    if (!(await fs.exists(dst))) { skippedMissing.push(board); continue; }
+    // Stash the SDK's OWN blobs BEFORE overwriting so revert can restore them.
+    // Guard: only stash when none exists yet, so a re-apply can't overwrite a good
+    // stash (the SDK's firmware) with already-overlaid launcher bytes.
+    const stashDir = p.stashQemuDir(board);
+    if (!(await fs.exists(wp.join(stashDir, FW_REFRESH_BLOBS[0])))) {
+      await fs.mkdirp(stashDir);
+      for (const blob of FW_REFRESH_BLOBS) {
+        const cur = wp.join(dst, blob);
+        if (await fs.exists(cur)) await fs.copyFile(cur, wp.join(stashDir, blob));
+      }
+    }
     for (const blob of FW_REFRESH_BLOBS) {
       const s = wp.join(src, blob);
       if (await fs.exists(s)) await fs.copyFile(s, wp.join(dst, blob));
     }
-    // Drop the stale decompressed spi so pebble-tool regenerates it from the new template.
+    // Drop the stale decompressed spi so pebble-tool regenerates it.
     await fs.remove(p.decompressedSpi(board));
-    done.push(board);
+    applied.push(board);
   }
-  if (done.length > 0) {
+  if (applied.length > 0) {
     await fs.writeText(p.marker, "1");
-    log(`Applied full PebbleOS launcher firmware (${done.join(", ")}).`);
+    log(`Applied full PebbleOS launcher firmware (${applied.join(", ")}).`);
   }
   if (skippedNewer.length > 0) {
     log(
@@ -153,7 +181,7 @@ export async function applyFullLauncherFirmware(
       `keeping its own firmware on ${skippedNewer.join(", ")}.`,
     );
   }
-  return done;
+  return { applied, skippedNewer, skippedMissing };
 }
 
 /**
