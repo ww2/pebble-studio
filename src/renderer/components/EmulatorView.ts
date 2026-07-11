@@ -1389,6 +1389,14 @@ export class EmulatorView {
     this.lastEp = ep as { host: string; port: number; wsPath: string };
     this.vnc = connectVnc(this.screenHost, this.lastEp, info.touch);
     this.updateLifecycleButtons();
+    // Fit was computed during applyGeometry() while the boot-time rows (status
+    // "Booting…", etc.) were transient, which over-subtracted their height and
+    // over-scaled the watch — and the column ResizeObserver won't fire for row
+    // changes. Re-fit now that we're "● Live" and the rows have settled. No-op
+    // unless Fit is the active zoom.
+    if (this.zoom === "fit") {
+      requestAnimationFrame(() => { if (this.zoom === "fit") this.applyFitScale(); });
+    }
     // If this boot followed an auto-relaunch, give it a chance to prove healthy:
     // staying live past AUTO_RELAUNCH_HEALTHY_MS resets the consecutive-crash
     // budget (a crash before then keeps counting, capping a thrash loop).
