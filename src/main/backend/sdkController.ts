@@ -185,6 +185,36 @@ export async function applyFullLauncherFirmware(
 }
 
 /**
+ * Undo a full-launcher overlay by restoring the SDK's OWN firmware from the
+ * `.stock-fw` stash. Per board: copy stashed blobs back over the overlaid ones
+ * and drop the decompressed spi so it regenerates. Removes the `.full-launcher`
+ * marker at the end (always, so state is clean even if no board had a stash). A
+ * board with no stash is skipped. Returns the boards actually reverted.
+ */
+export async function revertFullLauncherFirmware(
+  fs: ProvisionFs,
+  p: Pick<FullLauncherPaths, "targetSdkCore" | "marker" | "decompressedSpi" | "stashQemuDir">,
+  log: (msg: string) => void = () => {},
+): Promise<string[]> {
+  const { win32: wp } = await import("node:path");
+  const reverted: string[] = [];
+  for (const board of FW_REFRESH_BOARDS) {
+    const stashDir = p.stashQemuDir(board);
+    if (!(await fs.exists(wp.join(stashDir, FW_REFRESH_BLOBS[0])))) continue; // nothing stashed
+    const dst = wp.join(p.targetSdkCore, "pebble", board, "qemu");
+    for (const blob of FW_REFRESH_BLOBS) {
+      const s = wp.join(stashDir, blob);
+      if (await fs.exists(s)) await fs.copyFile(s, wp.join(dst, blob));
+    }
+    await fs.remove(p.decompressedSpi(board));
+    reverted.push(board);
+  }
+  await fs.remove(p.marker);
+  if (reverted.length > 0) log(`Reverted to the SDK's own firmware (${reverted.join(", ")}).`);
+  return reverted;
+}
+
+/**
  * Delete every board's QEMU snapshot bundle for a version
  * (`<persistSdkRoot>\<version>\<board>\.snapshot`). #8/#11: snapshot bundles are
  * keyed on {fwRev, sdkVer, exeStamp} — NOT firmware content — so swapping the

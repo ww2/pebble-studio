@@ -4,6 +4,7 @@ import {
   locateSdkCore,
   looksLikeArchive,
   applyFullLauncherFirmware,
+  revertFullLauncherFirmware,
   isPathInside,
   isVersionNewer,
   invalidateVersionSnapshots,
@@ -282,6 +283,42 @@ describe("applyFullLauncherFirmware", () => {
     expect(fs.calls).toContain(
       `copy ${winPath.join(dstQemu("emery"), FW_REFRESH_BLOBS[0])} -> ${winPath.join(STASH("emery"), FW_REFRESH_BLOBS[0])}`,
     );
+  });
+});
+
+describe("revertFullLauncherFirmware", () => {
+  const TARGET = "C:\\t\\sdk-core";
+  const MARKER = "C:\\t\\.full-launcher";
+  const STASH = (b: string) => winPath.join("C:\\t\\.stock-fw", b);
+  const dstQemu = (b: string) => winPath.join(TARGET, "pebble", b, "qemu");
+  const paths = {
+    bundleSdkCore: "C:\\b\\sdk-core",
+    targetSdkCore: TARGET,
+    marker: MARKER,
+    decompressedSpi: (b: string) => `C:\\spi\\${b}\\qemu_spi_flash.bin`,
+    stashQemuDir: (b: string) => STASH(b),
+  };
+
+  it("restores stashed blobs, drops the spi, and clears the marker", async () => {
+    const present: string[] = [MARKER];
+    for (const b of FW_REFRESH_BOARDS) for (const blob of FW_REFRESH_BLOBS) present.push(winPath.join(STASH(b), blob));
+    const fs = fakeFwFs(present);
+    const reverted = await revertFullLauncherFirmware(fs, paths);
+    expect(reverted).toEqual([...FW_REFRESH_BOARDS]);
+    for (const b of FW_REFRESH_BOARDS) {
+      for (const blob of FW_REFRESH_BLOBS) {
+        expect(fs.calls).toContain(`copy ${winPath.join(STASH(b), blob)} -> ${winPath.join(dstQemu(b), blob)}`);
+      }
+      expect(fs.calls).toContain(`remove C:\\spi\\${b}\\qemu_spi_flash.bin`);
+    }
+    expect(fs.calls).toContain(`remove ${MARKER}`);
+  });
+
+  it("skips a board with no stash but still clears the marker", async () => {
+    const fs = fakeFwFs([MARKER]);
+    const reverted = await revertFullLauncherFirmware(fs, paths);
+    expect(reverted).toEqual([]);
+    expect(fs.calls).toContain(`remove ${MARKER}`);
   });
 });
 
