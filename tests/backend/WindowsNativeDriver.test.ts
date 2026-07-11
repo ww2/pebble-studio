@@ -228,7 +228,7 @@ describe("WindowsNativeDriver", () => {
       });
       const d = new WindowsNativeDriver({
         run, boot: async () => ep, stop: async () => {},
-        timeHelper: healthHelper, sleep: async () => {},
+        healthHelper, sleep: async () => {},
       });
       const r = await d.activateHealth();
       expect(r).toEqual({ ok: true, status: 1, detail: "health-activate: status=1" });
@@ -239,7 +239,7 @@ describe("WindowsNativeDriver", () => {
       const run = vi.fn(async () => ({ code: 0, stdout: "health-activate: status=8", stderr: "" }));
       const d = new WindowsNativeDriver({
         run, boot: async () => ep, stop: async () => {},
-        timeHelper: healthHelper, sleep: async () => {},
+        healthHelper, sleep: async () => {},
       });
       const r = await d.activateHealth();
       expect(r.status).toBe(8);
@@ -251,7 +251,7 @@ describe("WindowsNativeDriver", () => {
       const run = vi.fn(async () => ({ code: 1, stdout: "health-activate: error refused", stderr: "" }));
       const d = new WindowsNativeDriver({
         run, boot: async () => ep, stop: async () => {},
-        timeHelper: healthHelper, sleep: async () => {},
+        healthHelper, sleep: async () => {},
       });
       const r = await d.activateHealth();
       expect(r.ok).toBe(false);
