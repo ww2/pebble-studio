@@ -7,6 +7,11 @@ on:
       - '.github/workflows/qemu-arm64.yml'
       - 'build/qemu-patches/**'
 
+# Least privilege: the job only reads repo contents (checkout, and the gate's
+# download of this repo's own v3.0.5 release asset — releases fall under contents).
+permissions:
+  contents: read
+
 jobs:
   build-and-gate:
     runs-on: windows-11-arm
