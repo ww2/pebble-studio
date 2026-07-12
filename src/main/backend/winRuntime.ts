@@ -48,6 +48,7 @@ export interface WinRuntimeCtx {
 
 /** Bundle dir names under resources/ (packaged) or vendor/ (dev). */
 const QEMU_BUNDLE = "qemu-pebble-win";
+const QEMU_BUNDLE_ARM64 = "qemu-pebble-win-arm64";
 const PY_BUNDLE = "pebble-py";
 const SDK_BUNDLE = "pebble-sdk";
 const TIMESHIM_WIN_BUNDLE = "timeshim-win";
@@ -83,8 +84,22 @@ function bundleDir(ctx: WinRuntimeCtx, name: string): string {
   return winPath.join(ctx.repoRoot, "vendor", name);
 }
 
-/** Absolute path to the bundled qemu-pebble.exe. */
+/** Absolute path to the bundled qemu-pebble.exe.
+ *
+ * On a real ARM64 host, prefer the native-arm64 bundle when it is staged — an
+ * x86-64 qemu crashes under Windows-on-ARM emulation (its TCG JIT re-JIT is the
+ * worst case), so we spawn the native-arm64 exe instead. If the arm64 bundle is
+ * absent (e.g. a mis-built x64-only package on ARM) we fall back to the x64 exe,
+ * which reproduces today's behavior rather than pointing at a missing file. */
 export function qemuExe(ctx: WinRuntimeCtx): string {
+  if (ctx.hostArm64) {
+    const arm64 = winPath.join(bundleDir(ctx, QEMU_BUNDLE_ARM64), "qemu-pebble.exe");
+    if (exists(ctx, arm64)) {
+      console.warn("[winRuntime] host is ARM64 — using native arm64 qemu bundle");
+      return arm64;
+    }
+    console.warn("[winRuntime] host is ARM64 but arm64 qemu bundle is missing — falling back to x64 qemu (emulated; may fail)");
+  }
   return winPath.join(bundleDir(ctx, QEMU_BUNDLE), "qemu-pebble.exe");
 }
 
