@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // Stage the native-arm64 qemu bundle into vendor/qemu-pebble-win-arm64/ (gitignored)
 // from the latest successful run of the Phase-0 arm64 CI workflow.
 //
