@@ -116,13 +116,18 @@ export function parseBridgePids(json: string, platform: string): BridgePids | nu
  *   Step 1: TCP probe via bare `(exec 3<>/dev/tcp/localhost/PORT) 2>/dev/null`.
  *           A refused connect fails immediately — no timeout wrapper needed.
  *           On success → echo OK and exit (port-reachable ⇒ alive, authoritative).
- *   Step 2 (only when the port is down): read a single state char from
- *           /proc/<pid>/status via grep+cut. `grep -m1 ^State /proc/<pid>/status
- *           | cut -f2 | cut -c1` yields one char (Z/S/R/…) or empty when the
- *           process is gone. If either QSTATE or PSTATE is empty or equals Z →
- *           DEAD pid; otherwise → DEAD port.
+ *   Step 2 (only when the port is down): read a single state char per pid, which
+ *           yields one char (Z/S/R/…) or empty when the process is gone. If either
+ *           QSTATE or PSTATE is empty or equals Z → DEAD pid; otherwise → DEAD port.
+ *
+ *   PLATFORM: the probe is darwin-gated. Linux and WSL keep the original
+ *   /proc/<pid>/status read byte-for-byte (the Windows host drives a Linux shell,
+ *   so it needs the Linux probe); ONLY macOS swaps in BSD `ps -o state=`, because
+ *   macOS has no /proc and the /proc grep produced an empty state for EVERY pid,
+ *   mis-reporting a hung-but-alive bridge as `DEAD pid`. `platform` defaults to
+ *   process.platform and is injectable for tests.
  */
-export function buildHealthCommand(pids: BridgePids): string {
+export function buildHealthCommand(pids: BridgePids, platform: string = process.platform): string {
   const { qemuPid, pypkjsPid, pypkjsPort } = pids;
 
   // Step 1: TCP probe — (exec 3<>/dev/tcp/localhost/PORT) 2>/dev/null
@@ -130,16 +135,23 @@ export function buildHealthCommand(pids: BridgePids): string {
   // A reachable port is authoritative: the bridge is serving ⇒ OK, regardless
   // of any (fragile) /proc pid read.
   //
-  // Step 2 (port down only): extract a single state char from /proc/<pid>/status.
-  // "State:" and the value are separated by a TAB, so `cut -f2` gives the value
-  // field ("Z (zombie)", "S (sleeping)", etc.) and `cut -c1` reduces it to one
-  // safe char. Empty when the process file is absent (process gone).
-  // Single char, no spaces → unquoted [ ] tests are safe.
+  // Step 2 (port down only): extract a single state char per pid, reduced to one
+  // safe char by `cut -c1` (empty when the process is gone). Single char, no
+  // spaces → unquoted [ ] tests are safe.
+  //   - Linux/WSL: grep /proc/<pid>/status — "State:" and its value are TAB-split,
+  //     so `cut -f2` gives the value ("Z (zombie)", "S (sleeping)", …). UNCHANGED
+  //     from the pre-macOS behavior.
+  //   - macOS: `ps -o state=` (BSD). The `=` suppresses the header; the value may
+  //     carry flag suffixes ("Ss"/"R+"), harmless after `cut -c1`. macOS has no /proc.
+  const stateProbe = (pid: number) =>
+    platform === "darwin"
+      ? `$(ps -o state= -p ${pid} 2>/dev/null | cut -c1)`
+      : `$(grep -m1 ^State /proc/${pid}/status 2>/dev/null | cut -f2 | cut -c1)`;
 
   return (
     `if (exec 3<>/dev/tcp/localhost/${pypkjsPort}) 2>/dev/null; then echo OK; exit 0; fi; ` +
-    `QSTATE=$(grep -m1 ^State /proc/${qemuPid}/status 2>/dev/null | cut -f2 | cut -c1); ` +
-    `PSTATE=$(grep -m1 ^State /proc/${pypkjsPid}/status 2>/dev/null | cut -f2 | cut -c1); ` +
+    `QSTATE=${stateProbe(qemuPid)}; ` +
+    `PSTATE=${stateProbe(pypkjsPid)}; ` +
     `if [ -z $QSTATE ] || [ -z $PSTATE ] || [ $QSTATE = Z ] || [ $PSTATE = Z ]; then echo DEAD pid; exit 1; fi; ` +
     `echo DEAD port`
   );

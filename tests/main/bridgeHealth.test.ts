@@ -129,21 +129,32 @@ describe("buildHealthCommand", () => {
   // `wsl.exe -- bash -lc "'bash' '-lc' '<cmd>'"`. Any quote inside the command
   // string is mangled across the two shell hops and silently breaks only on the
   // real .exe. (Same constraint as setTzOffsetCmd in pebbleCli.ts.)
+  // The quote-free contract must hold on BOTH branches — the /proc branch is the
+  // one that actually crosses the wsl.exe hop, so assert it explicitly too.
   it("contains NO single-quote characters (survives the Windows→wsl.exe→bash hops)", () => {
-    expect(buildHealthCommand(pids)).not.toContain("'");
+    expect(buildHealthCommand(pids, "linux")).not.toContain("'");
+    expect(buildHealthCommand(pids, "darwin")).not.toContain("'");
   });
 
   it("contains NO double-quote characters (survives the Windows→wsl.exe→bash hops)", () => {
-    expect(buildHealthCommand(pids)).not.toContain('"');
+    expect(buildHealthCommand(pids, "linux")).not.toContain('"');
+    expect(buildHealthCommand(pids, "darwin")).not.toContain('"');
   });
 
-  // Structural assertions: a gutted command body must not pass these.
-  it("reads qemu process state from /proc/<qemuPid>/status", () => {
-    expect(buildHealthCommand(pids)).toContain("/proc/1854238/status");
+  // Structural assertions — the pid-state probe is darwin-gated. Linux/WSL keep
+  // the original /proc read byte-for-byte; only macOS uses BSD `ps -o state=`.
+  it("reads process state via /proc on Linux/WSL, unchanged (WSL host = win32 → Linux shell)", () => {
+    const linux = buildHealthCommand(pids, "linux");
+    expect(linux).toContain("grep -m1 ^State /proc/1854238/status");
+    expect(linux).not.toContain("ps -o state=");
+    expect(buildHealthCommand(pids, "win32")).toContain("/proc/1854238/status");
   });
 
-  it("reads pypkjs process state from /proc/<pypkjsPid>/status", () => {
-    expect(buildHealthCommand(pids)).toContain("/proc/1854276/status");
+  it("reads process state via `ps -o state=` on macOS (no /proc)", () => {
+    const mac = buildHealthCommand(pids, "darwin");
+    expect(mac).toContain("ps -o state= -p 1854238");
+    expect(mac).toContain("ps -o state= -p 1854276");
+    expect(mac).not.toContain("/proc/");
   });
 
   it("probes TCP via /dev/tcp/localhost/<pypkjsPort>", () => {
