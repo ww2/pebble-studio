@@ -33,7 +33,17 @@ const CHROMES: Record<PlatformId, Chrome> = {
   diorite: rectChrome({ x: 10, y: 12, width: 144, height: 168 }, 167, 197),
   flint:   rectChrome({ x: 10, y: 12, width: 144, height: 168 }, 167, 197),
   chalk:   rectChrome({ x: 14, y: 14, width: 180, height: 180 }, 208, 208),
-  emery:   rectChrome({ x: 12, y: 12, width: 200, height: 228 }, 227, 257),
+  // emery: the LOGICAL panel is 200×228, but QEMU's VNC server rounds its
+  // framebuffer width UP to a 16px dirty-tile boundary → the real RFB surface is
+  // 208×228 (cols 200–207 are black padding). noVNC's scaleViewport uses ONE
+  // aspect-preserving scale; if the container aspect (200:228) ≠ the fb aspect
+  // (208:228) that single scale is wrong on the non-limiting axis, so touches
+  // drifted DOWN (Y over-scaled by 208/200). Sizing the screen container to the
+  // TRUE fb width (208) makes the aspect match → noVNC maps clicks 1:1 to fb
+  // pixels on both axes. x is unchanged so the watch content stays put; the extra
+  // 8px is the (black) padding strip. Pairs with the qemu pebble_touch X-align
+  // fix (qemu-pebble-touch-xalign.patch) which corrects the qemu side.
+  emery:   rectChrome({ x: 12, y: 12, width: 208, height: 228 }, 227, 257),
   gabbro:  rectChrome({ x: 14, y: 14, width: 260, height: 260 }, 288, 288),
 };
 

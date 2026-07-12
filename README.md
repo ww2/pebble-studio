@@ -14,7 +14,7 @@ A modern desktop GUI for the [`qemu-pebble`](https://github.com/pebble/qemu) emu
 
 ## Supported platforms
 
-The app is built and packaged for **Windows** as a self-contained bundle (it ships its own emulator, Python runtime, and SDK as release assets, so no separate install is needed). The codebase is cross-platform Electron/TypeScript; other platforms can be built from source but are not currently packaged.
+The app is built and packaged for **Windows** as a self-contained bundle (it ships its own emulator, Python runtime, and SDK as release assets, so no separate install is needed). A single download runs on both **Intel/AMD (x64)** and **Windows-on-ARM (ARM64)** PCs — on an ARM machine it automatically uses a native-ARM build of the emulator engine, so no separate ARM download is required. The codebase is cross-platform Electron/TypeScript; other platforms can be built from source but are not currently packaged.
 
 ## Install
 
