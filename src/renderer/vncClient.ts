@@ -5,10 +5,45 @@
 // import the bare package name (the subpath form is rejected by exports).
 import RFB from "@novnc/novnc";
 import type { VncEndpoint } from "../main/backend/BackendDriver.js"; // type-only (erased by Vite)
+import { fbCoordFromClick } from "./pointerMapping.js";
 
 export interface VncHandle {
   disconnect(): void;
   setTouchEnabled(on: boolean): void;
+}
+
+// The private noVNC internals we reach into. `absX/absY` are used ONLY by the
+// pointer-event senders (rfb.js `_sendMouse`), so replacing them changes touch
+// mapping and nothing else (not rendering, not clipping).
+interface RfbInternals {
+  _display?: {
+    absX(x: number): number;
+    absY(y: number): number;
+    _viewportLoc?: { w: number; h: number };
+  };
+  _canvas?: HTMLCanvasElement;
+}
+
+/**
+ * Replace noVNC's single-scale pointer mapping with per-axis scaling on this
+ * RFB's display. Idempotent; safe to call again after a reconnect (which builds
+ * a fresh Display). Reads the framebuffer size and the canvas's rendered size at
+ * click time, so it tracks live resizes/zoom.
+ */
+function installPerAxisPointerMapping(rfb: RfbInternals): void {
+  const display = rfb._display;
+  const canvas = rfb._canvas;
+  if (!display || !canvas) return;
+  display.absX = (x: number) => {
+    const w = canvas.getBoundingClientRect().width;
+    const fbW = display._viewportLoc?.w ?? w;
+    return fbCoordFromClick(x, w, fbW);
+  };
+  display.absY = (y: number) => {
+    const h = canvas.getBoundingClientRect().height;
+    const fbH = display._viewportLoc?.h ?? h;
+    return fbCoordFromClick(y, h, fbH);
+  };
 }
 
 export function connectVnc(
@@ -30,7 +65,13 @@ export function connectVnc(
   // qemu's VNC refresh, which this path can't tune.)
   rfb.qualityLevel = 9;
   rfb.compressionLevel = 0;
-  rfb.addEventListener("connect", () => console.log("[vnc] connected", url));
+  rfb.addEventListener("connect", () => {
+    console.log("[vnc] connected", url);
+    // Touch boards (emery/gabbro) have a tile-padded framebuffer width, so
+    // noVNC's single-scale pointer mapping drifts taps vertically. Swap in
+    // per-axis mapping — display-independent, so the watch stays centered.
+    if (touchEnabled) installPerAxisPointerMapping(rfb as unknown as RfbInternals);
+  });
   rfb.addEventListener("disconnect", (e: Event) => {
     const clean = (e as CustomEvent<{ clean?: boolean }>).detail?.clean;
     console.log("[vnc] disconnected", clean);
@@ -39,6 +80,7 @@ export function connectVnc(
     disconnect: () => rfb.disconnect(),
     setTouchEnabled: (on: boolean) => {
       rfb.viewOnly = !on;
+      if (on) installPerAxisPointerMapping(rfb as unknown as RfbInternals);
     },
   };
 }
