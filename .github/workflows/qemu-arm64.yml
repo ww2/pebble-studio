@@ -208,15 +208,18 @@ jobs:
           OUT="$PWD/qemu-pebble-win-arm64"
           export PATH="$OUT:$PATH"                          # DLL closure on PATH
           rm -f serial-emery.log
-          # emery = pebble-snowy-emery-bb; omit -cpu so the machine defines its own CPU
-          # (its M33/M-profile core differs from basalt's cortex-m4; a mismatched -cpu
-          # would error). qemu -kernel auto-detects the ELF micro_flash.
+          # emery on a modern SDK (4.9.169 > 4.9.148) is a "new board": pebble-tool
+          # (sdk/emulator.py) launches it as machine `pebble-emery` / -cpu cortex-m33,
+          # flash exposed via `-drive if=mtd` (NOT if=none,id=spi-flash — that binds the
+          # 32MB SPI to a 16MB cfi.pflash and aborts), plus a null audio backend. Mirror
+          # that contract exactly. -kernel loads the ELF micro_flash.
           "$OUT/qemu-pebble.exe" \
             -rtc base=localtime \
             -serial null -serial null -serial file:serial-emery.log \
             -kernel "$PWD/fw-emery/qemu_micro_flash.bin" \
-            -machine pebble-snowy-emery-bb \
-            -drive if=none,id=spi-flash,file="$PWD/fw-emery/qemu_spi_flash.bin",format=raw \
+            -machine pebble-emery -cpu cortex-m33 \
+            -drive if=mtd,format=raw,file="$PWD/fw-emery/qemu_spi_flash.bin" \
+            -audio driver=none,id=audio0 \
             -L "$OUT/pc-bios" \
             -vnc :2 &
           QPID=$!
