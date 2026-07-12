@@ -1,4 +1,3 @@
-qemu-pebble-faketime.patch
 qemu-file-migration-obinary.patch
 qemu-pebble-tim-vmstate.patch
 qemu-pebble-peripheral-vmstate.patch
