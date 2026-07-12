@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { getChrome, hitTestButton } from "../../src/renderer/chrome/chromeRegistry.js";
+import { getChrome, hitTestButton, roundClipPath } from "../../src/renderer/chrome/chromeRegistry.js";
 
 describe("chromeRegistry", () => {
   it("provides screen offset + button regions for basalt", () => {
@@ -20,7 +20,19 @@ describe("chromeRegistry", () => {
     expect(hitTestButton("basalt", -100, -100)).toBeNull();
   });
 
-  it("uses the correct 260x260 screen for gabbro", () => {
-    expect(getChrome("gabbro").screen).toEqual({ x: 14, y: 14, width: 260, height: 260 });
+  it("sizes gabbro's screen to the padded framebuffer width (272x260) for 1:1 touch mapping", () => {
+    // QEMU pads the 260px round panel width up to ROUND_UP(260,16)=272; matching
+    // the container to the true fb makes noVNC scale 1:1 on both axes (fixes the
+    // downward touch drift). Height (260) is not tile-padded. x stays 14 so the
+    // 260px content circle remains centered in the 288 body.
+    expect(getChrome("gabbro").screen).toEqual({ x: 14, y: 14, width: 272, height: 260 });
+  });
+
+  it("roundClipPath masks a true circle of radius height/2 aligned to the content", () => {
+    // gabbro: content circle diameter = height 260 → r=130, centered at (130,130)
+    // in the padded 272-wide host (NOT a border-radius:50% ellipse over 272×260).
+    expect(roundClipPath({ x: 14, y: 14, width: 272, height: 260 })).toBe("circle(130px at 130px 130px)");
+    // square round board (chalk-like) → a plain centered circle.
+    expect(roundClipPath({ x: 0, y: 0, width: 180, height: 180 })).toBe("circle(90px at 90px 90px)");
   });
 });

@@ -1,5 +1,5 @@
 import type { PlatformId, ButtonId } from "../../shared/types.js";
-import { getChrome } from "../chrome/chromeRegistry.js";
+import { getChrome, roundClipPath } from "../chrome/chromeRegistry.js";
 import { getPlatform } from "../../main/backend/emulatorRegistry.js"; // pure module, bundled by Vite
 import { connectVnc, type VncHandle } from "../vncClient.js";
 import { loadBindings, resolveAction, type Bindings } from "../keybindings.js";
@@ -1645,12 +1645,21 @@ export class EmulatorView {
     // Position the screen host within the stage. For round devices the screen is
     // centered in the (square) stage; for square devices the registry offset is used.
     if (info.round) {
+      // Round hosts are centered in the (square) stage via a 50% translate. When
+      // the framebuffer width is padded (w > h, e.g. gabbro 272×260) the round
+      // content circle lives in the host's LEFT h columns, so centering the full
+      // host width would shift the circle right of center — nudge left by the
+      // half-padding (w-h)/2 so the circle stays centered (0 for square boards).
+      const padNudge = (chrome.screen.width - chrome.screen.height) / 2;
       Object.assign(this.screenHost.style, {
         left: "50%",
         top: "50%",
-        transform: "translate(-50%, -50%)",
+        transform: `translate(calc(-50% - ${padNudge}px), -50%)`,
         width: `${chrome.screen.width}px`,
         height: `${chrome.screen.height}px`,
+        // Mask to a true circle (radius = h/2) aligned to the content, not a
+        // border-radius:50% ellipse over the padded host.
+        clipPath: roundClipPath(chrome.screen),
       });
     } else {
       Object.assign(this.screenHost.style, {
@@ -1659,6 +1668,7 @@ export class EmulatorView {
         transform: "none",
         width: `${chrome.screen.width}px`,
         height: `${chrome.screen.height}px`,
+        clipPath: "none",
       });
     }
     this.screenHost.classList.toggle("emu-screen--round", info.round);
