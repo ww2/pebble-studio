@@ -43,38 +43,21 @@ const CHROMES: Record<PlatformId, Chrome> = {
   // pixels on both axes. x is unchanged so the watch content stays put; the extra
   // 8px is the (black) padding strip. Pairs with the qemu pebble_touch X-align
   // fix (qemu-pebble-touch-xalign.patch) which corrects the qemu side.
-  emery:   rectChrome({ x: 12, y: 12, width: 208, height: 228 }, 227, 257),
-  // gabbro: same QEMU width-padding story as emery, but this board is ROUND. The
-  // logical panel is 260×260; QEMU's VNC surface rounds the width up to 272
-  // (ROUND_UP(260,16)) — the round watch content stays in the left 260 columns,
-  // cols 260–271 are black padding. Sizing the screen container to 272 (× 260)
-  // makes the container aspect match the true framebuffer so noVNC maps clicks
-  // 1:1 on both axes (previously the square 260×260 container over-scaled Y by
-  // 272/260, drifting taps down). x is unchanged so the 260px circle stays
-  // centered in the 288 body; the extra 12px padding is masked off by the round
-  // clip (see roundClipPath / EmulatorView) — border-radius:50% alone would turn
-  // the non-square container into an ellipse. Pairs with the generic qemu
-  // pebble_touch X-align fix (qemu-pebble-touch-xalign.patch), which already
-  // de-normalizes by ROUND_UP(display_w,16) for every board.
-  gabbro:  rectChrome({ x: 14, y: 14, width: 272, height: 260 }, 288, 288),
+  // NOTE (touch alignment): emery & gabbro are the only touch boards. QEMU pads
+  // the VNC framebuffer WIDTH up to a 16px tile boundary (emery 200→208, gabbro
+  // 260→272), so a click maps 1:1 only if the screen container matches that
+  // padded width. We tried sizing the container to the padded fb — but that
+  // exposes the black padding strip as visible screen area and de-centers the
+  // watchface (regressed v3.0.13 emery / v3.0.14 gabbro). So the container stays
+  // at the LOGICAL panel size (display centered, as before); the horizontal
+  // touch error is corrected qemu-side (qemu-pebble-touch-xalign.patch). The
+  // residual vertical touch drift must be fixed with a display-independent
+  // pointer mapping, NOT by resizing the screen here.
+  emery:   rectChrome({ x: 12, y: 12, width: 200, height: 228 }, 227, 257),
+  gabbro:  rectChrome({ x: 14, y: 14, width: 260, height: 260 }, 288, 288),
 };
 
 export function getChrome(id: PlatformId): Chrome { return CHROMES[id]; }
-
-/**
- * clip-path for a ROUND screen host. The round watch content is a circle of
- * diameter = the (unpadded) screen HEIGHT, top-left aligned inside the host
- * (QEMU pads the framebuffer WIDTH to the right, never the height). So the mask
- * is a circle of radius height/2 centered at (height/2, height/2) — NOT a
- * border-radius:50% ellipse, which would stretch across a padded (w≠h) host and
- * shift off-center. For a square round board (w===h, e.g. chalk) this reduces to
- * a centered circle, identical to border-radius:50%. Being px-based, it scales
- * uniformly with the zoom transform (the transform is applied after the clip).
- */
-export function roundClipPath(screen: Rect): string {
-  const r = screen.height / 2;
-  return `circle(${r}px at ${r}px ${r}px)`;
-}
 
 export function hitTestButton(id: PlatformId, x: number, y: number): ButtonId | null {
   for (const b of CHROMES[id].buttons) {

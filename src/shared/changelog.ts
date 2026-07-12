@@ -14,8 +14,8 @@ export const CHANGELOG: ChangelogEntry[] = [
   // The 2.x line is the native-Windows track (no WSL); the 1.x line is the
   // WSL-connected track. 2.0.1 is the first native release. 3.0.0 is the first
   // public open-source release. (3.0.6 was never released.)
-  { version: "3.0.14-test1", date: "2026-07-12", changes: [
-    "Fixed touch alignment on Pebble Round 2, the same way it was fixed on Pebble Time 2: taps now register where you tap instead of drifting downward. (Both are the only watch models with a touchscreen. Pebble Round 2 is round, so its screen is masked back to a true circle after the fix.)",
+  { version: "3.0.14-test2", date: "2026-07-12", changes: [
+    "Fixed watchfaces looking off-center on Pebble Time 2. The v3.0.13 touch-alignment change had widened the watch's on-screen area to include a hidden padding strip, which pushed the watchface off to one side of the bezel; the screen is back to its correct size, so watchfaces are centered again. The horizontal touch-alignment fix from v3.0.13 — which lives in the emulator itself — is unaffected and still applies.",
   ] },
   { version: "3.0.13", date: "2026-07-12", changes: [
     "Fixed touch alignment on Pebble Time 2. Taps now register where you tap — previously touches landed low and slightly left of where you clicked (for example, tapping the top row of an on-screen keypad registered as the row below), because the emulator's screen and its touch panel disagreed about the screen's exact pixel width.",
