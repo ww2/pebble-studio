@@ -40,3 +40,66 @@ jobs:
           clang -o /tmp/hello.exe /tmp/hello.c
           file /tmp/hello.exe
           file /tmp/hello.exe | grep -qiE 'aarch64|arm64' && echo "GATE-2 PASS: native ARM64 toolchain" || { echo "GATE-2 FAIL: not Aarch64"; exit 1; }
+
+      - name: Clone qemu-pebble source
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          BUILD="$(cygpath "$RUNNER_TEMP")/qemu-build"
+          mkdir -p "$BUILD" && cd "$BUILD"
+          git clone --depth 1 --branch pebble-10.1 https://github.com/coredevices/qemu
+          echo "QEMU_SRC=$BUILD/qemu" >> "$GITHUB_ENV"
+
+      - name: Apply patches
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd "$QEMU_SRC"
+          REPO="$(cygpath "$GITHUB_WORKSPACE")"
+          while read -r p; do
+            [ -z "$p" ] && continue
+            echo "== applying $p =="
+            patch -p1 < "$REPO/build/qemu-patches/$p"
+          done < "$REPO/build/qemu-patches/apply-order.txt"
+          # Neutralize the meson install-tree symlink step (needs Developer Mode;
+          # the qemu-bundle/ tree is only used by `meson install`, which we never run).
+          printf 'import sys\nsys.exit(0)\n' > scripts/symlink-install-tree.py
+
+      - name: Configure + build
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd "$QEMU_SRC"
+          ./configure \
+            --target-list=arm-softmmu \
+            --disable-werror \
+            --disable-docs \
+            --disable-gtk \
+            --disable-sdl \
+            --enable-vnc
+          ninja -C build qemu-system-arm.exe
+          file build/qemu-system-arm.exe
+          # NOTE: MSYS2 `file` reports this arch as "ARM64" (not "Aarch64") — match both.
+          file build/qemu-system-arm.exe | grep -qiE 'aarch64|arm64' \
+            && echo "GATE-3 PASS: native ARM64 qemu built" \
+            || { echo "GATE-3 FAIL: qemu not ARM64"; exit 1; }
+
+      - name: Bundle exe + DLL closure + pc-bios
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd "$QEMU_SRC"
+          OUT="$(cygpath "$GITHUB_WORKSPACE")/qemu-pebble-win-arm64"
+          mkdir -p "$OUT"
+          cp build/qemu-system-arm.exe "$OUT/qemu-pebble.exe"
+          # copy every clangarm64 DLL the exe links against
+          ldd "$OUT/qemu-pebble.exe" | grep -i clangarm64 | awk '{print $3}' \
+            | while read -r dll; do cp -u "$dll" "$OUT/"; done
+          cp -r pc-bios "$OUT/pc-bios"
+          ls -la "$OUT"
+
+      - name: Upload qemu arm64 bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-pebble-win-arm64
+          path: qemu-pebble-win-arm64/
