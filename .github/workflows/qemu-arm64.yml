@@ -80,6 +80,7 @@ jobs:
             --disable-docs \
             --disable-gtk \
             --disable-sdl \
+            --disable-guest-agent \
             --enable-vnc
           ninja -C build qemu-system-arm.exe
           file build/qemu-system-arm.exe
