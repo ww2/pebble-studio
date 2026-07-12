@@ -1,0 +1,42 @@
+name: qemu-pebble arm64 (Phase 0 gate)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/qemu-arm64.yml'
+      - 'build/qemu-patches/**'
+
+jobs:
+  build-and-gate:
+    runs-on: windows-11-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (CLANGARM64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          update: true
+          install: >-
+            git patch diffutils bzip2
+            mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-lld
+            mingw-w64-clang-aarch64-meson
+            mingw-w64-clang-aarch64-ninja
+            mingw-w64-clang-aarch64-pkgconf
+            mingw-w64-clang-aarch64-glib2
+            mingw-w64-clang-aarch64-pixman
+            mingw-w64-clang-aarch64-gettext
+            mingw-w64-clang-aarch64-zlib
+
+      - name: Probe toolchain is native ARM64
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          clang --version
+          printf 'int main(void){return 0;}\n' > /tmp/hello.c
+          clang -o /tmp/hello.exe /tmp/hello.c
+          file /tmp/hello.exe
+          file /tmp/hello.exe | grep -qi 'Aarch64' && echo "GATE-2 PASS: native ARM64 toolchain" || { echo "GATE-2 FAIL: not Aarch64"; exit 1; }
