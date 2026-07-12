@@ -14,6 +14,9 @@ export const CHANGELOG: ChangelogEntry[] = [
   // The 2.x line is the native-Windows track (no WSL); the 1.x line is the
   // WSL-connected track. 2.0.1 is the first native release. 3.0.0 is the first
   // public open-source release. (3.0.6 was never released.)
+  { version: "3.0.12", date: "2026-07-12", changes: [
+    "Pebble Studio now runs on Windows-on-ARM (Snapdragon-class) PCs. The same download works on both regular (Intel/AMD) and ARM machines: on an ARM PC it automatically uses a native-ARM emulator engine, so the watch emulator boots instead of failing with \"failed to load.\" Nothing changes on Intel/AMD PCs.",
+  ] },
   { version: "3.0.11", date: "2026-07-11", changes: [
     "\"Make full-featured\" now gives the modern watches (Pebble Time 2 / Pebble 2 Duo / the new Pebble) the full launcher AND runs apps built with newer SDKs. Previously the bundled launcher firmware was one app-version behind the current SDK, so those apps were rejected with \"requires a newer version of the Pebble firmware\"; the launcher firmware for those models has been rebuilt to accept them.",
     "Whether the launcher can be added is now decided by real app compatibility (the SDK version your apps actually require vs the launcher firmware) instead of the SDK's release number, so the warning only appears when apps would genuinely be rejected.",
