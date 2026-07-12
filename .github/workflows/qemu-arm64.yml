@@ -171,6 +171,68 @@ jobs:
             echo "GATE-0 FAIL: no boot markers — native ARM64 qemu did not run the Pebble machine"; exit 1
           fi
 
+      - name: Fetch emery firmware fixtures
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # resolve the .zip asset URL from the v3.0.5 release (contains vendor/pebble-sdk)
+          $asset = gh release view v3.0.5 --json assets --jq '.assets[] | select(.name | endswith(".zip")) | .url' | Select-Object -First 1
+          if (-not $asset) { throw "no zip asset on v3.0.5" }
+          # reuse the already-downloaded release.zip if the basalt step left it; else fetch
+          if (-not (Test-Path "$PWD\release.zip")) {
+            curl.exe -L -H "Authorization: Bearer $env:GH_TOKEN" -H "Accept: application/octet-stream" -o release.zip "$asset"
+          }
+          # extract only the two emery flash files (emery = M33 board; second CPU family)
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("$PWD\release.zip")
+          $mk = "fw-emery"; New-Item -ItemType Directory -Force -Path $mk | Out-Null
+          foreach ($e in $zip.Entries) {
+            if ($e.FullName -match 'emery/qemu/qemu_micro_flash\.bin$') { [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, "$PWD\$mk\qemu_micro_flash.bin", $true) }
+            if ($e.FullName -match 'emery/qemu/qemu_spi_flash\.bin\.bz2$') { [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, "$PWD\$mk\qemu_spi_flash.bin.bz2", $true) }
+            if ($e.FullName -match 'emery/qemu/qemu_spi_flash\.bin$') { [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, "$PWD\$mk\qemu_spi_flash.bin", $true) }
+          }
+          $zip.Dispose()
+          if (-not (Test-Path "$mk\qemu_micro_flash.bin")) { throw "emery micro flash not found in release zip" }
+          if (-not (Test-Path "$mk\qemu_spi_flash.bin.bz2") -and -not (Test-Path "$mk\qemu_spi_flash.bin")) { throw "emery spi flash not found in release zip" }
+
+      - name: Smoke test — boot emery headless (M33 coverage)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd "$(cygpath "$GITHUB_WORKSPACE")"
+          if [ -f fw-emery/qemu_spi_flash.bin.bz2 ]; then
+            bunzip2 -kf fw-emery/qemu_spi_flash.bin.bz2    # -> fw-emery/qemu_spi_flash.bin
+          fi
+          OUT="$PWD/qemu-pebble-win-arm64"
+          export PATH="$OUT:$PATH"                          # DLL closure on PATH
+          rm -f serial-emery.log
+          # emery = pebble-snowy-emery-bb; omit -cpu so the machine defines its own CPU
+          # (its M33/M-profile core differs from basalt's cortex-m4; a mismatched -cpu
+          # would error). qemu -kernel auto-detects the ELF micro_flash.
+          "$OUT/qemu-pebble.exe" \
+            -rtc base=localtime \
+            -serial null -serial null -serial file:serial-emery.log \
+            -kernel "$PWD/fw-emery/qemu_micro_flash.bin" \
+            -machine pebble-snowy-emery-bb \
+            -drive if=none,id=spi-flash,file="$PWD/fw-emery/qemu_spi_flash.bin",format=raw \
+            -L "$OUT/pc-bios" \
+            -vnc :2 &
+          QPID=$!
+          sleep 60
+          kill "$QPID" 2>/dev/null || taskkill //F //PID "$QPID" 2>/dev/null || true
+          echo "===== serial-emery.log ====="
+          cat serial-emery.log || true
+          echo "============================"
+          if grep -q "Ready for communication" serial-emery.log; then
+            echo "GATE-EMERY PASS: emery (M33) booted to Ready for communication on ARM64"
+          elif grep -q "Booting firmware" serial-emery.log; then
+            echo "GATE-EMERY PARTIAL: firmware started booting (investigate why it did not complete)"; exit 1
+          else
+            echo "GATE-EMERY FAIL: no boot markers — native ARM64 qemu did not run the emery machine"; exit 1
+          fi
+
       - name: Upload gate evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -178,3 +240,4 @@ jobs:
           name: phase0-gate-evidence
           path: |
             serial.log
+            serial-emery.log
