@@ -1,0 +1,24 @@
+diff --git a/hw/misc/pebble_touch.c b/hw/misc/pebble_touch.c
+--- a/hw/misc/pebble_touch.c
++++ b/hw/misc/pebble_touch.c
+@@ -79,7 +79,19 @@ static void pbl_touch_input_event(DeviceState *dev, QemuConsole *src,
+     } else if (evt->type == INPUT_EVENT_KIND_ABS) {
+         InputMoveEvent *move = evt->u.abs.data;
+         if (move->axis == INPUT_AXIS_X) {
+-            s->x = move->value * s->display_w / INPUT_EVENT_ABS_MAX;
++            /* QEMU's VNC server normalizes the incoming pointer X against its
++             * server-surface width, which it rounds UP to a 16px dirty-tile
++             * boundary (ui/vnc.c vnc_width() -> ROUND_UP(w,
++             * VNC_DIRTY_PIXELS_PER_BIT)). For a 200px panel the server width is
++             * 208, so de-normalizing by the logical display_w (200) undershot X
++             * by 200/208 -- touches drifted left, worsening toward the right
++             * edge. De-normalize by the SAME aligned width to recover the true
++             * framebuffer column (the display blits the panel 1:1, left-aligned
++             * inside the padded surface), then clamp into the panel. Height is
++             * NOT tile-aligned by VNC, so Y needs no such correction. */
++            uint32_t norm_w = ROUND_UP(s->display_w, 16);
++            uint32_t px = (uint32_t)move->value * norm_w / INPUT_EVENT_ABS_MAX;
++            s->x = px < s->display_w ? px : s->display_w - 1;
+         } else if (move->axis == INPUT_AXIS_Y) {
+             s->y = move->value * s->display_h / INPUT_EVENT_ABS_MAX;
+         }

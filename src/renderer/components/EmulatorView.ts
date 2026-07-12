@@ -6,7 +6,13 @@ import { loadBindings, resolveAction, type Bindings } from "../keybindings.js";
 import type { TimeConfig } from "../../main/backend/timeController.js";
 import { SessionLog } from "../sessionLog.js";
 import { applySunlightLut } from "../sunlightLut.js";
-import { shouldRunLiveSunlight, LIVE_SUNLIGHT_KEY, LIVE_SUNLIGHT_EVENT } from "../liveSunlight.js";
+import {
+  shouldRunLiveSunlight,
+  LIVE_SUNLIGHT_KEY,
+  LIVE_SUNLIGHT_EVENT,
+  hideCanvasForSunlightOverlay,
+  restoreCanvasFromSunlightOverlay,
+} from "../liveSunlight.js";
 
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 /** Format hours/minutes as 12h "h:mm AM/PM" (default) or 24h "HH:MM". */
@@ -1272,7 +1278,7 @@ export class EmulatorView {
     const overlay = this.screenHost.querySelector<HTMLCanvasElement>("#emu-sunlight");
     if (overlay) overlay.remove();
     const vncCanvas = this.findVncCanvas();
-    if (vncCanvas) vncCanvas.style.visibility = "";
+    if (vncCanvas) restoreCanvasFromSunlightOverlay(vncCanvas);
   }
 
   /** The noVNC-rendered canvas (the overlay canvas is excluded by id). */
@@ -1308,7 +1314,10 @@ export class EmulatorView {
           const img = sctx.getImageData(0, 0, w, h);
           applySunlightLut(img.data as unknown as Uint8Array);
           octx.putImageData(img, 0, 0);
-          src.style.visibility = "hidden"; // show the corrected overlay instead
+          // Show the corrected overlay instead of the raw frame, but keep the
+          // source canvas hit-testable so noVNC still receives touch/click input
+          // (the overlay is pointer-events:none and events fall through to it).
+          hideCanvasForSunlightOverlay(src);
         } catch { /* tainted/transient — skip this frame */ }
       }
     }

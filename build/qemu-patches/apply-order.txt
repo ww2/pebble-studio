@@ -4,3 +4,4 @@ qemu-pebble-peripheral-vmstate.patch
 qemu-pebble-m33-vmstate.patch
 qemu-pebble-vnc-cadence.patch
 qemu-pebble-silk-vmstate.patch
+qemu-pebble-touch-xalign.patch
