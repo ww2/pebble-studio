@@ -1,0 +1,145 @@
+diff --git a/hw/display/pebble_sm_lcd.c b/hw/display/pebble_sm_lcd.c
+index 215cb8981c..edd693c666 100644
+--- a/hw/display/pebble_sm_lcd.c
++++ b/hw/display/pebble_sm_lcd.c
+@@ -32,6 +32,7 @@
+ #include "hw/ssi/ssi.h"
+ #include "hw/irq.h"
+ #include "hw/qdev-properties.h"
++#include "migration/vmstate.h"
+ #include "qapi/error.h"
+ 
+ #define NUM_ROWS 168
+@@ -51,7 +52,10 @@ typedef struct {
+     bool redraw;
+     uint8_t framebuffer[NUM_ROWS * NUM_COL_BYTES];
+     int fbindex;
+-    SmLcdXferState state;
++    /* Holds an SmLcdXferState value but declared uint32_t so it can be
++     * migrated with the type-checked VMSTATE_UINT32 macro (mirrors the
++     * enum->uint32_t treatment in pebble_snowy_display.c). */
++    uint32_t state;
+ 
+     bool   backlight_enabled;
+     float  brightness;
+@@ -288,6 +292,35 @@ static void sm_lcd_power_ctl(void *opaque, int n, int level)
+     s->power_on = !!level;
+ }
+ 
++static int sm_lcd_post_load(void *opaque, int version_id)
++{
++    SmLcdState *s = opaque;
++
++    /* The QemuConsole surface has no vmstate, so the restored framebuffer must
++     * be repainted immediately: sm_lcd_update_display() only draws when redraw
++     * is set and reads s->framebuffer directly. Without this the memory LCD
++     * stays blank until the guest next pushes a changed line (up to a minute). */
++    s->redraw = true;
++    return 0;
++}
++
++static const VMStateDescription vmstate_sm_lcd = {
++    .name = "sm-lcd",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = sm_lcd_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_BUFFER(framebuffer, SmLcdState),
++        VMSTATE_INT32(fbindex, SmLcdState),
++        VMSTATE_UINT32(state, SmLcdState),
++        VMSTATE_BOOL(backlight_enabled, SmLcdState),
++        VMSTATE_BOOL(vibrate_on, SmLcdState),
++        VMSTATE_INT32(vibrate_offset, SmLcdState),
++        VMSTATE_BOOL(power_on, SmLcdState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void sm_lcd_reset(DeviceState *dev)
+ {
+     SmLcdState *s = SM_LCD(dev);
+@@ -329,6 +362,7 @@ static void sm_lcd_class_init(ObjectClass *klass, const void *data)
+     SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
+ 
+     device_class_set_props(dc, sm_lcd_properties);
++    dc->vmsd = &vmstate_sm_lcd;
+     k->realize = sm_lcd_realize;
+     k->transfer = sm_lcd_transfer;
+     k->cs_polarity = SSI_CS_LOW;
+diff --git a/hw/misc/stm32_pebble_syscfg.c b/hw/misc/stm32_pebble_syscfg.c
+index b2c6246692..eacf82982d 100644
+--- a/hw/misc/stm32_pebble_syscfg.c
++++ b/hw/misc/stm32_pebble_syscfg.c
+@@ -22,6 +22,7 @@
+ #include "qemu/osdep.h"
+ #include "hw/sysbus.h"
+ #include "hw/arm/stm32_common.h"
++#include "migration/vmstate.h"
+ #include "qapi/error.h"
+ #include "qemu/log.h"
+ 
+@@ -244,6 +245,56 @@ static void stm32_syscfg_reset(DeviceState *dev)
+ 
+ 
+ 
++/* MIGRATION */
++
++/* Re-establish the GPIO->EXTI line routing after a restore.
++ *
++ * The routing (which GPIO port drives each EXTI line) is programmed by the
++ * firmware through the EXTICR registers at boot. Its effect lives as runtime
++ * qemu_irq pointers stored *inside* the GPIO devices (s->exti[pin], installed
++ * via stm32_exti_set_gpio -> f2xx_gpio_exti_set) and is NOT part of any
++ * device's migration stream. After a plain restore every EXTI line is still
++ * wired to the reset default (port A, from stm32_syscfg_reset), so a button
++ * GPIO on another port (e.g. silk/diorite's PC13/PD2/PH0/PH1) toggles its IDR
++ * but never reaches the EXTI controller -> the button interrupt never fires
++ * and the watch ignores all input. Replay the routing from the restored
++ * EXTICR values so EXTI-driven buttons work again. Mirrors the write path in
++ * stm32_syscfg_SYSCFG_EXTICR_write() against the port-A reset default. */
++static int stm32_syscfg_post_load(void *opaque, int version_id)
++{
++    Stm32Syscfg *s = opaque;
++    unsigned index, i, exti_line, gpio_index;
++
++    if (!s->stm32_exti) {
++        return 0;
++    }
++    for (index = 0; index < SYSCFG_EXTICR_COUNT; index++) {
++        for (i = 0; i < SYSCFG_EXTI_PER_CR; i++) {
++            exti_line = (index * SYSCFG_EXTI_PER_CR) + i;
++            gpio_index = (s->SYSCFG_EXTICR[index] >> (i * 4)) & 0xf;
++            if (gpio_index != 0) {
++                /* Reset the reset-default port-A binding, then bind the port
++                 * the firmware actually selected. */
++                stm32_exti_reset_gpio(s->stm32_exti, exti_line, 0);
++                stm32_exti_set_gpio(s->stm32_exti, exti_line, gpio_index);
++            }
++        }
++    }
++    return 0;
++}
++
++static const VMStateDescription vmstate_stm32_syscfg = {
++    .name = "stm32f2xx_syscfg",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = stm32_syscfg_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(SYSCFG_MEMRMP, Stm32Syscfg),
++        VMSTATE_UINT32_ARRAY(SYSCFG_EXTICR, Stm32Syscfg, SYSCFG_EXTICR_COUNT),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ /* DEVICE INITIALIZATION */
+ 
+ static void stm32_syscfg_realize(DeviceState *dev, Error **errp)
+@@ -274,6 +325,7 @@ static void stm32_syscfg_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
++    dc->vmsd = &vmstate_stm32_syscfg;
+     dc->realize = stm32_syscfg_realize;
+     device_class_set_legacy_reset(dc, stm32_syscfg_reset);
+     device_class_set_props(dc, stm32_syscfg_properties);

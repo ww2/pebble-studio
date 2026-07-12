@@ -1,0 +1,612 @@
+diff --git a/hw/char/stm32_pebble_uart.c b/hw/char/stm32_pebble_uart.c
+index 134a048abe..fe8a0fa24d 100644
+--- a/hw/char/stm32_pebble_uart.c
++++ b/hw/char/stm32_pebble_uart.c
+@@ -21,6 +21,7 @@
+ #include "hw/qdev-properties.h"
+ #include "hw/qdev-properties-system.h"
+ #include "hw/arm/stm32_common.h"
++#include "migration/vmstate.h"
+ #include "chardev/char-fe.h"
+ #include "qemu/log.h"
+ #include "qapi/error.h"
+@@ -411,10 +412,52 @@ static const Property stm32_uart_properties[] = {
+     DEFINE_PROP_CHR("chardev", Stm32Uart, chr),
+ };
+ 
++static int stm32_uart_post_load(void *opaque, int version_id)
++{
++    Stm32Uart *s = opaque;
++
++    /* Force the IRQ line to be re-driven to match the restored register
++     * state (curr_irq_level was migrated, but the qemu_irq consumer was
++     * reset; -1 guarantees update_irq sees a level change). */
++    s->curr_irq_level = -1;
++    stm32_uart_update_irq(s);
++    return 0;
++}
++
++static const VMStateDescription vmstate_stm32_uart = {
++    .name = "stm32_uart",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = stm32_uart_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(USART_RDR, Stm32Uart),
++        VMSTATE_UINT32(USART_TDR, Stm32Uart),
++        VMSTATE_UINT32(USART_BRR, Stm32Uart),
++        VMSTATE_UINT32(USART_CR1, Stm32Uart),
++        VMSTATE_UINT32(USART_CR2, Stm32Uart),
++        VMSTATE_UINT32(USART_CR3, Stm32Uart),
++        VMSTATE_UINT32(USART_SR_TXE, Stm32Uart),
++        VMSTATE_UINT32(USART_SR_TC, Stm32Uart),
++        VMSTATE_UINT32(USART_SR_RXNE, Stm32Uart),
++        VMSTATE_UINT32(USART_SR_ORE, Stm32Uart),
++        VMSTATE_UINT32(USART_CR1_UE, Stm32Uart),
++        VMSTATE_UINT32(USART_CR1_TXEIE, Stm32Uart),
++        VMSTATE_UINT32(USART_CR1_TCIE, Stm32Uart),
++        VMSTATE_UINT32(USART_CR1_RXNEIE, Stm32Uart),
++        VMSTATE_UINT32(USART_CR1_TE, Stm32Uart),
++        VMSTATE_UINT32(USART_CR1_RE, Stm32Uart),
++        VMSTATE_BOOL(sr_read_since_ore_set, Stm32Uart),
++        VMSTATE_BUFFER(rcv_char_buf, Stm32Uart),
++        VMSTATE_UINT32(rcv_char_bytes, Stm32Uart),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void stm32_uart_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
++    dc->vmsd = &vmstate_stm32_uart;
+     device_class_set_legacy_reset(dc, stm32_uart_reset);
+     dc->realize = stm32_uart_realize;
+     device_class_set_props(dc, stm32_uart_properties);
+diff --git a/hw/display/pebble_snowy_display.c b/hw/display/pebble_snowy_display.c
+index 78a95c149a..0c4570d93b 100644
+--- a/hw/display/pebble_snowy_display.c
++++ b/hw/display/pebble_snowy_display.c
+@@ -59,6 +59,7 @@
+ #include "ui/console.h"
+ #include "ui/pixel_ops.h"
+ #include "hw/ssi/ssi.h"
++#include "migration/vmstate.h"
+ #include "hw/irq.h"
+ #include "hw/qdev-properties.h"
+ #include "qapi/error.h"
+@@ -221,12 +222,15 @@ typedef struct {
+     float         brightness;
+     bool          power_on;
+ 
+-    /* State variables */
+-    PSDisplayState  state;
++    /* State variables.
++     * NOTE: state/scene/cmd_set hold PSDisplayState/PDisplayScene/
++     * PDisplayCmdSet values but are declared uint32_t so they can be
++     * migrated with the type-checked VMSTATE_UINT32 macros. */
++    uint32_t        state;
+     uint8_t         cmd;
+     uint32_t        parameter;
+     uint32_t        parameter_byte_offset;
+-    PDisplayScene   scene;
++    uint32_t        scene;
+ 
+     bool      sclk_value;
+     bool      cs_value;                 // low means asserted
+@@ -240,7 +244,7 @@ typedef struct {
+     uint32_t      prog_byte_offset;
+ 
+     // Which command set we are emulating
+-    PDisplayCmdSet cmd_set;
++    uint32_t cmd_set;
+ 
+ #ifdef __EMSCRIPTEN__
+     QEMUTimer *wasm_refresh_timer;
+@@ -1057,6 +1061,47 @@ static void ps_display_power_ctl(void *opaque, int n, int level)
+ }
+ 
+ 
++// -----------------------------------------------------------------------------
++static int ps_display_post_load(void *opaque, int version_id)
++{
++    PSDisplayGlobals *s = opaque;
++
++    /* Repaint the restored framebuffer immediately: the QemuConsole surface
++     * has no vmstate, so without this the screen stays blank until the guest
++     * next pushes a frame. ps_set_redraw() also refreshes framebuffer_copy,
++     * which is what the renderer actually draws from. */
++    ps_set_redraw(s);
++    return 0;
++}
++
++static const VMStateDescription vmstate_ps_display = {
++    .name = "pebble-snowy-display",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = ps_display_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_VBUFFER_UINT32(framebuffer, PSDisplayGlobals, 0, NULL,
++                               bytes_per_frame),
++        VMSTATE_INT32(col_index, PSDisplayGlobals),
++        VMSTATE_INT32(row_index, PSDisplayGlobals),
++        VMSTATE_BOOL(backlight_enabled, PSDisplayGlobals),
++        VMSTATE_BOOL(power_on, PSDisplayGlobals),
++        VMSTATE_UINT32(state, PSDisplayGlobals),
++        VMSTATE_UINT8(cmd, PSDisplayGlobals),
++        VMSTATE_UINT32(parameter, PSDisplayGlobals),
++        VMSTATE_UINT32(parameter_byte_offset, PSDisplayGlobals),
++        VMSTATE_UINT32(scene, PSDisplayGlobals),
++        VMSTATE_BOOL(sclk_value, PSDisplayGlobals),
++        VMSTATE_BOOL(cs_value, PSDisplayGlobals),
++        VMSTATE_BOOL(vibrate_on, PSDisplayGlobals),
++        VMSTATE_INT32(vibrate_offset, PSDisplayGlobals),
++        VMSTATE_BUFFER(prog_header, PSDisplayGlobals),
++        VMSTATE_UINT32(prog_byte_offset, PSDisplayGlobals),
++        VMSTATE_UINT32(cmd_set, PSDisplayGlobals),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ // -----------------------------------------------------------------------------
+ static void ps_display_reset(DeviceState *dev)
+ {
+@@ -1177,6 +1222,7 @@ static void ps_display_class_init(ObjectClass *klass, const void *data)
+     SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
+ 
+     device_class_set_props(dc, ps_display_init_properties);
++    dc->vmsd = &vmstate_ps_display;
+     k->realize = ps_display_realize;
+     k->transfer = ps_display_transfer;
+     k->cs_polarity = SSI_CS_LOW;
+diff --git a/hw/dma/stm32_pebble_dma.c b/hw/dma/stm32_pebble_dma.c
+index dfbbafbdf7..2de3228c98 100644
+--- a/hw/dma/stm32_pebble_dma.c
++++ b/hw/dma/stm32_pebble_dma.c
+@@ -29,6 +29,7 @@
+ #include "hw/qdev-properties.h"
+ #include "system/address-spaces.h"
+ #include "qemu/log.h"
++#include "migration/vmstate.h"
+ #include "qapi/error.h"
+ 
+ ////#define DEBUG_STM32F2XX_DMA
+@@ -413,10 +414,38 @@ f2xx_dma_reset(DeviceState *ds)
+     }
+ }
+ 
++static const VMStateDescription vmstate_f2xx_dma_stream = {
++    .name = "f2xx_dma_stream",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(cr, f2xx_dma_stream),
++        VMSTATE_UINT16(ndtr, f2xx_dma_stream),
++        VMSTATE_UINT32(par, f2xx_dma_stream),
++        VMSTATE_UINT32(m0ar, f2xx_dma_stream),
++        VMSTATE_UINT32(m1ar, f2xx_dma_stream),
++        VMSTATE_UINT8(isr, f2xx_dma_stream),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static const VMStateDescription vmstate_f2xx_dma = {
++    .name = "f2xx_dma",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(ifcr, f2xx_dma, R_DMA_HIFCR - R_DMA_LIFCR + 1),
++        VMSTATE_STRUCT_ARRAY(stream, f2xx_dma, R_DMA_Sx_COUNT, 1,
++                             vmstate_f2xx_dma_stream, f2xx_dma_stream),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void
+ f2xx_dma_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
++    dc->vmsd = &vmstate_f2xx_dma;
+     dc->realize = f2xx_dma_realize;
+     device_class_set_legacy_reset(dc, f2xx_dma_reset);
+ }
+diff --git a/hw/gpio/stm32_pebble_gpio.c b/hw/gpio/stm32_pebble_gpio.c
+index 30f56df973..a2362f0650 100644
+--- a/hw/gpio/stm32_pebble_gpio.c
++++ b/hw/gpio/stm32_pebble_gpio.c
+@@ -29,6 +29,7 @@
+ #include "hw/qdev-properties.h"
+ #include "hw/arm/stm32_common.h"
+ #include "qapi/error.h"
++#include "migration/vmstate.h"
+ #include "qemu/log.h"
+ 
+ //#define DEBUG_STM32_GPIO
+@@ -263,11 +264,23 @@ static const Property stm32f2xx_gpio_properties[] = {
+     DEFINE_PROP_UINT32("idr-mask", stm32f2xx_gpio, idr_mask, 0),
+ };
+ 
++static const VMStateDescription vmstate_stm32f2xx_gpio = {
++    .name = "stm32f2xx_gpio",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, stm32f2xx_gpio, R_GPIO_MAX),
++        VMSTATE_UINT32(ccr, stm32f2xx_gpio),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void
+ stm32f2xx_gpio_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
++    dc->vmsd = &vmstate_stm32f2xx_gpio;
+     dc->realize = stm32f2xx_gpio_realize;
+     device_class_set_legacy_reset(dc, stm32f2xx_gpio_reset);
+     device_class_set_props(dc, stm32f2xx_gpio_properties);
+diff --git a/hw/misc/stm32_pebble_exti.c b/hw/misc/stm32_pebble_exti.c
+index 7bcd6db69e..ee6c0570f7 100644
+--- a/hw/misc/stm32_pebble_exti.c
++++ b/hw/misc/stm32_pebble_exti.c
+@@ -24,6 +24,7 @@
+ #include "hw/arm/stm32_common.h"
+ #include "qapi/error.h"
+ #include "qemu/log.h"
++#include "migration/vmstate.h"
+ 
+ 
+ 
+@@ -368,10 +369,25 @@ void stm32_exti_set_gpio_array(Stm32Exti *s, stm32f2xx_gpio **gpio)
+     s->stm32_gpio = gpio;
+ }
+ 
++static const VMStateDescription vmstate_stm32_exti = {
++    .name = "stm32_exti",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(EXTI_IMR, Stm32Exti),
++        VMSTATE_UINT32(EXTI_RTSR, Stm32Exti),
++        VMSTATE_UINT32(EXTI_FTSR, Stm32Exti),
++        VMSTATE_UINT32(EXTI_SWIER, Stm32Exti),
++        VMSTATE_UINT32(EXTI_PR, Stm32Exti),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void stm32_exti_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
++    dc->vmsd = &vmstate_stm32_exti;
+     dc->realize = stm32_exti_realize;
+     device_class_set_legacy_reset(dc, stm32_exti_reset);
+ }
+diff --git a/hw/ssi/stm32_pebble_spi.c b/hw/ssi/stm32_pebble_spi.c
+index 1b76500e23..b72638c149 100644
+--- a/hw/ssi/stm32_pebble_spi.c
++++ b/hw/ssi/stm32_pebble_spi.c
+@@ -30,6 +30,7 @@
+ #include "hw/qdev-properties.h"
+ #include "hw/arm/stm32_common.h"
+ #include "hw/ssi/ssi.h"
++#include "migration/vmstate.h"
+ #include "qemu/log.h"
+ #include "qapi/error.h"
+ 
+@@ -219,11 +220,24 @@ static const Property stm32f2xx_spi_properties[] = {
+     DEFINE_PROP_INT32("periph", Stm32Spi, periph, -1),
+ };
+ 
++static const VMStateDescription vmstate_stm32f2xx_spi = {
++    .name = "stm32f2xx_spi",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_INT32(rx, Stm32Spi),
++        VMSTATE_INT32(rx_full, Stm32Spi),
++        VMSTATE_UINT16_ARRAY(regs, Stm32Spi, R_MAX),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void
+ stm32f2xx_spi_class_init(ObjectClass *c, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(c);
+ 
++    dc->vmsd = &vmstate_stm32f2xx_spi;
+     dc->realize = stm32f2xx_spi_realize;
+     device_class_set_legacy_reset(dc, stm32f2xx_spi_reset);
+     device_class_set_props(dc, stm32f2xx_spi_properties);
+diff --git a/hw/timer/stm32_pebble_rtc.c b/hw/timer/stm32_pebble_rtc.c
+index 38f25aa8eb..1bc89052cc 100644
+--- a/hw/timer/stm32_pebble_rtc.c
++++ b/hw/timer/stm32_pebble_rtc.c
+@@ -29,6 +29,7 @@
+ #include "hw/irq.h"
+ #include "hw/qdev-properties.h"
+ #include "qemu/bcd.h"
++#include "migration/vmstate.h"
+ #include "qemu/cutils.h"
+ #include "system/rtc.h"
+ #include "qemu/timer.h"
+@@ -86,6 +87,14 @@
+ #define R_RTC_BKPxR_INC_EXTRA_LAST (R_RTC_BKPxR_LAST + STM32F2XX_RTC_NUM_EXTRA_BKUP_REG)
+ #define R_RTC_MAX    (R_RTC_BKPxR_INC_EXTRA_LAST + 1)
+ 
++// Pebble emulator: reserved RTC offset that reads the REAL (unfrozen) host wall
++// clock in MICROSECONDS, low 32 bits (wraps ~71 min; only sub-second deltas are
++// taken). The guest firmware reads this ONLY in its frozen-clock STOP-elapsed
++// fallback (drivers/stm32f4/rtc.c) so the scheduler can measure true elapsed time
++// (to sub-tick precision) even while the displayed RTC is frozen for custom time.
++// Reserved on real STM32F4 (0x40002A00) and never read there.
++#define R_RTC_PEBBLE_REALUS (0x200 / 4)
++
+ #define R_RTC_CR_FMT_MASK (0x01 << 6)
+ 
+ #define DEBUG_ALARM(x...)
+@@ -219,6 +228,161 @@ f2xx_rtc_set_time_and_date_registers(f2xx_rtc *s, struct tm *tm)
+ }
+ 
+ 
++// ---------------------------------------------------------------------------
++// Pebble fake-time (native-Windows custom time / freeze / rate).
++//
++// On Linux the app fakes the qemu process's CLOCK_REALTIME with an LD_PRELOAD
++// shim (vendor/timeshim). Windows has no LD_PRELOAD, and an injected-DLL API
++// hook could not reach the host-clock path mingw's gettimeofday() actually uses,
++// so custom time silently reverted to real time after a few seconds. We instead
++// honor the SAME control-file contract HERE, inside the only place that matters:
++// the Pebble RTC's host-time reads. Every host-time read in THIS file must use
++// pebble_faketime_us() so the fake base/rate is internally consistent (the
++// host->target offset is computed against the same clock the RTC is jammed from
++// — mixing real + fake would make the offset cancel the fake out).
++//
++// Control file (PEBBLE_FAKETIME_FILE), one line: "<target_unix|-> <rate>"
++//   "1577836800 1" -> jump fake clock to 2020-01-01T00:00:00Z, run 1x
++//   "- 0"          -> keep current fake time, freeze
++//   "- 10"         -> keep current fake time, run 10x
++// Env fallbacks (read once): PEBBLE_FAKETIME_OFFSET (sec), PEBBLE_FAKETIME_RATE.
++// Re-read on mtime change, throttled to 200ms. Mirrors vendor/timeshim/timeshim.c.
++// All callers run under the BQL, so no locking is needed.
++// ---------------------------------------------------------------------------
++static int64_t      pebble_ft_anchor_real_us = 0;
++static int64_t      pebble_ft_anchor_fake_us = 0;
++static double       pebble_ft_rate = 1.0;
++static const char  *pebble_ft_ctl = NULL;
++static int          pebble_ft_ready = 0;
++static char         pebble_ft_last_line[64] = {0};   /* last control line applied */
++static int64_t      pebble_ft_last_check_us = 0;
++static int64_t      pebble_ft_last_log_us = 0;
++
++/* DIAG: append to PEBBLE_FAKETIME_LOG (if set) — confirms, from inside the REAL
++ * qemu process, whether PEBBLE_FAKETIME_FILE arrived, whether the ctl is read,
++ * and what fake time is served. Remove once custom time is confirmed working. */
++static void pebble_ft_log(const char *fmt, ...)
++{
++    const char *lp = getenv("PEBBLE_FAKETIME_LOG");
++    FILE *f;
++    va_list ap;
++
++    if (!lp || !lp[0]) {
++        return;
++    }
++    f = fopen(lp, "a");
++    if (!f) {
++        return;
++    }
++    va_start(ap, fmt);
++    vfprintf(f, fmt, ap);
++    va_end(ap);
++    fclose(f);
++}
++
++static int64_t pebble_real_us(void)
++{
++    struct timeval tv;
++    gettimeofday(&tv, NULL);
++    return tv.tv_sec * 1000000LL + tv.tv_usec;
++}
++
++static int64_t pebble_fake_locked(int64_t real_us)
++{
++    return pebble_ft_anchor_fake_us
++         + (int64_t)((double)(real_us - pebble_ft_anchor_real_us) * pebble_ft_rate);
++}
++
++static void pebble_ft_init(void)
++{
++    const char *o = getenv("PEBBLE_FAKETIME_OFFSET");
++    const char *r = getenv("PEBBLE_FAKETIME_RATE");
++    int64_t real = pebble_real_us();
++
++    pebble_ft_ctl = getenv("PEBBLE_FAKETIME_FILE");
++    pebble_ft_anchor_real_us = real;
++    pebble_ft_anchor_fake_us = real + (o ? (int64_t)atoll(o) * 1000000LL : 0);
++    pebble_ft_rate = r ? atof(r) : 1.0;
++    pebble_ft_ready = 1;
++    pebble_ft_log("[ft-init] FILE=%s OFFSET=%s RATE=%s anchor_fake_us=%lld\n",
++                  pebble_ft_ctl ? pebble_ft_ctl : "(null)", o ? o : "(null)",
++                  r ? r : "(null)", (long long)pebble_ft_anchor_fake_us);
++}
++
++static void pebble_ft_check_ctl(int64_t real_us)
++{
++    FILE *f;
++    char line[64];
++    char tgt[64];
++    double r;
++
++    if (!pebble_ft_ctl) {
++        return;
++    }
++    if (real_us - pebble_ft_last_check_us < 200000) {   /* 200ms throttle */
++        return;
++    }
++    pebble_ft_last_check_us = real_us;
++
++    /* Detect changes by the file's CONTENT, not stat() mtime: on Windows a
++     * cross-process stat() can return a stale last-write time for seconds (so
++     * the watch never picked up a custom time set after boot), but a fresh
++     * fopen()+read always returns the current bytes. We only re-anchor when the
++     * line actually changed — re-applying every poll would pin an absolute
++     * target in place (it could never advance at its rate). */
++    f = fopen(pebble_ft_ctl, "r");
++    if (!f) {
++        return;
++    }
++    if (!fgets(line, sizeof(line), f)) {
++        fclose(f);
++        return;
++    }
++    fclose(f);
++    if (strcmp(line, pebble_ft_last_line) == 0) {
++        return;                                           /* unchanged → leave as-is */
++    }
++    if (sscanf(line, "%63s %lf", tgt, &r) == 2) {
++        int64_t cur_fake = pebble_fake_locked(real_us);
++        /* commit the new line only after a successful parse, so a torn/partial
++         * write is retried on the next poll instead of being latched. */
++        strncpy(pebble_ft_last_line, line, sizeof(pebble_ft_last_line) - 1);
++        pebble_ft_last_line[sizeof(pebble_ft_last_line) - 1] = '\0';
++        pebble_ft_anchor_real_us = real_us;
++        if (tgt[0] == '-' && tgt[1] == '\0') {
++            pebble_ft_anchor_fake_us = cur_fake;          /* keep current fake */
++        } else {
++            pebble_ft_anchor_fake_us = (int64_t)atoll(tgt) * 1000000LL;
++        }
++        pebble_ft_rate = r;
++        pebble_ft_log("[ft-ctl] read tgt=%s rate=%.3f anchor_fake_us=%lld\n",
++                      tgt, r, (long long)pebble_ft_anchor_fake_us);
++    }
++}
++
++// Fake host wall-clock in microseconds (custom base + freeze/rate). Drop-in
++// replacement for the gettimeofday()-derived host_time_us the RTC used to read.
++// Non-static: also called by the generic Pebble RTC (hw/misc/pebble_rtc.c) so
++// the Cortex-M33 boards (emery/gabbro/flint) — whose modern qemu board "follows
++// the host RTC" and ignores SetUTC — honor the same custom-time/freeze/rate
++// control file. Both files link into the single qemu-system-arm binary.
++int64_t pebble_faketime_us(void)
++{
++    int64_t real;
++
++    if (!pebble_ft_ready) {
++        pebble_ft_init();
++    }
++    real = pebble_real_us();
++    pebble_ft_check_ctl(real);
++    if (real - pebble_ft_last_log_us > 1000000) {   /* ~1s throttle */
++        pebble_ft_last_log_us = real;
++        pebble_ft_log("[ft-now] fake_unix=%lld rate=%.3f\n",
++                      (long long)(pebble_fake_locked(real) / 1000000LL), pebble_ft_rate);
++    }
++    return pebble_fake_locked(real);
++}
++
+ // Compute what time we want in the target based on the host's current date and time.
+ // This takes into consideration the host_to_target_offset_us we have computed and captured
+ // previously.
+@@ -230,10 +394,8 @@ static time_t
+ f2xx_rtc_compute_target_time_from_host_time(f2xx_rtc *s, uint64_t rtc_period_ns,
+                                             struct tm *target_tm)
+ {
+-    // Get the host time in microseconds
+-    struct timeval tv;
+-    gettimeofday(&tv, NULL);
+-    int64_t host_time_us = tv.tv_sec * 1000000LL + (tv.tv_usec);
++    // Get the host time in microseconds (faked: custom base + freeze/rate).
++    int64_t host_time_us = pebble_faketime_us();
+ 
+     // Apply local timezone offset if provided via environment (e.g. from browser JS).
+     // TZ_OFFSET_SEC is seconds east of UTC (e.g. -28800 for PST).
+@@ -303,10 +465,8 @@ f2xx_rtc_compute_host_to_target_offset(f2xx_rtc *s, int64_t period_ns, time_t ta
+     // Convert target ticks to real clock microseconds
+     int64_t target_time_us = target_ticks * period_ns / 1000;
+ 
+-    // Get the host time in microseconds
+-    struct timeval tv;
+-    gettimeofday(&tv, NULL);
+-    int64_t host_time_us = tv.tv_sec * 1000000LL + (tv.tv_usec);
++    // Get the host time in microseconds (faked: custom base + freeze/rate).
++    int64_t host_time_us = pebble_faketime_us();
+ 
+     // Get the host to target offset in micro seconds
+     return target_time_us - host_time_us;
+@@ -321,6 +481,14 @@ f2xx_rtc_read(void *arg, hwaddr addr, unsigned int size)
+     int offset = addr & 0x3;
+ 
+     addr >>= 2;
++    // Pebble emulator real-time register: REAL (unfrozen) host clock in
++    // microseconds, low 32 bits. Independent of the custom-time freeze so the
++    // firmware can measure true STOP-mode elapsed (sub-tick precision) under a
++    // frozen wall clock. Must be handled before the R_RTC_MAX range check (it
++    // lives at a reserved high offset).
++    if (addr == R_RTC_PEBBLE_REALUS) {
++        return (uint32_t)pebble_real_us();
++    }
+     if (addr >= R_RTC_MAX) {
+         qemu_log_mask(LOG_GUEST_ERROR, "invalid read f2xx rtc register 0x%x\n",
+           (unsigned int)addr << 2);
+@@ -358,10 +526,8 @@ f2xx_rtc_read(void *arg, hwaddr addr, unsigned int size)
+ 
+         uint64_t full_cycle_us = f2xx_clock_period_ns(s) / 1000;
+ 
+-        // What fraction of a full cycle are we in?
+-        struct timeval tv;
+-        gettimeofday(&tv, NULL);
+-        int64_t host_time_us = tv.tv_sec * 1000000LL + (tv.tv_usec);
++        // What fraction of a full cycle are we in? (faked host clock)
++        int64_t host_time_us = pebble_faketime_us();
+         host_time_us += s->host_to_target_offset_us;
+ 
+         int64_t host_mod = host_time_us % full_cycle_us;
+@@ -722,10 +888,14 @@ f2xx_rtc_realize(DeviceState *dev, Error **errp)
+     uint32_t period_ns = f2xx_clock_period_ns(s);
+     DPRINTF("%s: period: %d ns\n", __func__, period_ns);
+ 
+-    // Init the time and date registers from the time on the host as the default
++    // Init the time and date registers from the (faked) host time as the default.
++    // Use pebble_faketime_us() — NOT qemu_get_timedate() — so the seed matches the
++    // clock the continuous re-jam reads; otherwise the host->target offset computed
++    // just below would be relative to real time and cancel the fake out.
+     s->host_to_target_offset_us = 0;
+     struct tm now;
+-    qemu_get_timedate(&now, 0);
++    time_t fake_now_sec = pebble_faketime_us() / 1000000LL;
++    gmtime_r(&fake_now_sec, &now);
+ 
+     // Set time and date registers from the now struct
+     f2xx_rtc_set_time_and_date_registers(s, &now);
+@@ -741,10 +911,28 @@ f2xx_rtc_realize(DeviceState *dev, Error **errp)
+     s->wu_timer = timer_new_ns(QEMU_CLOCK_REALTIME, f2xx_wu_timer, s);
+ }
+ 
++static const VMStateDescription vmstate_f2xx_rtc = {
++    .name = "f2xx_rtc",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_TIMER_PTR(timer, f2xx_rtc),
++        VMSTATE_TIMER_PTR(wu_timer, f2xx_rtc),
++        VMSTATE_INT64(host_to_target_offset_us, f2xx_rtc),
++        VMSTATE_INT64(ticks, f2xx_rtc),
++        VMSTATE_UINT32_ARRAY(regs, f2xx_rtc, R_RTC_MAX),
++        VMSTATE_INT32(wp_count, f2xx_rtc),
++        VMSTATE_BOOL_ARRAY(alarm_irq_level, f2xx_rtc, 2),
++        VMSTATE_BOOL(wut_irq_level, f2xx_rtc),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void
+ f2xx_rtc_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
++    dc->vmsd = &vmstate_f2xx_rtc;
+     dc->realize = f2xx_rtc_realize;
+     device_class_set_legacy_reset(dc, f2xx_rtc_reset);
+ }

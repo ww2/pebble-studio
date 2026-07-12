@@ -1,0 +1,60 @@
+Subject: [PATCH] migration/file: open migration stream files in binary mode (Windows)
+
+On Windows (MinGW/MSVCRT), open()/read()/write() default to *text mode* unless
+O_BINARY is set (O_BINARY is 0 on POSIX per include/qemu/osdep.h, so this is a
+no-op there). migration/file.c opened the migration stream with plain
+O_WRONLY / O_RDONLY, so on the native-Windows qemu-pebble build:
+
+  - the WRITER inflated every 0x0A byte to 0x0D 0x0A (CRLF), corrupting the
+    binary QEMUFile stream (measured: 100% of 0x0A bytes preceded by 0x0D,
+    ~7160 spurious 0x0D injected into a 17.99 MB snapshot), and
+  - the READER treated the first 0x1A (Ctrl-Z) byte as EOF (first 0x1A at
+    offset 465), truncating the stream at the RAM section.
+
+Net effect: `migrate uri=file:...` writes a corrupt file and `-incoming file:`
+dies with "error while loading state section id 1(ram)". tcp: migration of the
+same VM is unaffected because socket channels never go through the CRT's
+text-mode translation.
+
+Fix: OR O_BINARY into every migration-file open (outgoing, incoming, and the
+multifd secondary channels).
+
+--- a/migration/file.c
++++ b/migration/file.c
+@@ -63,7 +63,7 @@ void file_cleanup_outgoing_migration(void)
+ bool file_send_channel_create(gpointer opaque, Error **errp)
+ {
+     QIOChannelFile *ioc;
+-    int flags = O_WRONLY;
++    int flags = O_WRONLY | O_BINARY;
+     bool ret = true;
+
+     if (migrate_direct_io()) {
+@@ -103,7 +103,8 @@ void file_start_outgoing_migration(MigrationState *s,
+
+     trace_migration_file_outgoing(filename);
+
+-    fioc = qio_channel_file_new_path(filename, O_CREAT | O_WRONLY, 0600, errp);
++    fioc = qio_channel_file_new_path(filename, O_CREAT | O_WRONLY | O_BINARY,
++                                     0600, errp);
+     if (!fioc) {
+         return;
+     }
+@@ -137,7 +138,7 @@ static void file_create_incoming_channels(QIOChannel *ioc, char *filename,
+ {
+     int i, channels = 1;
+     g_autofree QIOChannel **iocs = NULL;
+-    int flags = O_RDONLY;
++    int flags = O_RDONLY | O_BINARY;
+
+     if (migrate_multifd()) {
+         channels += migrate_multifd_channels();
+@@ -181,7 +182,7 @@ void file_start_incoming_migration(FileMigrationArgs *file_args, Error **errp)
+
+     trace_migration_file_incoming(filename);
+
+-    fioc = qio_channel_file_new_path(filename, O_RDONLY, 0, errp);
++    fioc = qio_channel_file_new_path(filename, O_RDONLY | O_BINARY, 0, errp);
+     if (!fioc) {
+         return;
+     }

@@ -1,0 +1,319 @@
+diff --git a/hw/display/pebble_display.c b/hw/display/pebble_display.c
+index 34f4d9c103..3fa8730a40 100644
+--- a/hw/display/pebble_display.c
++++ b/hw/display/pebble_display.c
+@@ -33,6 +33,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "migration/vmstate.h"
+ #include "qemu/log.h"
+ #include "qemu/timer.h"
+ #include "hw/irq.h"
+@@ -510,10 +511,42 @@ static const Property pbl_display_properties[] = {
+     DEFINE_PROP_BOOL("round-mask", PblDisplay, round_mask, false),
+ };
+ 
++static int pbl_display_post_load(void *opaque, int version_id)
++{
++    PblDisplay *s = opaque;
++
++    /* The QemuConsole surface has no vmstate: repaint the restored
++     * framebuffer immediately (render reads s->fb directly). */
++    s->redraw = true;
++    return 0;
++}
++
++static const VMStateDescription vmstate_pbl_display = {
++    .name = "pebble-display",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = pbl_display_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_VBUFFER_UINT32(fb, PblDisplay, 0, NULL, fb_size),
++        VMSTATE_UINT32(ctrl, PblDisplay),
++        VMSTATE_UINT32(brightness, PblDisplay),
++        VMSTATE_UINT32(intstat, PblDisplay),
++        VMSTATE_UINT32(intctrl, PblDisplay),
++        VMSTATE_UINT8(bl_r, PblDisplay),
++        VMSTATE_UINT8(bl_g, PblDisplay),
++        VMSTATE_UINT8(bl_b, PblDisplay),
++        VMSTATE_BOOL(vibrating, PblDisplay),
++        VMSTATE_INT32(vibe_frame, PblDisplay),
++        VMSTATE_TIMER_PTR(vibe_timer, PblDisplay),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void pbl_display_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
++    dc->vmsd = &vmstate_pbl_display;
+     dc->realize = pbl_display_realize;
+     device_class_set_legacy_reset(dc, pbl_display_reset);
+     device_class_set_props(dc, pbl_display_properties);
+diff --git a/hw/gpio/pebble_gpio.c b/hw/gpio/pebble_gpio.c
+index eefbcd07c8..6d92390fee 100644
+--- a/hw/gpio/pebble_gpio.c
++++ b/hw/gpio/pebble_gpio.c
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "migration/vmstate.h"
+ #include "qemu/log.h"
+ #include "qemu/timer.h"
+ #include "hw/irq.h"
+@@ -244,10 +245,25 @@ static void pbl_gpio_reset(DeviceState *dev)
+     }
+ }
+ 
++static const VMStateDescription vmstate_pbl_gpio = {
++    .name = "pebble-gpio",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(btn_state, PblGpio),
++        VMSTATE_UINT32(btn_edge, PblGpio),
++        VMSTATE_UINT32(intctrl, PblGpio),
++        VMSTATE_UINT32(pending_release, PblGpio),
++        VMSTATE_TIMER_PTR(debounce_timer, PblGpio),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void pbl_gpio_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
++    dc->vmsd = &vmstate_pbl_gpio;
+     dc->realize = pbl_gpio_realize;
+     device_class_set_legacy_reset(dc, pbl_gpio_reset);
+ }
+diff --git a/hw/misc/pebble_extflash.c b/hw/misc/pebble_extflash.c
+index cd038b57f0..e4603bd209 100644
+--- a/hw/misc/pebble_extflash.c
++++ b/hw/misc/pebble_extflash.c
+@@ -44,6 +44,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "migration/vmstate.h"
+ #include "qemu/log.h"
+ #include "qemu/units.h"
+ #include "qapi/error.h"
+@@ -332,10 +333,27 @@ static const Property pbl_extflash_properties[] = {
+                        EXTFLASH_DEFAULT_XIP_BASE),
+ };
+ 
++static const VMStateDescription vmstate_pbl_extflash = {
++    .name = "pebble-extflash",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        /* Guest flash writes live in this RAM buffer and only reach the
++         * backing file on an explicit SYNC command, so the buffer itself
++         * must migrate to keep flash content consistent with guest RAM. */
++        VMSTATE_VBUFFER_UINT32(storage, PblExtFlash, 0, NULL, size),
++        VMSTATE_UINT32(backed_size, PblExtFlash),
++        VMSTATE_UINT32(pending_addr, PblExtFlash),
++        VMSTATE_UINT32(pending_sync_len, PblExtFlash),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void pbl_extflash_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
++    dc->vmsd = &vmstate_pbl_extflash;
+     dc->realize = pbl_extflash_realize;
+     device_class_set_legacy_reset(dc, pbl_extflash_reset);
+     device_class_set_props(dc, pbl_extflash_properties);
+diff --git a/hw/misc/pebble_rtc.c b/hw/misc/pebble_rtc.c
+index 2d0ff62732..148772b508 100644
+--- a/hw/misc/pebble_rtc.c
++++ b/hw/misc/pebble_rtc.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "migration/vmstate.h"
+ #include "qemu/log.h"
+ #include "qemu/timer.h"
+ #include "hw/irq.h"
+@@ -61,10 +62,22 @@ static void pbl_rtc_update_irq(PblRtc *s)
+                           (s->ctrl & CTRL_ALARM_IRQ));
+ }
+ 
+-/* Return the host wall-clock time, in seconds, as a UTC unix timestamp. */
++/* Pebble fake-time host clock (custom base + freeze/rate), defined in
++ * hw/timer/stm32_pebble_rtc.c and shared across the single qemu-system-arm
++ * binary. Returns the (possibly faked) host wall-clock in microseconds, driven
++ * by the PEBBLE_FAKETIME_FILE control file. On the Cortex-M4 boards the f2xx
++ * RTC re-jams the guest clock from this; here it is the generic RTC's host
++ * source. The modern pebble-emery/gabbro/flint board "follows the host RTC" and
++ * ignores SetUTC, so faking this function is the ONLY lever for custom time,
++ * freeze, and accelerated rates on those Cortex-M33 boards. */
++extern int64_t pebble_faketime_us(void);
++
++/* Return the host wall-clock time, in seconds, as a UTC unix timestamp.
++ * Uses the shared Pebble fake clock so custom time / freeze / rate work here
++ * exactly as on the f2xx boards (real hardware always advances → unaffected). */
+ static int64_t pbl_rtc_host_time(void)
+ {
+-    return qemu_clock_get_ms(QEMU_CLOCK_HOST) / 1000;
++    return pebble_faketime_us() / 1000000LL;
+ }
+ 
+ /* Return the RTC's current time: host wall-clock plus the guest-set offset.
+@@ -188,9 +201,23 @@ static void pbl_rtc_reset(DeviceState *dev)
+     /* Backup registers intentionally NOT cleared on reset */
+ }
+ 
++static const VMStateDescription vmstate_pbl_rtc = {
++    .name = "pebble-generic-rtc",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_INT64(time_offset_s, PblRtc),
++        VMSTATE_UINT32(alarm, PblRtc),
++        VMSTATE_UINT32(ctrl, PblRtc),
++        VMSTATE_UINT32_ARRAY(backup, PblRtc, RTC_NUM_BACKUP),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void pbl_rtc_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
++    dc->vmsd = &vmstate_pbl_rtc;
+     device_class_set_legacy_reset(dc, pbl_rtc_reset);
+ }
+ 
+diff --git a/hw/misc/pebble_simple_uart.c b/hw/misc/pebble_simple_uart.c
+index 6b11a72586..4ed84d8ddf 100644
+--- a/hw/misc/pebble_simple_uart.c
++++ b/hw/misc/pebble_simple_uart.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "migration/vmstate.h"
+ #include "qemu/log.h"
+ #include "hw/irq.h"
+ #include "hw/sysbus.h"
+@@ -271,10 +272,36 @@ static const Property pbl_uart_properties[] = {
+     DEFINE_PROP_CHR("chardev", PblSimpleUart, chr),
+ };
+ 
++static int pbl_uart_post_load(void *opaque, int version_id)
++{
++    PblSimpleUart *s = opaque;
++
++    /* Re-drive the IRQ line to match the restored register/FIFO state. */
++    pbl_uart_update_irq(s);
++    return 0;
++}
++
++static const VMStateDescription vmstate_pbl_uart = {
++    .name = "pebble-simple-uart",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = pbl_uart_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(state, PblSimpleUart),
++        VMSTATE_UINT32(ctrl, PblSimpleUart),
++        VMSTATE_UINT32(intstat, PblSimpleUart),
++        VMSTATE_BUFFER(rx_fifo, PblSimpleUart),
++        VMSTATE_UINT32(rx_head, PblSimpleUart),
++        VMSTATE_UINT32(rx_count, PblSimpleUart),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void pbl_uart_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
++    dc->vmsd = &vmstate_pbl_uart;
+     dc->realize = pbl_uart_realize;
+     device_class_set_legacy_reset(dc, pbl_uart_reset);
+     device_class_set_props(dc, pbl_uart_properties);
+diff --git a/hw/misc/pebble_timer.c b/hw/misc/pebble_timer.c
+index 8db99f631e..1f265f9434 100644
+--- a/hw/misc/pebble_timer.c
++++ b/hw/misc/pebble_timer.c
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "migration/vmstate.h"
+ #include "qemu/log.h"
+ #include "qemu/timer.h"
+ #include "hw/irq.h"
+@@ -236,9 +237,25 @@ static void pbl_timer_reset(DeviceState *dev)
+     s->tick_start = 0;
+ }
+ 
++static const VMStateDescription vmstate_pbl_timer = {
++    .name = "pebble-generic-timer",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_TIMER_PTR(timer, PblTimer),
++        VMSTATE_UINT32(load, PblTimer),
++        VMSTATE_UINT32(ctrl, PblTimer),
++        VMSTATE_UINT32(intstat, PblTimer),
++        VMSTATE_UINT32(prescaler, PblTimer),
++        VMSTATE_INT64(tick_start, PblTimer),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void pbl_timer_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
++    dc->vmsd = &vmstate_pbl_timer;
+     device_class_set_legacy_reset(dc, pbl_timer_reset);
+ }
+ 
+diff --git a/hw/misc/pebble_touch.c b/hw/misc/pebble_touch.c
+index b19a5cf45c..4cc216a8ff 100644
+--- a/hw/misc/pebble_touch.c
++++ b/hw/misc/pebble_touch.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "migration/vmstate.h"
+ #include "qemu/log.h"
+ #include "hw/irq.h"
+ #include "hw/sysbus.h"
+@@ -185,10 +186,25 @@ static const Property pbl_touch_properties[] = {
+     DEFINE_PROP_UINT32("display-height", PblTouch, display_h, 228),
+ };
+ 
++static const VMStateDescription vmstate_pbl_touch = {
++    .name = "pebble-touch",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(state, PblTouch),
++        VMSTATE_UINT32(x, PblTouch),
++        VMSTATE_UINT32(y, PblTouch),
++        VMSTATE_UINT32(intctrl, PblTouch),
++        VMSTATE_UINT32(intstat, PblTouch),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static void pbl_touch_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
++    dc->vmsd = &vmstate_pbl_touch;
+     dc->realize = pbl_touch_realize;
+     device_class_set_legacy_reset(dc, pbl_touch_reset);
+     device_class_set_props(dc, pbl_touch_properties);
