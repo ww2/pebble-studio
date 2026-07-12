@@ -13,7 +13,8 @@ describe("fbCoordFromClick (per-axis pointer mapping)", () => {
   it("scales Y by its OWN ratio, so a full-height canvas maps 1:1 (fixes the ~4% down drift)", () => {
     // canvas height == fb height (228) → identity. noVNC's single scale would give y*1.04 (too low).
     expect(fbCoordFromClick(114, 228, 228)).toBe(114);
-    expect(fbCoordFromClick(228, 228, 228)).toBe(228);
+    // last valid on-screen pixel (renderedPx-1) maps to the last fb row, 1:1.
+    expect(fbCoordFromClick(227, 228, 228)).toBe(227);
     expect(fbCoordFromClick(50, 228, 228)).toBe(50);
   });
 
@@ -24,6 +25,14 @@ describe("fbCoordFromClick (per-axis pointer mapping)", () => {
 
   it("guards against a zero-sized (unmeasured) canvas", () => {
     expect(fbCoordFromClick(100, 0, 208)).toBe(0);
+  });
+
+  it("clamps the extreme last pixel into [0, fbPx-1] under high zoom (never one past the edge)", () => {
+    // emery bottom row at ~3x zoom: rendered height 684, click 683, fb 228.
+    // round(683*228/684) = 228 (one past); must clamp to 227.
+    expect(fbCoordFromClick(683, 684, 228)).toBe(227);
+    // sanity: still exact well inside range.
+    expect(fbCoordFromClick(342, 684, 228)).toBe(114);
   });
 
   it("gabbro width: click maps to the padded 272 framebuffer", () => {

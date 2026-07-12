@@ -21,5 +21,9 @@
  */
 export function fbCoordFromClick(clickPx: number, renderedPx: number, fbPx: number): number {
   if (renderedPx <= 0) return 0;
-  return Math.round((clickPx * fbPx) / renderedPx);
+  const px = Math.round((clickPx * fbPx) / renderedPx);
+  // Clamp into the framebuffer [0, fbPx-1]. Rounding the last on-screen pixel at
+  // high zoom can land exactly on fbPx (one past the edge); truncating parity
+  // with noVNC's original `| 0` keeps it in range.
+  return Math.min(Math.max(fbPx - 1, 0), Math.max(0, px));
 }
