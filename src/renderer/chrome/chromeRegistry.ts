@@ -43,7 +43,17 @@ const CHROMES: Record<PlatformId, Chrome> = {
   // pixels on both axes. x is unchanged so the watch content stays put; the extra
   // 8px is the (black) padding strip. Pairs with the qemu pebble_touch X-align
   // fix (qemu-pebble-touch-xalign.patch) which corrects the qemu side.
-  emery:   rectChrome({ x: 12, y: 12, width: 208, height: 228 }, 227, 257),
+  // NOTE (touch alignment): emery & gabbro are the only touch boards. QEMU pads
+  // the VNC framebuffer WIDTH up to a 16px tile boundary (emery 200→208, gabbro
+  // 260→272), so a click maps 1:1 only if the screen container matches that
+  // padded width. We tried sizing the container to the padded fb — but that
+  // exposes the black padding strip as visible screen area and de-centers the
+  // watchface (regressed v3.0.13 emery / v3.0.14 gabbro). So the container stays
+  // at the LOGICAL panel size (display centered, as before); the horizontal
+  // touch error is corrected qemu-side (qemu-pebble-touch-xalign.patch). The
+  // residual vertical touch drift must be fixed with a display-independent
+  // pointer mapping, NOT by resizing the screen here.
+  emery:   rectChrome({ x: 12, y: 12, width: 200, height: 228 }, 227, 257),
   gabbro:  rectChrome({ x: 14, y: 14, width: 260, height: 260 }, 288, 288),
 };
 

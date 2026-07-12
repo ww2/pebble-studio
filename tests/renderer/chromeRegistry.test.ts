@@ -20,7 +20,10 @@ describe("chromeRegistry", () => {
     expect(hitTestButton("basalt", -100, -100)).toBeNull();
   });
 
-  it("uses the correct 260x260 screen for gabbro", () => {
+  it("uses the correct 260x260 screen for gabbro (logical panel size; display stays centered)", () => {
+    // The screen container is kept at the LOGICAL panel size so the watchface
+    // stays centered in the bezel. Touch alignment is corrected qemu-side, not by
+    // resizing the screen to the padded framebuffer (that de-centered the face).
     expect(getChrome("gabbro").screen).toEqual({ x: 14, y: 14, width: 260, height: 260 });
   });
 });
