@@ -64,7 +64,10 @@ jobs:
           done < "$REPO/build/qemu-patches/apply-order.txt"
           # Neutralize the meson install-tree symlink step (needs Developer Mode;
           # the qemu-bundle/ tree is only used by `meson install`, which we never run).
-          printf 'import sys\nsys.exit(0)\n' > scripts/symlink-install-tree.py
+          # Keep a valid shebang + exec bit: meson's find_program() rejects a script
+          # with no shebang ("Unusable script"), which fails `configure` at setup.
+          printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > scripts/symlink-install-tree.py
+          chmod +x scripts/symlink-install-tree.py
 
       - name: Configure + build
         shell: msys2 {0}
