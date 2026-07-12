@@ -57,6 +57,7 @@ jobs:
           cd "$QEMU_SRC"
           REPO="$(cygpath "$GITHUB_WORKSPACE")"
           while read -r p; do
+            p="${p%$'\r'}"
             [ -z "$p" ] && continue
             echo "== applying $p =="
             patch -p1 < "$REPO/build/qemu-patches/$p"
