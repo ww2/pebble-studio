@@ -39,4 +39,4 @@ jobs:
           printf 'int main(void){return 0;}\n' > /tmp/hello.c
           clang -o /tmp/hello.exe /tmp/hello.c
           file /tmp/hello.exe
-          file /tmp/hello.exe | grep -qi 'Aarch64' && echo "GATE-2 PASS: native ARM64 toolchain" || { echo "GATE-2 FAIL: not Aarch64"; exit 1; }
+          file /tmp/hello.exe | grep -qiE 'aarch64|arm64' && echo "GATE-2 PASS: native ARM64 toolchain" || { echo "GATE-2 FAIL: not Aarch64"; exit 1; }
