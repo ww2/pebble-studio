@@ -18,6 +18,7 @@ docs/
 # Large self-contained runtime bundles (~300 MB total). Shipped as release
 # assets, not committed; reproducible from the build scripts under scripts/.
 vendor/qemu-pebble-win/
+vendor/qemu-pebble-win-arm64/
 vendor/pebble-py/
 vendor/pebble-sdk/
 

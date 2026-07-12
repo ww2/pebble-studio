@@ -16,7 +16,8 @@
     "dev": "vite",
     "start": "electron .",
     "dist": "npm run build && electron-builder --win && node scripts/set-exe-icon.mjs",
-    "gen:icon": "node scripts/gen-icon.mjs"
+    "gen:icon": "node scripts/gen-icon.mjs",
+    "fetch:arm64-qemu": "node scripts/fetch-arm64-qemu.mjs"
   },
   "devDependencies": {
     "@resvg/resvg-js": "^2.6.2",
