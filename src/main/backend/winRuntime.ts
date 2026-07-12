@@ -37,6 +37,13 @@ export interface WinRuntimeCtx {
   pyDevDir?: string;
   /** Existence predicate (injected in tests). Defaults to fs.existsSync. */
   exists?: (p: string) => boolean;
+  /**
+   * Whether the REAL host CPU is ARM64. `process.arch` cannot tell us this — it
+   * reports `x64` for an emulated x64 process on Windows-on-ARM — so this is
+   * derived from the WOW64 env vars via hostIsArm64(process.env) in defaultCtx.
+   * Optional (defaults to false when omitted) so existing ctx literals compile.
+   */
+  hostArm64?: boolean;
 }
 
 /** Bundle dir names under resources/ (packaged) or vendor/ (dev). */
@@ -51,6 +58,18 @@ const TIMESHIM_WIN_BUNDLE = "timeshim-win";
  * locates its home from the containing directory, NOT the exe name, so renaming
  * is safe. The build script (build-pebble-py.ps1) emits this name. */
 const PY_EXE_NAME = "PebbleStudioEmu.exe";
+
+/**
+ * True iff the REAL host CPU is ARM64. On Windows-on-ARM an emulated x64 process
+ * sees `process.arch === "x64"`; the host arch surfaces only via the WOW64 env
+ * vars: PROCESSOR_ARCHITEW6432 is "ARM64" when an x86/x64 process runs on an
+ * ARM64 host, and PROCESSOR_ARCHITECTURE is "ARM64" for a natively-arm64 process.
+ */
+export function hostIsArm64(env: NodeJS.ProcessEnv): boolean {
+  const wow = (env.PROCESSOR_ARCHITEW6432 ?? "").toUpperCase();
+  const arch = (env.PROCESSOR_ARCHITECTURE ?? "").toUpperCase();
+  return wow === "ARM64" || arch === "ARM64";
+}
 
 function exists(ctx: WinRuntimeCtx, p: string): boolean {
   return (ctx.exists ?? existsSync)(p);
@@ -158,5 +177,6 @@ export async function defaultCtx(): Promise<WinRuntimeCtx> {
     userDataDir: app.getPath("userData"),
     // Opt-in only; unset (and ignored) in packaged builds, which short-circuit above.
     pyDevDir: process.env.PEBBLE_STUDIO_PY_DEV_DIR,
+    hostArm64: hostIsArm64(process.env),
   };
 }
